@@ -1,0 +1,163 @@
+// Snappy's block format, which devp2p wraps every message in after Hello: a varint of the uncompressed
+// length, then literals and back-references (copies) to what has already been written.
+//
+// The decoder takes the whole format and refuses anything malformed rather than guessing: a length past
+// the limit, a copy reaching before the start, output that does not come to the length promised. The
+// encoder is a plain greedy one — a hash of each four bytes to where they were last seen, a copy whenever
+// they match — which finds the repetition in RLP (zero-filled hashes, repeated addresses) without
+// competing with the reference implementation for ratio.
+
+/** Decompressed messages over this are refused: devp2p's limit. */
+export static i32 MAX_DECODED = 16777216;
+
+/** The decoded bytes, or null for input that is not valid snappy or decodes past `MAX_DECODED`. */
+export u8[]? snappyDecode(u8[] src) {
+  i64 n = 0;
+  i32 shift = 0;
+  i32 at = 0;
+  while (true) {
+    if (at >= src.len() || shift > 28) { return null; }
+    i32 b = src[at] as i32;
+    at++;
+    n = n | (((b & 0x7f) as i64) << shift);
+    if (b < 0x80) { break; }
+    shift += 7;
+  }
+  if (n > (MAX_DECODED as i64)) { return null; }
+  u8[] out = u8[].filled(n as! i32, 0);
+  i32 w = 0;
+  while (at < src.len()) {
+    i32 tag = src[at] as i32;
+    at++;
+    i32 kind = tag & 3;
+    if (kind == 0) {
+      i32 len = (tag >> 2) + 1;
+      if (len > 60) {
+        i32 extra = len - 60;
+        if (at + extra > src.len()) { return null; }
+        len = 0;
+        for (i32 i = 0; i < extra; i++) { len = len | ((src[at + i] as i32) << (8 * i)); }
+        len = len + 1;
+        at += extra;
+        if (len <= 0) { return null; }
+      }
+      if (at + len > src.len() || w + len > out.len()) { return null; }
+      for (i32 i = 0; i < len; i++) { out[w + i] = src[at + i]; }
+      at += len;
+      w += len;
+      continue;
+    }
+    i32 len = 0;
+    i32 offset = 0;
+    if (kind == 1) {
+      if (at >= src.len()) { return null; }
+      len = ((tag >> 2) & 7) + 4;
+      offset = ((tag >> 5) << 8) | (src[at] as i32);
+      at++;
+    } else if (kind == 2) {
+      if (at + 2 > src.len()) { return null; }
+      len = (tag >> 2) + 1;
+      offset = (src[at] as i32) | ((src[at + 1] as i32) << 8);
+      at += 2;
+    } else {
+      if (at + 4 > src.len()) { return null; }
+      len = (tag >> 2) + 1;
+      offset = (src[at] as i32) | ((src[at + 1] as i32) << 8) | ((src[at + 2] as i32) << 16) | ((src[at + 3] as i32) << 24);
+      at += 4;
+    }
+    if (offset <= 0 || offset > w || w + len > out.len()) { return null; }
+    // Byte by byte: a copy may overlap what it is writing, which is how a run repeats.
+    for (i32 i = 0; i < len; i++) { out[w + i] = out[w - offset + i]; }
+    w += len;
+  }
+  return w == out.len() ? out : null;
+}
+
+void emitLiteral(Bytes o, u8[] src, i32 from, i32 to) {
+  i32 len = to - from;
+  if (len <= 0) { return; }
+  i32 n = len - 1;
+  if (n < 60) {
+    o.push((n << 2) as@ u8);
+  } else if (n < 256) {
+    o.push((60 << 2) as@ u8);
+    o.push(n as@ u8);
+  } else if (n < 65536) {
+    o.push((61 << 2) as@ u8);
+    o.push((n & 0xff) as@ u8);
+    o.push((n >> 8) as@ u8);
+  } else {
+    o.push((62 << 2) as@ u8);
+    o.push((n & 0xff) as@ u8);
+    o.push(((n >> 8) & 0xff) as@ u8);
+    o.push((n >> 16) as@ u8);
+  }
+  for (i32 i = from; i < to; i++) { o.push(src[i]); }
+}
+
+/** A copy of `len` bytes from `offset` back, as 2-byte-offset elements of at most 64 bytes each. */
+void emitCopy(Bytes o, i32 offset, i32 len) {
+  while (len > 0) {
+    i32 n = len > 64 ? 64 : len;
+    // Never leave a tail of fewer than 4 for the next element to carry, as the reference encoder does not.
+    if (len > 64 && len - 64 < 4) { n = 60; }
+    o.push((((n - 1) << 2) | 2) as@ u8);
+    o.push((offset & 0xff) as@ u8);
+    o.push((offset >> 8) as@ u8);
+    len -= n;
+  }
+}
+
+/** A growable byte buffer. */
+struct Bytes {
+  u8[] buf;
+  i32 len;
+
+  void push(this, u8 b) {
+    if (this.len == this.buf.len()) {
+      u8[] grown = u8[].filled(this.buf.len() * 2 + 16, 0);
+      for (i32 i = 0; i < this.len; i++) { grown[i] = this.buf[i]; }
+      this.buf = grown;
+    }
+    this.buf[this.len] = b;
+    this.len++;
+  }
+}
+
+export u8[] snappyEncode(u8[] src) {
+  Bytes o = Bytes(u8[].filled(src.len() / 2 + 32, 0), 0);
+  i32 n = src.len();
+  while (true) {
+    i32 b = n & 0x7f;
+    n = n >> 7;
+    if (n == 0) {
+      o.push(b as@ u8);
+      break;
+    }
+    o.push((b | 0x80) as@ u8);
+  }
+  i32[] table = i32[].filled(16384, -1);
+  i32 lit = 0;
+  i32 i = 0;
+  while (i + 4 <= src.len()) {
+    u32 word = (src[i] as u32) | ((src[i + 1] as u32) << 8) | ((src[i + 2] as u32) << 16) | ((src[i + 3] as u32) << 24);
+    i32 h = (((word * 0x1e35a7bd) >> 18) & 16383) as! i32;
+    i32 cand = table[h];
+    table[h] = i;
+    if (cand >= 0 && i - cand <= 65535 && src[cand] == src[i] && src[cand + 1] == src[i + 1] && src[cand + 2] == src[i + 2] &&
+        src[cand + 3] == src[i + 3]) {
+      emitLiteral(o, src, lit, i);
+      i32 len = 4;
+      while (i + len < src.len() && src[cand + len] == src[i + len]) { len++; }
+      emitCopy(o, i - cand, len);
+      i += len;
+      lit = i;
+    } else {
+      i++;
+    }
+  }
+  emitLiteral(o, src, lit, src.len());
+  u8[] out = u8[].filled(o.len, 0);
+  for (i32 k = 0; k < o.len; k++) { out[k] = o.buf[k]; }
+  return out;
+}

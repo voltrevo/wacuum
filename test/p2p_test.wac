@@ -6,6 +6,7 @@ import { hexToBytes, bytesToHex } from "../src/hex.wac";
 import { publicKey, ecdh, sign, recover } from "../src/p2p/secp.wac";
 import { Hello, Session, readAuth, readAck, makeAuth, makeAck, secrets, session, writeFrame, readFrameHeader,
          readFrameBody } from "../src/p2p/rlpx.wac";
+import { snappyEncode, snappyDecode } from "../src/p2p/snappy.wac";
 import { Check } from "./check.wac";
 
 static string KEY_A = "1111111111111111111111111111111111111111111111111111111111111111";
@@ -106,5 +107,36 @@ export string test_rlpx_both_ends_agree() {
     for (i32 k = 0; k < rest2.len(); k++) { rest2[k] = back[32 + k]; }
     t.ok(readFrameBody(sa, rest2, msg.len()) is not null, "with its body");
   }
+  return t.report();
+}
+
+/** What snappyjs makes of "", "a", a sentence twenty times, and 300 x's. */
+static string[] SNAPPED = ["0x00", "0x010061",
+  "0x88041c77616375756d20760507307320757020626c6f636b732c20fe1a00fe1a00fe1a00fe1a00fe1a00fe1a00fe1a00b61a00",
+  "0xac020078fe0100fe0100fe0100fe0100aa0100"];
+
+string repeat(string s, i32 n) {
+  string out = "";
+  for (i32 i = 0; i < n; i++) { out += s; }
+  return out;
+}
+
+export string test_snappy_reads_the_reference_and_round_trips() {
+  Check t = Check.create();
+  string[] plain = ["", "a", repeat("wacuum vacuums up blocks, ", 20), repeat("x", 300)];
+  for (i32 i = 0; i < plain.len(); i++) {
+    u8[]? d = snappyDecode(hexToBytes(SNAPPED[i])!);
+    t.ok(d is not null && string.fromBytes(d!) == plain[i], "snappyjs's encoding \{i} decodes");
+    u8[]? back = snappyDecode(snappyEncode(plain[i].toBytes()));
+    t.ok(back is not null && string.fromBytes(back!) == plain[i], "ours \{i} round-trips");
+  }
+  u8[] bin = u8[].filled(70000, 0);
+  for (i32 i = 0; i < bin.len(); i++) { bin[i] = (((i * 7919) >> 3) & 0xff) as! u8; }
+  u8[] packed = snappyEncode(bin);
+  u8[]? back = snappyDecode(packed);
+  t.ok(back is not null && bytesToHex(back!) == bytesToHex(bin), "70,000 bytes round-trip");
+  t.ok(packed.len() < 20000, "and compress: \{packed.len()} bytes");
+  t.ok(snappyDecode(hexToBytes("0x0a0100")!) is null, "a short output is refused");
+  t.ok(snappyDecode(hexToBytes("0x040d01")!) is null, "a copy from before the start is refused");
   return t.report();
 }
