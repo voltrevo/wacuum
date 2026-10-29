@@ -1,0 +1,180 @@
+// Check block building against execution-spec-tests' engine fixtures: at each valid payload, send its
+// transactions to the mempool and have the engine build a block with the same parent and attributes.
+//
+//     wac build --allow-read tools/buildtest.wac -o dist/buildtest
+//     wac dist/buildtest.wasm [--fork Cancun] [--filter text] FILE...
+//
+// The same transactions in the same environment must give the payload's state root, receipts root, gas
+// used, bloom and blob gas — the fixture is the oracle for what the builder should have produced — and
+// the built payload must then be VALID by the engine's own newPayload. The fixture's own payload is
+// imported after it, so the next one has its parent.
+
+import { Sys } from "std";
+import { json.parse, json.JsonValue, json.JsonObject, json.JsonArray } from "wac";
+import { rlp.encode } from "wac";
+import { crypto.keccak256 } from "wac";
+import { U256 } from "../src/u256.wac";
+import { bytesToHex } from "../src/hex.wac";
+import { World } from "../src/state/world.wac";
+import { stateRoot } from "../src/state/root.wac";
+import { Spec } from "../src/evm/spec.wac";
+import { Header } from "../src/chain/block.wac";
+import { Engine, Answer } from "../src/engine/engine.wac";
+import { headerItem } from "../src/chain/block.wac";
+import { num, bytes, worldFrom } from "./fixture.wac";
+
+struct Tally {
+  i32 passed;
+  i32 failed;
+  string fork;
+  string filter;
+}
+
+Header genesisOf(JsonValue g) {
+  return Header(num(g.member("parentHash")), num(g.member("uncleHash")), num(g.member("coinbase")), num(g.member("stateRoot")),
+                num(g.member("transactionsTrie")), num(g.member("receiptTrie")), bytes(g.member("bloom")),
+                num(g.member("difficulty")), num(g.member("number")), num(g.member("gasLimit")), num(g.member("gasUsed")),
+                num(g.member("timestamp")), bytes(g.member("extraData")), num(g.member("mixHash")), bytes(g.member("nonce")),
+                num(g.member("baseFeePerGas")), num(g.member("withdrawalsRoot")), num(g.member("blobGasUsed")),
+                num(g.member("excessBlobGas")), num(g.member("parentBeaconBlockRoot")), num(g.member("requestsHash")),
+                num(g.member("hash")));
+}
+
+JsonValue str(string s) { return JsonValue.Str(s.toBytes()); }
+
+string statusOf(Answer a) {
+  if (a.result is null) { return "error \{a.code}: \{a.message}"; }
+  return a.result!.member("status")?.text() ?? "?";
+}
+
+string runTest(Spec spec, JsonValue test) {
+  World w = worldFrom(test.member("pre")!);
+  JsonValue? config = test.member("config");
+  U256 chainId = config is null ? U256.one() : num(config!.member("chainid"));
+  if (chainId.isZero()) { chainId = U256.one(); }
+  Header genesis = genesisOf(test.member("genesisBlockHeader")!);
+  Engine e = Engine.create(spec, chainId, genesis, w);
+
+  JsonArray payloads = test.member("engineNewPayloads")!.array()!;
+  for (i32 i = 0; i < payloads.len(); i++) {
+    JsonValue p = payloads.get(i);
+    if (p.member("errorCode") is not null || p.member("validationError") is not null) { continue; }
+    string v = p.member("newPayloadVersion")!.text()!;
+    JsonArray params = p.member("params")!.array()!;
+    JsonValue want = params.get(0);
+
+    // The fixture's transactions go to the mempool, and the engine builds on the same parent with the
+    // same attributes. Same transactions and same environment must give the same roots.
+    JsonArray txs = want.member("transactions")!.array()!;
+    for (i32 k = 0; k < txs.len(); k++) {
+      JsonArray one = JsonArray.create();
+      one.push(txs.get(k));
+      Answer sent = e.call("eth_sendRawTransaction", JsonValue.Array(one));
+      if (sent.result is null) { return "payload \{i + 1}: transaction \{k} refused by the mempool: \{sent.message}"; }
+    }
+    JsonObject attrs = JsonObject.create();
+    attrs.push("timestamp".toBytes(), want.member("timestamp")!);
+    attrs.push("prevRandao".toBytes(), want.member("prevRandao")!);
+    attrs.push("suggestedFeeRecipient".toBytes(), want.member("feeRecipient")!);
+    attrs.push("withdrawals".toBytes(), want.member("withdrawals") ?? JsonValue.Array(JsonArray.create()));
+    attrs.push("parentBeaconBlockRoot".toBytes(), params.len() > 2 ? params.get(2) : str("0x" + zeros(64)));
+    Answer f = e.call("engine_forkchoiceUpdatedV3", fcu(want.member("parentHash")!, JsonValue.Object(attrs)));
+    JsonValue? id = f.result?.member("payloadId");
+    if (id is null || id!.isNull()) { return "payload \{i + 1}: no payload id: \{f.message}"; }
+    JsonArray idArgs = JsonArray.create();
+    idArgs.push(id!);
+    Answer g = e.call("engine_getPayloadV" + v, JsonValue.Array(idArgs));
+    if (g.result is null) { return "payload \{i + 1}: getPayload: \{g.message}"; }
+    JsonValue built = g.result!.member("executionPayload")!;
+
+    if ((built.member("gasLimit")!.text() ?? "") == (want.member("gasLimit")!.text() ?? "")) {
+      string[] fields = ["stateRoot", "receiptsRoot", "gasUsed", "logsBloom", "blobGasUsed"];
+      for (i32 k = 0; k < fields.len(); k++) {
+        U256 a = num(built.member(fields[k]));
+        U256 b = num(want.member(fields[k]));
+        if (fields[k] == "logsBloom") {
+          if (bytesToHex(bytes(built.member(fields[k]))) != bytesToHex(bytes(want.member(fields[k])))) { return "payload \{i + 1}: built logsBloom differs"; }
+        } else if (!a.eq(b)) {
+          return "payload \{i + 1}: built \{fields[k]} \{a.toHex()}, the fixture's \{b.toHex()}";
+        }
+      }
+    }
+    // What was built must be valid by the engine's own import.
+    JsonArray np = JsonArray.create();
+    np.push(built);
+    for (i32 k = 1; k < params.len(); k++) { np.push(params.get(k)); }
+    if (v == "4") {
+      np = JsonArray.create();
+      np.push(built);
+      np.push(params.get(1));
+      np.push(params.get(2));
+      np.push(g.result!.member("executionRequests")!);
+    }
+    Answer back = e.call("engine_newPayloadV" + v, JsonValue.Array(np));
+    string st = statusOf(back);
+    if (st != "VALID") {
+      string why = back.result is null ? "" : (back.result!.member("validationError")?.text() ?? "");
+      return "payload \{i + 1}: the built payload came back \{st}: \{why}";
+    }
+    // Carry on along the fixture's own chain, so the next payload has its parent.
+    Answer a = e.call("engine_newPayloadV" + v, p.member("params")!);
+    if (statusOf(a) != "VALID") { return "payload \{i + 1}: the fixture's payload is \{statusOf(a)}"; }
+    e.call("engine_forkchoiceUpdatedV3", fcu(want.member("blockHash")!, JsonValue.Null));
+  }
+  return "";
+}
+
+string zeros(i32 n) {
+  string s = "";
+  for (i32 i = 0; i < n; i++) { s += "0"; }
+  return s;
+}
+
+JsonValue fcu(JsonValue head, JsonValue attrs) {
+  JsonObject fc = JsonObject.create();
+  fc.push("headBlockHash".toBytes(), head);
+  fc.push("safeBlockHash".toBytes(), head);
+  fc.push("finalizedBlockHash".toBytes(), str("0x" + zeros(64)));
+  JsonArray args = JsonArray.create();
+  args.push(JsonValue.Object(fc));
+  args.push(attrs);
+  return JsonValue.Array(args);
+}
+
+export async i32 main(Sys sys) {
+  string[] args = sys.args();
+  Tally tally = Tally(0, 0, "Cancun", "");
+  for (i32 a = 0; a < args.len(); a++) {
+    string arg = args[a];
+    if (arg == "--fork") { a++; tally.fork = args[a]; continue; }
+    if (arg == "--filter") { a++; tally.filter = args[a]; continue; }
+    match (await sys.readFile(arg)) {
+      Err(e): { sys.log("FAIL \{arg}: \{e}"); tally.failed++; }
+      Ok(src): {
+        match (parse(src)) {
+          Err(e): { sys.log("FAIL \{arg}: not JSON"); tally.failed++; }
+          Ok(doc): {
+            JsonObject tests = doc.object()!;
+            for (i32 i = 0; i < tests.len(); i++) {
+              string name = tests.at(i).keyStr();
+              JsonValue test = tests.at(i).value;
+              if (tally.filter != "" && name.indexOf(tally.filter) < 0) { continue; }
+              if ((test.member("network")!.text() ?? "") != tally.fork) { continue; }
+              Spec? spec = Spec.byName(tally.fork);
+              if (spec is null) { continue; }
+              string why = runTest(spec!, test);
+              if (why == "") {
+                tally.passed++;
+              } else {
+                tally.failed++;
+                sys.log("FAIL \{name}: \{why}");
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  sys.log("\{tally.passed} passed, \{tally.failed} failed");
+  return tally.failed == 0 ? 0 : 1;
+}

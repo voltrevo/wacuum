@@ -177,6 +177,33 @@ export BlockDecode decodeBlock(Spec spec, u8[] rlpBytes) {
   return BlockDecode(Block(h!, itemsOf(parts[1]), itemsOf(parts[2]).len() > 0, withdrawals), "");
 }
 
+/** The header's RLP, field by field, as `headerOf` reads it. */
+export Item headerItem(Spec spec, Header h) {
+  Vec<Item> f = Vec.create();
+  f.push(Item.Bytes(h.parentHash.toBytes()));
+  f.push(Item.Bytes(h.ommersHash.toBytes()));
+  f.push(Item.Bytes(addressBytes(h.coinbase)));
+  f.push(Item.Bytes(h.stateRoot.toBytes()));
+  f.push(Item.Bytes(h.txRoot.toBytes()));
+  f.push(Item.Bytes(h.receiptsRoot.toBytes()));
+  f.push(Item.Bytes(h.bloom));
+  f.push(Item.Bytes(u256Bytes(h.difficulty)));
+  f.push(Item.Bytes(u256Bytes(h.number)));
+  f.push(Item.Bytes(u256Bytes(h.gasLimit)));
+  f.push(Item.Bytes(u256Bytes(h.gasUsed)));
+  f.push(Item.Bytes(u256Bytes(h.timestamp)));
+  f.push(Item.Bytes(h.extraData));
+  f.push(Item.Bytes(h.prevRandao.toBytes()));
+  f.push(Item.Bytes(h.nonce));
+  f.push(Item.Bytes(u256Bytes(h.baseFee)));
+  f.push(Item.Bytes(h.withdrawalsRoot.toBytes()));
+  f.push(Item.Bytes(u256Bytes(h.blobGasUsed)));
+  f.push(Item.Bytes(u256Bytes(h.excessBlobGas)));
+  f.push(Item.Bytes(h.parentBeaconBlockRoot.toBytes()));
+  if (spec.isPrague) { f.push(Item.Bytes(h.requestsHash.toBytes())); }
+  return Item.List(f.toArray());
+}
+
 // ── Header rules ────────────────────────────────────────────────────────────────
 
 export static string EMPTY_OMMERS = "0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347";
@@ -327,22 +354,81 @@ export string applyBlock(Spec spec, World w, Block b, Header parent, U256 chainI
 
   BlockEnv env = BlockEnv(h.coinbase, h.number, h.timestamp, h.gasLimit, h.prevRandao, h.baseFee,
                           blobGasPrice(spec, h.excessBlobGas), chainId, hashes);
+  Body r = executeBody(spec, w, env, h, b.txs, b.withdrawals, false);
+  if (r.error != "") { return r.error; }
+  if (spec.isPrague && !r.requestsHash.eq(h.requestsHash)) { return "requests hash does not match"; }
+  if (!U256.ofU64(r.gasUsed as! u64).eq(h.gasUsed)) { return "gas used \{r.gasUsed}, header says \{h.gasUsed.toDecimal()}"; }
+  if (!U256.ofU64(r.blobGasUsed as! u64).eq(h.blobGasUsed)) { return "blob gas used does not match"; }
+  if (!r.txRoot.eq(h.txRoot)) { return "transactions root does not match"; }
+  if (!r.receiptsRoot.eq(h.receiptsRoot)) { return "receipts root does not match"; }
+  for (i32 k = 0; k < 256; k++) {
+    if (r.bloom[k] != h.bloom[k]) { return "logs bloom does not match"; }
+  }
+  if (!r.withdrawalsRoot.eq(h.withdrawalsRoot)) { return "withdrawals root does not match"; }
+  if (!r.stateRoot.eq(h.stateRoot)) { return "state root does not match"; }
+  return "";
+}
+
+/** What executing a block's body produced: every commitment its header makes, and what went in. */
+export struct Body {
+  /** Why the body is invalid, or "". */
+  string error;
+  /** The transactions that went in: all of them when importing, those that fit when building. */
+  Item[] included;
+  i64 gasUsed;
+  i64 blobGasUsed;
+  /**
+   * What the transactions paid the fee recipient: its balance after them less before. A transaction that
+   * sends it value counts too, which is generous to the block and harmless — it only informs the
+   * consensus client's choice between this block and a builder's.
+   */
+  U256 fees;
+  u8[] bloom;
+  U256 txRoot;
+  U256 receiptsRoot;
+  U256 withdrawalsRoot;
+  U256 stateRoot;
+  /** EIP-7685's three request lists — deposits, withdrawal requests, consolidations — and their hash. */
+  u8[][] requests;
+  U256 requestsHash;
+}
+
+Body failed(string why) {
+  return Body(why, Item[].filled(0, Item.Bytes(u8[].filled(0, 0))), 0, 0, U256.zero(), u8[].filled(256, 0), U256.zero(), U256.zero(),
+              U256.zero(), U256.zero(), u8[][].defaulted(0), U256.zero());
+}
+
+/**
+ * Run a block's body on `w`: the system calls that open it, its transactions, its withdrawals, and from
+ * Prague its requests. Importing (`skipInvalid` false), a transaction that cannot be included makes the
+ * whole body invalid; building (`skipInvalid` true), it is left out — which is safe because an invalid
+ * transaction is refused before it writes anything.
+ */
+export Body executeBody(Spec spec, World w, BlockEnv env, Header h, Item[] txs, Withdrawal[] withdrawals, bool skipInvalid) {
   systemCall(spec, w, env, U256.fromHex(BEACON_ROOTS)!, h.parentBeaconBlockRoot.toBytes());
   if (spec.isPrague) { systemCall(spec, w, env, U256.fromHex(HISTORY_STORAGE)!, h.parentHash.toBytes()); }
 
   i64 gasLimit = h.gasLimit.low() as@ i64;
   i64 used = 0;
   i64 blobUsed = 0;
-  u8[][] txRaw = u8[][].defaulted(b.txs.len());
-  u8[][] receipts = u8[][].defaulted(b.txs.len());
+  U256 coinbaseBefore = w.balance(env.coinbase);
+  Vec<Item> included = Vec.create();
+  Vec<u8[]> txRaw = Vec.create();
+  Vec<u8[]> receipts = Vec.create();
   u8[] blockBloom = u8[].filled(256, 0);
   Vec<u8[]> deposits = Vec.create();
-  for (i32 i = 0; i < b.txs.len(); i++) {
-    DecodedTx d = decodeTransaction(b.txs[i], chainId);
-    if (d.error != "") { return "transaction \{i}: \{d.error}"; }
+  for (i32 i = 0; i < txs.len(); i++) {
+    DecodedTx d = decodeTransaction(txs[i], env.chainId);
+    if (d.error != "") {
+      if (skipInvalid) { continue; }
+      return failed("transaction \{i}: \{d.error}");
+    }
     Transaction tx = d.tx;
     Processed p = processTransaction(spec, w, env, tx, gasLimit - used, spec.maxBlobGasPerBlock - blobUsed, null);
-    if (p.invalid != "") { return "transaction \{i}: \{p.invalid}"; }
+    if (p.invalid != "") {
+      if (skipInvalid) { continue; }
+      return failed("transaction \{i}: \{p.invalid}");
+    }
     used += p.gasUsed;
     blobUsed += GAS_PER_BLOB * (tx.blobHashes.len() as i64);
     u8[] bloom = u8[].filled(256, 0);
@@ -353,20 +439,23 @@ export string applyBlock(Spec spec, World w, Block b, Header parent, U256 chainI
       if (spec.isPrague && log.address.eq(U256.fromHex(DEPOSIT_CONTRACT)!) && log.topics.len() > 0 &&
           log.topics[0].eq(U256.fromHex(DEPOSIT_EVENT)!)) {
         u8[]? dep = depositOf(log.data);
-        if (dep is null) { return "transaction \{i}: a malformed deposit event"; }
+        if (dep is null) { return failed("transaction \{i}: a malformed deposit event"); }
         deposits.push(dep!);
       }
     }
     for (i32 k = 0; k < 256; k++) { blockBloom[k] = blockBloom[k] | bloom[k]; }
-    txRaw[i] = d.raw;
-    receipts[i] = receiptOf(tx.txType, p.success, used, bloom, p.logs);
+    included.push(txs[i]);
+    txRaw.push(d.raw);
+    receipts.push(receiptOf(tx.txType, p.success, used, bloom, p.logs));
   }
 
+  U256 fees = w.balance(env.coinbase).sub(coinbaseBefore);
+
   // Withdrawals credit gwei, and an account a zero withdrawal created is removed again.
-  u8[][] wsRaw = u8[][].defaulted(b.withdrawals.len());
+  u8[][] wsRaw = u8[][].defaulted(withdrawals.len());
   U256 gwei = U256.ofU64(1000000000);
-  for (i32 i = 0; i < b.withdrawals.len(); i++) {
-    Withdrawal wd = b.withdrawals[i];
+  for (i32 i = 0; i < withdrawals.len(); i++) {
+    Withdrawal wd = withdrawals[i];
     w.addBalance(wd.address, wd.amount.mul(gwei));
     Item[] fields = [Item.Bytes(u256Bytes(wd.index)), Item.Bytes(u256Bytes(wd.validator)), Item.Bytes(addressBytes(wd.address)),
                      Item.Bytes(u256Bytes(wd.amount))];
@@ -374,11 +463,13 @@ export string applyBlock(Spec spec, World w, Block b, Header parent, U256 chainI
   }
   w.endTransaction();
 
+  u8[][] requests = u8[][].defaulted(0);
+  U256 requestsHash = U256.zero();
   if (spec.isPrague) {
     u8[]? withdrawalRequests = requestCall(spec, w, env, WITHDRAWAL_REQUESTS);
-    if (withdrawalRequests is null) { return "the withdrawal request contract failed"; }
+    if (withdrawalRequests is null) { return failed("the withdrawal request contract failed"); }
     u8[]? consolidations = requestCall(spec, w, env, CONSOLIDATION_REQUESTS);
-    if (consolidations is null) { return "the consolidation request contract failed"; }
+    if (consolidations is null) { return failed("the consolidation request contract failed"); }
     u8[][] depositList = deposits.toArray();
     i32 n = 0;
     for (i32 i = 0; i < depositList.len(); i++) { n += depositList[i].len(); }
@@ -388,20 +479,13 @@ export string applyBlock(Spec spec, World w, Block b, Header parent, U256 chainI
       for (i32 k = 0; k < depositList[i].len(); k++) { depositBytes[at + k] = depositList[i][k]; }
       at += depositList[i].len();
     }
-    U256 requestsHash = requestsHashOf([depositBytes, withdrawalRequests!, consolidations!]);
-    if (!requestsHash.eq(h.requestsHash)) { return "requests hash does not match"; }
+    requests = [depositBytes, withdrawalRequests!, consolidations!];
+    requestsHash = requestsHashOf(requests);
   }
 
-  if (!U256.ofU64(used as! u64).eq(h.gasUsed)) { return "gas used \{used}, header says \{h.gasUsed.toDecimal()}"; }
-  if (!U256.ofU64(blobUsed as! u64).eq(h.blobGasUsed)) { return "blob gas used does not match"; }
-  if (!U256.fromBytes(indexedRoot(txRaw), 0, 32).eq(h.txRoot)) { return "transactions root does not match"; }
-  if (!U256.fromBytes(indexedRoot(receipts), 0, 32).eq(h.receiptsRoot)) { return "receipts root does not match"; }
-  for (i32 k = 0; k < 256; k++) {
-    if (blockBloom[k] != h.bloom[k]) { return "logs bloom does not match"; }
-  }
-  if (!U256.fromBytes(indexedRoot(wsRaw), 0, 32).eq(h.withdrawalsRoot)) { return "withdrawals root does not match"; }
-  if (!U256.fromBytes(stateRoot(w), 0, 32).eq(h.stateRoot)) { return "state root does not match"; }
-  return "";
+  return Body("", included.toArray(), used, blobUsed, fees, blockBloom, U256.fromBytes(indexedRoot(txRaw.toArray()), 0, 32),
+              U256.fromBytes(indexedRoot(receipts.toArray()), 0, 32), U256.fromBytes(indexedRoot(wsRaw), 0, 32),
+              U256.fromBytes(stateRoot(w), 0, 32), requests, requestsHash);
 }
 
 /** EIP-7685: sha256 over the sha256 of each non-empty request list, its type byte first. */

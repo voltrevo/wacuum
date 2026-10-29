@@ -55,3 +55,15 @@ MODEXP went without `bignum` because `src/limbs.wac` already had the division it
 
 The fix is two lines in `lib.wac`, `export * as bls from …` and `export * as bignum from …`, if their
 public names are what they should be for a consumer.
+
+## On the JavaScript hosts, a program is given no network, whatever it is granted
+
+`wac run --allow-net prog.wac`, and a `wac app` built with `--allow-net`, both run the program as a spawned
+child, and on the Node host (and, by the same code, Deno) a child gets only its standard streams: the
+comment in `entryNode.ts`/`children.ts` says so ("What a child is granted, in this first cut: nothing but
+its standard input and output"). So `sys.net().listen(...)` answers "network access not granted to this
+application" even with `--allow-net`. `wac update` fails the same way under `--host nodejs`.
+
+**What it costs here:** the node, `cmd/wacuum.wac`, needs a native host. On wasmtime (`./bootstrap.sh --host
+wasmtime`) it listens and serves the Engine API as it should. A refusal that said "this host does not pass
+the network to programs" rather than "not granted" would have saved the hour it took to find.

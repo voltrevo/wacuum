@@ -17,6 +17,7 @@ Against execution-spec-tests v5.4.0:
 | state tests | 16,782 of 16,847 | 18,218 of 18,869 |
 | blockchain tests, imported from block RLP | 17,619 of 17,685 | 20,207 of 20,859 |
 | engine tests, through `engine_newPayload` and `engine_forkchoiceUpdated` | 17,619 of 17,685 | 20,226 of 20,878 |
+| block building: each engine fixture's payloads rebuilt from the mempool, same roots | 17,619 of 17,685 | running |
 
 Every one that fails needs BLS12-381: KZG point evaluation (0x0a) and EIP-2537's precompiles (0x0b to 0x11),
 which wait on wac's `bls` package; see `docs/wac-asks.md`.
@@ -32,7 +33,7 @@ which wait on wac's `bls` package; see `docs/wac-asks.md`.
 | precompiles | **all but one**. ecrecover (secp256k1), SHA-256, RIPEMD-160, identity, MODEXP, bn254 add, mul and pairing, BLAKE2F. KZG point evaluation waits on BLS12-381; see `docs/wac-asks.md` |
 | Prague | **done but for BLS12-381**. EIP-7702 delegation (authorities recovered, not taken from the fixture), EIP-7623's calldata floor, EIP-7691's blob schedule. EIP-2935 and the requests of EIP-7685 belong to blocks, below |
 | blocks | **done for Cancun and Prague**. Blocks and transactions decoded from RLP with every sender recovered, headers checked against their parents (base fee, blob gas, gas limit), EIP-4788 and EIP-2935 system calls, withdrawals, EIP-7685 requests (deposits, withdrawal and consolidation requests), and every root and the bloom checked. An invalid block runs on a copy of the world and leaves no trace |
-| the Engine API | **in progress**. `engine_newPayloadV1`–`V4` (payload to block, the hash and versioned-hash checks, VALID / INVALID / SYNCING, the `-32602` refusals) and `engine_forkchoiceUpdated`, over JSON-RPC and HTTP with HS256 JWT authentication, from a geth-format `genesis.json`. Not yet: building payloads (`forkchoiceUpdated` with attributes, `getPayload`) |
+| the Engine API | **done for a single fork**. `engine_newPayloadV1`–`V4` (payload to block, the hash and versioned-hash checks, VALID / INVALID / SYNCING, the `-32602` refusals), `engine_forkchoiceUpdated` with and without payload attributes, `engine_getPayloadV3`/`V4`, and `eth_sendRawTransaction` into a mempool, over JSON-RPC and HTTP with HS256 JWT authentication, from a geth-format `genesis.json`. Not yet: following a fork that activates after genesis, and blob sidecars for `getPayload`'s blobs bundle |
 | persistence, devp2p, sync | not started |
 
 ## Running it

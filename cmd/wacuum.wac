@@ -13,7 +13,8 @@ import { crypto.keccak256 } from "wac";
 import { U256 } from "../src/u256.wac";
 import { hexToBytes } from "../src/hex.wac";
 import { Genesis, genesisFrom } from "../src/chain/genesis.wac";
-import { Engine, headerItem } from "../src/engine/engine.wac";
+import { Engine } from "../src/engine/engine.wac";
+import { headerItem } from "../src/chain/block.wac";
 import { HttpRequest, headersEnd, parseHead, answerHttp } from "../src/engine/rpc.wac";
 
 string usage() { return "usage: wacuum --genesis FILE --jwt-secret FILE [--addr 127.0.0.1] [--port 8551]"; }

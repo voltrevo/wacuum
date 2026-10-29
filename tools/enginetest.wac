@@ -18,7 +18,8 @@ import { World } from "../src/state/world.wac";
 import { stateRoot } from "../src/state/root.wac";
 import { Spec } from "../src/evm/spec.wac";
 import { Header } from "../src/chain/block.wac";
-import { Engine, Answer, headerItem } from "../src/engine/engine.wac";
+import { Engine, Answer } from "../src/engine/engine.wac";
+import { headerItem } from "../src/chain/block.wac";
 import { num, bytes, worldFrom } from "./fixture.wac";
 
 struct Tally {

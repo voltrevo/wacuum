@@ -2,7 +2,9 @@
 // fixture's pre-state as a geth genesis.json, start `wacuum` on it, then send each payload with a fresh
 // HS256 JWT and check every answer — and that a request without a token is refused.
 //
-//     node tools/engine-e2e.mjs FIXTURE.json [TEST-NAME-SUBSTRING]
+//     WAC=path/to/native/wac node tools/engine-e2e.mjs FIXTURE.json [TEST-NAME-SUBSTRING]
+//
+// It needs a `wac` on a native host: on the JavaScript hosts a program is given no network.
 import { readFileSync, writeFileSync, mkdtempSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { createHmac, randomBytes } from "node:crypto";
@@ -27,7 +29,7 @@ writeFileSync(join(dir, "genesis.json"), JSON.stringify(genesis));
 writeFileSync(join(dir, "jwt.hex"), secret.toString("hex") + "\n");
 const port = 18551 + Math.floor(Math.random() * 1000);
 
-const node = spawn("wac", ["run", "--allow-read", "--allow-net", "cmd/wacuum.wac", "--",
+const node = spawn(process.env.WAC ?? "wac", ["run", "--allow-read", "--allow-net", "cmd/wacuum.wac", "--",
   "--genesis", join(dir, "genesis.json"), "--jwt-secret", join(dir, "jwt.hex"), "--port", String(port)]);
 let out = "";
 node.stdout.on("data", (d) => { out += d; process.stdout.write("  wacuum| " + d); });
@@ -69,6 +71,18 @@ for (const [i, p] of t.engineNewPayloads.entries()) {
 const last = t.engineNewPayloads.filter((p) => !p.validationError && !p.errorCode).at(-1);
 const n = (await rpc("eth_blockNumber", [])).body.result;
 check(!last || n === last.params[0].blockNumber, `eth_blockNumber is ${n}`);
+// The state reads, against the fixture's post-state.
+const norm = (h) => "0x" + (BigInt(h || "0x0").toString(16));
+for (const [addr, acct] of Object.entries(t.postState ?? {})) {
+  const bal = (await rpc("eth_getBalance", [addr, "latest"])).body.result;
+  const nonce = (await rpc("eth_getTransactionCount", [addr, "latest"])).body.result;
+  const code = (await rpc("eth_getCode", [addr, "latest"])).body.result;
+  let ok = norm(bal) === norm(acct.balance) && norm(nonce) === norm(acct.nonce) && code === acct.code;
+  for (const [k, v] of Object.entries(acct.storage)) {
+    ok &&= norm((await rpc("eth_getStorageAt", [addr, k, "latest"])).body.result) === norm(v);
+  }
+  check(ok, `state of ${addr}`);
+}
 node.kill();
 console.log(failed ? `${failed} failed` : "all ok");
 process.exit(failed ? 1 : 0);
