@@ -15,7 +15,7 @@ KZG point evaluation, the one precompile missing.
 
 | | state |
 | --- | --- |
-| `U256`, the EVM word | **done**. Every arithmetic, comparison and bit operation the EVM has, checked against BigInt over 10,350 cases |
+| `U256`, the EVM word | **done**. Every arithmetic, comparison and bit operation the EVM has, checked against BigInt over every pair of nine edge values and 192 random cases |
 | the interpreter | **done for Cancun**. Every opcode, with EIP-2929 access costs, EIP-2200/3529 SSTORE metering and refunds, EIP-1153 transient storage, EIP-6780 SELFDESTRUCT |
 | calls and creation | **done**. The CALL family with EIP-150's 63/64 and the stipend, CREATE and CREATE2 with collision, EIP-3860 and EIP-170 limits |
 | world state | **done**. One journal undoes everything a failed frame did; EIP-161 sweeps touched empty accounts |
