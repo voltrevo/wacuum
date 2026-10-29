@@ -17,6 +17,7 @@ import { hashU256, eqU256 } from "../state/world.wac";
 import { Header, headerItem, decodeBlock, BlockDecode, blockTimestamp } from "../chain/block.wac";
 import { Spec } from "../evm/spec.wac";
 import { Engine, Answer, rawOf } from "../engine/engine.wac";
+import { blockFormOf } from "../engine/blobs.wac";
 import { publicKey } from "./secp.wac";
 import { Conn } from "./peer.wac";
 import { Message, HelloMsg, StatusMsg, Response, ForkId, hello, readHello, status, readStatus, forkId, disconnect,
@@ -284,10 +285,10 @@ Message answerPooled(Engine e, Item body) {
     for (i32 i = 0; i < hashes.len(); i++) {
       U256 want = U256.fromBytes(bytesOf(hashes[i]), 0, 32);
       for (i32 k = 0; k < e.mempool.len(); k++) {
-        u8[] raw = rawOf(e.mempool.get(k));
-        if (raw.len() > 0 && raw[0] != 0x03 && U256.fromBytes(keccak256(raw), 0, 32).eq(want)) {
-          out.push(isList(e.mempool.get(k)) ? e.mempool.get(k) : Item.Bytes(raw));
-        }
+        Item tx = e.mempool.get(k);
+        if (!U256.fromBytes(keccak256(rawOf(tx)), 0, 32).eq(want)) { continue; }
+        u8[]? wire = e.networkForm(tx);
+        if (wire is not null) { out.push(isList(tx) ? tx : Item.Bytes(wire!)); }
       }
     }
   }
@@ -421,7 +422,7 @@ export async void tend(Sys sys, Network n, fn<Ticket<void>()> flush) {
         u8[] raw = n.e.announce.get(i);
         types.push(small(raw[0] >= 0xc0 ? 0 : (raw[0] as u64)));
         sizes.push(small((raw.len() as@ u32) as u64));
-        hashes.push(Item.Bytes(keccak256(raw)));
+        hashes.push(Item.Bytes(keccak256(blockFormOf(raw))));
       }
       n.e.announce = Vec.create();
       u8[] typeBytes = u8[].filled(types.len(), 0);

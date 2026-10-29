@@ -1,6 +1,8 @@
 // wacuum and geth on one devnet, over devp2p. Each has its own consensus client — this script, playing one
 // for each — and they must agree:
 //
+// The chain is Osaka from its genesis.
+//
 //   1. geth makes blocks; wacuum, told of geth's head, syncs them from geth over the network.
 //   2. A transaction sent to wacuum reaches geth's pool, and one sent to geth reaches wacuum's.
 //   3. wacuum makes blocks; geth, told of wacuum's head, syncs them from wacuum, and both end on the same
@@ -17,20 +19,24 @@ const ethers = await import(join(process.env.ETHERS ?? "node_modules/ethers", "l
 const GETH = process.env.GETH ?? "geth";
 const dir = mkdtempSync(join(tmpdir(), "wacuum-devnet-"));
 const key = "0x" + "11".repeat(32);
+const blobKey = "0x" + "33".repeat(32);
 const kit = readFileSync(new URL("../test/chainkit.wac", import.meta.url), "utf8");
 const code = (name) => kit.match(new RegExp(`static string ${name} = "(0x[0-9a-f]+)"`))[1];
 const genesis = {
   config: { chainId: 1337, homesteadBlock: 0, eip150Block: 0, eip155Block: 0, eip158Block: 0, byzantiumBlock: 0,
             constantinopleBlock: 0, petersburgBlock: 0, istanbulBlock: 0, berlinBlock: 0, londonBlock: 0, mergeNetsplitBlock: 0,
-            terminalTotalDifficulty: 0, shanghaiTime: 0, cancunTime: 0, pragueTime: 0,
+            terminalTotalDifficulty: 0, shanghaiTime: 0, cancunTime: 0, pragueTime: 0, osakaTime: 0,
             depositContractAddress: "0x" + "00".repeat(20),
             blobSchedule: { cancun: { target: 3, max: 6, baseFeeUpdateFraction: 3338477 },
-                            prague: { target: 6, max: 9, baseFeeUpdateFraction: 5007716 } } },
+                            prague: { target: 6, max: 9, baseFeeUpdateFraction: 5007716 },
+                            osaka: { target: 6, max: 9, baseFeeUpdateFraction: 5007716 } } },
   nonce: "0x0", timestamp: "0x0", extraData: "0x", gasLimit: "0x1c9c380", difficulty: "0x0", mixHash: "0x" + "00".repeat(32),
   coinbase: "0x" + "00".repeat(20), number: "0x0", gasUsed: "0x0", parentHash: "0x" + "00".repeat(32), baseFeePerGas: "0x3b9aca00",
   excessBlobGas: "0x0", blobGasUsed: "0x0",
   alloc: {
     [new ethers.Wallet(key).address]: { balance: "0x56bc75e2d63100000" },
+    // Blob transactions come from an account of their own: geth keeps an account's transactions in one pool.
+    [new ethers.Wallet(blobKey).address]: { balance: "0x56bc75e2d63100000" },
     "0x00000961ef480eb55e80d19ad83579a64c007002": { nonce: "0x1", code: code("WITHDRAWALS"), balance: "0x0" },
     "0x0000bbddc7ce488642fb579f8b00f3a590007251": { nonce: "0x1", code: code("CONSOLIDATIONS"), balance: "0x0" },
     "0x0000f90827f1c53a10cb7a02335b175320002935": { nonce: "0x1", code: code("HISTORY"), balance: "0x0" },
@@ -88,8 +94,10 @@ const makeBlocks = async (auth, rpc, n) => {
     const { payloadId } = await call(auth, "engine_forkchoiceUpdatedV3",
       [{ headBlockHash: head.hash, safeBlockHash: head.hash, finalizedBlockHash: zero }, attrs], true);
     await new Promise((r) => setTimeout(r, 300));
-    const p = await call(auth, "engine_getPayloadV4", [payloadId], true);
-    await call(auth, "engine_newPayloadV4", [p.executionPayload, [], zero, p.executionRequests], true);
+    const p = await call(auth, "engine_getPayloadV5", [payloadId], true);
+    const hashes = p.blobsBundle.commitments.map((c) => "0x01" + ethers.sha256(c).slice(4));
+    const st = await call(auth, "engine_newPayloadV4", [p.executionPayload, hashes, zero, p.executionRequests], true);
+    if (st.status !== "VALID") throw new Error(`a built block came back ${st.status}: ${st.validationError}`);
     await choose(auth, p.executionPayload.blockHash);
     head = await call(rpc, "eth_getBlockByNumber", ["latest", false]);
   }
@@ -127,11 +135,31 @@ try {
   check(await until(async () => (await call(ports.wac, "eth_getTransactionByHash", [toGeth])) !== null, 20000),
         "and one sent to geth reaches wacuum");
 
+  // Blob transactions, both ways: the zero blob, whose commitment and proof are the point at infinity.
+  const point = "0xc0" + "00".repeat(47);
+  const vhash = "0x01" + ethers.sha256(point).slice(4);
+  const blobTx = async (n) => {
+    const signed = ethers.Transaction.from(await new ethers.Wallet(blobKey).signTransaction({ type: 3, chainId: 1337, nonce: n, to: other.address, value: 1,
+      gasLimit: 21000, maxFeePerGas: 10n ** 10n, maxPriorityFeePerGas: 10n ** 9n, maxFeePerBlobGas: 10n ** 9n,
+      blobVersionedHashes: [vhash] }));
+    const body = ethers.decodeRlp("0x" + signed.serialized.slice(4));
+    // Osaka's sidecar: version 1, and the blob's 128 cell proofs.
+    return "0x03" + ethers.encodeRlp([body, "0x01", ["0x" + "00".repeat(131072)], [point], Array(128).fill(point)]).slice(2);
+  };
+  const blobToWac = await call(ports.wac, "eth_sendRawTransaction", [await blobTx(0)]);
+  check(await until(async () => (await call(ports.gethRpc, "eth_getTransactionByHash", [blobToWac])) !== null, 20000),
+        "a blob transaction sent to wacuum reaches geth's blob pool");
+  const blobToGeth = await call(ports.gethRpc, "eth_sendRawTransaction", [await blobTx(1)]);
+  check(await until(async () => (await call(ports.wac, "eth_getTransactionByHash", [blobToGeth])) !== null, 20000),
+        "and one sent to geth reaches wacuum, sidecar and all");
+
   // 3. wacuum's chain into geth.
   const wacHead = await makeBlocks(ports.wac, ports.wac, 2);
   check(parseInt(wacHead.number, 16) === 5, "wacuum made two blocks on geth's three");
   const wacBlock4 = await call(ports.wac, "eth_getBlockByNumber", ["0x4", true]);
-  check(wacBlock4.transactions.length === 3, "the first holds both gossiped transactions and its own");
+  check(wacBlock4.transactions.length === 5, `the first holds the four gossiped transactions and its own: ${wacBlock4.transactions.length}`);
+  const bundleBlock = await call(ports.wac, "eth_getBlockByNumber", ["0x4", false]);
+  check(bundleBlock.blobGasUsed === "0x40000", "two blobs' worth of blob gas");
   await choose(ports.gethAuth, wacHead.hash);
   check(await until(async () => (await choose(ports.gethAuth, wacHead.hash)).payloadStatus.status === "VALID"),
         "geth syncs wacuum's blocks from wacuum");

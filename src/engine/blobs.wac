@@ -14,6 +14,7 @@
 // proofs that verify. A bad one makes the built block's blobs unavailable to the consensus layer.
 
 import { crypto.sha256 } from "wac";
+import { Vec } from "core";
 import { rlp.Item, rlp.encode, rlp.decode, rlp.Decoded, rlp.bytesOf, rlp.itemsOf, rlp.isList } from "wac";
 import { U256 } from "../u256.wac";
 import { verifyBlobProof } from "../crypto/kzg.wac";
@@ -102,4 +103,41 @@ export bool sidecarsFit(Sidecar[] sidecars, U256[] hashes) {
     if (!versionedHash(sidecars[i].commitment).eq(hashes[i])) { return false; }
   }
   return true;
+}
+
+/** The network form of a blob transaction from its block form and its sidecars, which `unwrap` undoes. */
+export u8[] wrap(u8[] canonical, Sidecar[] sidecars, bool cellProofs) {
+  u8[] body = u8[].filled(canonical.len() - 1, 0);
+  for (i32 i = 0; i < body.len(); i++) { body[i] = canonical[i + 1]; }
+  Item[] blobs = Item[].filled(sidecars.len(), Item.Bytes(u8[].filled(0, 0)));
+  Item[] commitments = Item[].filled(sidecars.len(), Item.Bytes(u8[].filled(0, 0)));
+  Vec<Item> proofs = Vec.create();
+  for (i32 i = 0; i < sidecars.len(); i++) {
+    blobs[i] = Item.Bytes(sidecars[i].blob);
+    commitments[i] = Item.Bytes(sidecars[i].commitment);
+    for (i32 k = 0; k < sidecars[i].proofs.len(); k++) { proofs.push(Item.Bytes(sidecars[i].proofs[k])); }
+  }
+  Item tx = decode(body).item;
+  Item[] parts = cellProofs
+    ? [tx, Item.Bytes([1 as u8]), Item.List(blobs), Item.List(commitments), Item.List(proofs.toArray())]
+    : [tx, Item.List(blobs), Item.List(commitments), Item.List(proofs.toArray())];
+  u8[] packed = encode(Item.List(parts));
+  u8[] out = u8[].filled(packed.len() + 1, 0);
+  out[0] = 0x03;
+  for (i32 i = 0; i < packed.len(); i++) { out[i + 1] = packed[i]; }
+  return out;
+}
+
+/** The block form of a transaction in its network form, without checking anything: what its hash is of. */
+export u8[] blockFormOf(u8[] raw) {
+  if (raw.len() < 2 || raw[0] != 0x03) { return raw; }
+  u8[] rest = u8[].filled(raw.len() - 1, 0);
+  for (i32 i = 0; i < rest.len(); i++) { rest[i] = raw[i + 1]; }
+  Decoded d = decode(rest);
+  if (!d.ok || !isList(d.item) || itemsOf(d.item).len() == 0 || !isList(itemsOf(d.item)[0])) { return raw; }
+  u8[] body = encode(itemsOf(d.item)[0]);
+  u8[] out = u8[].filled(body.len() + 1, 0);
+  out[0] = 0x03;
+  for (i32 i = 0; i < body.len(); i++) { out[i + 1] = body[i]; }
+  return out;
 }
