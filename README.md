@@ -38,7 +38,8 @@ in about an hour and a half.
 | the Engine API | **done**. `engine_newPayloadV1`–`V4`, `engine_forkchoiceUpdatedV1`–`V3` with and without payload attributes, `engine_getPayloadV3`–`V5` with blobs bundles, `engine_getBlobsV1`/`V2`, `eth_sendRawTransaction` into a mempool (blob transactions in their network form, blob proofs verified), over JSON-RPC and HTTP with HS256 JWT authentication, from a geth-format `genesis.json`. Forks are followed and finality prunes them. Not yet: verifying Osaka's cell proofs |
 | persistence | **done, simply**. With `--datadir`, every imported block and fork choice is appended to a log before it is acknowledged, and the log is replayed on start. Not yet: a state snapshot, so a long chain restarts slowly |
 | the user's JSON-RPC | **done for what wallets and libraries use**. Blocks, transactions and receipts (`eth_getBlockByNumber`/`ByHash`, `eth_getTransactionByHash`, `eth_getTransactionReceipt`, `eth_getBlockReceipts`), `eth_getLogs`, state reads at any unfinalized block, `eth_call`, `eth_estimateGas`, fees (`eth_gasPrice`, `eth_maxPriorityFeePerGas`, `eth_feeHistory`, `eth_blobBaseFee`), and the `net_` and `web3_` basics. With `--public-rpc` they are answered without a token; ethers drives them all in `tools/rpc-e2e.mjs`. Not yet: subscriptions and traces |
-| devp2p, sync | not started |
+| devp2p | **talks to geth**. RLPx (EIP-8's handshake, checked against its vectors; AES-CTR frames with keccak MACs), snappy, the base protocol and eth/69 with EIP-2124 fork ids. The node dials `--peer`s and accepts others on `--p2p-port`, serves headers and bodies, and swaps transactions. Not yet: discovery (discv4/v5), receipts for snap sync, blob transactions over the wire |
+| sync | **full sync from peers**. When the consensus client names a block this has not got, headers are fetched back to one it has, then bodies forward, each executed. `tools/devnet-e2e.mjs` runs geth and wacuum side by side: each syncs the other's blocks, transactions cross both ways, and both end on the same state root. Not yet: snap sync, so joining a large chain means executing all of it |
 
 ## Running it
 
@@ -84,14 +85,16 @@ wac app --allow-read --allow-write --allow-net cmd/wacuum.wac -o dist/wacuum
 ```
 
 ```bash
-./dist/wacuum --genesis genesis.json --jwt-secret jwt.hex --datadir data --public-rpc --port 8551
+./dist/wacuum --genesis genesis.json --jwt-secret jwt.hex --datadir data --public-rpc --port 8551 \
+  --p2p-port 30303 --peer enode://…
 ```
 
 It needs a `wac` on a native host (`./bootstrap.sh --host wasmtime` or the default v8): on the JavaScript
 hosts a program is given no network, whatever it is granted. `node tools/engine-e2e.mjs FIXTURE` drives a
 running node through an engine fixture over HTTP, JWT and all, then restarts it on its data directory and
 checks the replayed state; `node tools/rpc-e2e.mjs` makes blocks as a consensus client would and uses
-ethers as a wallet against them.
+ethers as a wallet against them; `node tools/devnet-e2e.mjs` (with `GETH` set) puts wacuum and geth on one
+devnet and checks that they sync from each other.
 
 ## Layout
 
@@ -116,7 +119,8 @@ ethers as a wallet against them.
     src/engine/eth.wac       blocks, transactions, receipts and logs as the eth_ methods spell them
     src/engine/rpc.wac       JSON-RPC over HTTP, and the JWT gate in front of it
     src/engine/jwt.wac       HS256 JWTs, as the Engine API authenticates them
-    cmd/wacuum.wac           the node: genesis, then the Engine API on a socket
+    src/p2p/                 devp2p: secp256k1 keys, RLPx, snappy, the wire messages, peers, sync
+    cmd/wacuum.wac           the node: genesis, the Engine API, its peers
     src/crypto/              a Montgomery field, short-Weierstrass curves, bn254 and its pairing, KZG blob proofs
     src/precompiles/         ecrecover, RIPEMD-160, MODEXP, BLAKE2F, and BLS12-381 on wac's `bls`
     test/                    wac tests; `test*` exports returning "" for a pass
@@ -124,6 +128,7 @@ ethers as a wallet against them.
     tools/blocktest.wac      the blockchain-test runner, importing blocks from RLP
     tools/enginetest.wac     the engine-test runner, through the Engine API's own methods
     tools/buildtest.wac      the block-building runner: each payload rebuilt from the mempool
+    tools/dial.wac           dial a devp2p node and fetch its chain, saying what happens
     tools/fixture.wac        what both runners read from a fixture
     tools/                   vector generators, the fixture fetcher, the cache filler
     docs/wac-asks.md         what wacuum has found wrong with, or wants from, wac
