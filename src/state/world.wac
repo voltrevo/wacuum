@@ -9,6 +9,14 @@
 // entries newest first. That is the whole mechanism, so a change made any other way would survive a revert
 // it should not; nothing outside this file writes an account's fields.
 //
+// ## Change sets
+//
+// A block's effect on the world is kept as a change set: what each account and slot it wrote held before
+// it (first write wins), and, once the block is done, what each holds after. With one, the world can be
+// moved back to the block's parent and forward again in time proportional to what the block changed, which
+// is how one `World` serves every block the engine knows rather than a copy of the state for each. The
+// recording hooks are in the same writing methods the journal's are, so nothing escapes it either.
+//
 // ## Original values
 //
 // SSTORE's gas (EIP-2200) depends on what a slot held when the *transaction* began, which is neither the
@@ -70,6 +78,36 @@ enum Change {
   Touched(U256 addr),
 }
 
+/** An account's fields without its storage, or its absence. */
+export struct AccountState {
+  bool exists;
+  u64 nonce;
+  U256 balance;
+  u8[] code;
+  U256 codeHash;
+}
+
+/** What a block changed: before it, and — once `seal`ed — after it. A zero slot is an absent one. */
+export struct ChangeSet {
+  Map<U256, AccountState> before;
+  Map<U256, Map<U256, U256>> slotsBefore;
+  Map<U256, AccountState> after;
+  Map<U256, Map<U256, U256>> slotsAfter;
+
+  ChangeSet create() {
+    return ChangeSet(Map.create(hashU256, eqU256), Map.create(hashU256, eqU256), Map.create(hashU256, eqU256),
+                     Map.create(hashU256, eqU256));
+  }
+
+  /** How many accounts and slots it touches: a measure of what moving across it costs. */
+  i32 size(this) {
+    i32 n = this.before.len();
+    U256[] addrs = this.slotsBefore.keys();
+    for (i32 i = 0; i < addrs.len(); i++) { n += this.slotsBefore.get(addrs[i])!.len(); }
+    return n;
+  }
+}
+
 export struct Snapshot {
   i32 journal;
   i32 logs;
@@ -89,11 +127,13 @@ export struct World {
   Map<U256, bool> touched;
   Vec<Log> logs;
   i64 refund;
+  /** The change set being recorded, while a block runs. */
+  ChangeSet? recording;
 
   World create() {
     return World(Map.create(hashU256, eqU256), Vec.create(), Map.create(hashU256, eqU256), Map.create(hashU256, eqU256),
                  Map.create(hashU256, eqU256), Map.create(hashU256, eqU256), Map.create(hashU256, eqU256),
-                 Map.create(hashU256, eqU256), Map.create(hashU256, eqU256), Vec.create(), 0);
+                 Map.create(hashU256, eqU256), Map.create(hashU256, eqU256), Vec.create(), 0, null);
   }
 
   // ── Reading ─────────────────────────────────────────────────────────────────
@@ -144,6 +184,7 @@ export struct World {
   Account touch(this, U256 addr) {
     Account? a = this.accounts.get(addr);
     if (a is not null) { return a!; }
+    this.noteAccount(addr);
     Account n = Account.empty();
     this.accounts.set(addr, n);
     this.journal.push(Change.Created(addr));
@@ -161,6 +202,7 @@ export struct World {
   }
 
   void setBalance(this, U256 addr, U256 v) {
+    this.noteAccount(addr);
     Account a = this.touch(addr);
     this.journal.push(Change.Balance(addr, a.balance));
     a.balance = v;
@@ -176,12 +218,14 @@ export struct World {
   }
 
   void setNonce(this, U256 addr, u64 n) {
+    this.noteAccount(addr);
     Account a = this.touch(addr);
     this.journal.push(Change.Nonce(addr, a.nonce));
     a.nonce = n;
   }
 
   void setCode(this, U256 addr, u8[] code) {
+    this.noteAccount(addr);
     Account a = this.touch(addr);
     this.journal.push(Change.Code(addr, a.code, a.codeHash));
     a.code = code;
@@ -189,6 +233,8 @@ export struct World {
   }
 
   void setStorage(this, U256 addr, U256 key, U256 v) {
+    this.noteAccount(addr);
+    this.noteSlot(addr, key);
     Account a = this.touch(addr);
     U256 prev = a.storage.getOr(key, U256.zero());
     Map<U256, U256>? o = this.original.get(addr);
@@ -307,12 +353,27 @@ export struct World {
    */
   void endTransaction(this) {
     U256[] gone = this.destructed.keys();
-    for (i32 i = 0; i < gone.len(); i++) { this.accounts.remove(gone[i]); }
+    for (i32 i = 0; i < gone.len(); i++) { this.remove(gone[i]); }
     U256[] t = this.touched.keys();
     for (i32 i = 0; i < t.len(); i++) {
       Account? a = this.accounts.get(t[i]);
-      if (a is not null && a!.isEmpty()) { this.accounts.remove(t[i]); }
+      if (a is not null && a!.isEmpty()) { this.remove(t[i]); }
     }
+    this.discardTransaction();
+  }
+
+  /** Delete an account, noting it and every slot it had first: undoing the deletion needs all of them. */
+  void remove(this, U256 addr) {
+    Account? a = this.accounts.get(addr);
+    if (a is null) { return; }
+    this.noteAccount(addr);
+    U256[] keys = a!.storage.keys();
+    for (i32 k = 0; k < keys.len(); k++) { this.noteSlot(addr, keys[k]); }
+    this.accounts.remove(addr);
+  }
+
+  /** Forget the transaction in flight without sweeping anything: its journal and everything per-transaction. */
+  void discardTransaction(this) {
     this.journal.clear();
     this.original = Map.create(hashU256, eqU256);
     this.transient = Map.create(hashU256, eqU256);
@@ -321,7 +382,94 @@ export struct World {
     this.createdThisTx = Map.create(hashU256, eqU256);
     this.destructed = Map.create(hashU256, eqU256);
     this.touched = Map.create(hashU256, eqU256);
+    this.logs = Vec.create();
     this.refund = 0;
+  }
+
+  // ── Change sets ─────────────────────────────────────────────────────────────
+
+  AccountState stateOf(this, U256 addr) {
+    Account? a = this.accounts.get(addr);
+    if (a is null) { return AccountState(false, 0, U256.zero(), u8[].filled(0, 0), emptyCodeHash()); }
+    return AccountState(true, a!.nonce, a!.balance, a!.code, a!.codeHash);
+  }
+
+  void noteAccount(this, U256 addr) {
+    if (this.recording is null) { return; }
+    ChangeSet cs = this.recording!;
+    if (!cs.before.has(addr)) { cs.before.set(addr, this.stateOf(addr)); }
+  }
+
+  void noteSlot(this, U256 addr, U256 key) {
+    if (this.recording is null) { return; }
+    ChangeSet cs = this.recording!;
+    Map<U256, U256>? m = cs.slotsBefore.get(addr);
+    if (m is null) {
+      Map<U256, U256> fresh = slotMap();
+      cs.slotsBefore.set(addr, fresh);
+      m = fresh;
+    }
+    if (!m!.has(key)) { m!.set(key, this.storage(addr, key)); }
+  }
+
+  /** Start recording a block's changes. */
+  void record(this) { this.recording = ChangeSet.create(); }
+
+  /** Stop recording, and fill in what each recorded account and slot holds now. */
+  ChangeSet seal(this) {
+    ChangeSet cs = this.recording!;
+    this.recording = null;
+    U256[] addrs = cs.before.keys();
+    for (i32 i = 0; i < addrs.len(); i++) { cs.after.set(addrs[i], this.stateOf(addrs[i])); }
+    U256[] holders = cs.slotsBefore.keys();
+    for (i32 i = 0; i < holders.len(); i++) {
+      Map<U256, U256> now = slotMap();
+      U256[] keys = cs.slotsBefore.get(holders[i])!.keys();
+      for (i32 k = 0; k < keys.len(); k++) { now.set(keys[k], this.storage(holders[i], keys[k])); }
+      cs.slotsAfter.set(holders[i], now);
+    }
+    return cs;
+  }
+
+  /** Back to before the change set: the world must be where it left it. */
+  void undo(this, ChangeSet cs) { this.apply(cs.before, cs.slotsBefore); }
+
+  /** Forward across the change set: the world must be where it found it. */
+  void redo(this, ChangeSet cs) { this.apply(cs.after, cs.slotsAfter); }
+
+  /**
+   * Set each account to `accounts`' state and then each slot to `slots`' value. Accounts first, because a
+   * slot of an account that does not exist is not there to set, and an account that comes back starts
+   * with no storage — every slot it had is in `slots`, since deleting it noted them all.
+   */
+  void apply(this, Map<U256, AccountState> accounts, Map<U256, Map<U256, U256>> slots) {
+    this.discardTransaction();
+    U256[] addrs = accounts.keys();
+    for (i32 i = 0; i < addrs.len(); i++) {
+      AccountState st = accounts.get(addrs[i])!;
+      if (!st.exists) {
+        this.accounts.remove(addrs[i]);
+        continue;
+      }
+      Account? a = this.accounts.get(addrs[i]);
+      if (a is null) {
+        Account fresh = Account.empty();
+        this.accounts.set(addrs[i], fresh);
+        a = fresh;
+      }
+      a!.nonce = st.nonce;
+      a!.balance = st.balance;
+      a!.code = st.code;
+      a!.codeHash = st.codeHash;
+    }
+    U256[] holders = slots.keys();
+    for (i32 i = 0; i < holders.len(); i++) {
+      Account? a = this.accounts.get(holders[i]);
+      if (a is null) { continue; }
+      Map<U256, U256> m = slots.get(holders[i])!;
+      U256[] keys = m.keys();
+      for (i32 k = 0; k < keys.len(); k++) { putSlot(a!.storage, keys[k], m.get(keys[k])!); }
+    }
   }
 }
 

@@ -1,0 +1,107 @@
+// Forks through the engine: two chains from one genesis, the head switched between them, and each still
+// extended afterwards. The engine keeps one world and moves it across blocks' change sets, so this is the
+// test of moving it back (undo), forward (redo), and across a common ancestor.
+
+import { json.JsonValue, json.JsonObject, json.JsonArray } from "wac";
+import { U256 } from "../src/u256.wac";
+import { Engine, Answer } from "../src/engine/engine.wac";
+import { engineFor, str, one } from "./chainkit.wac";
+import { Check } from "./check.wac";
+
+/** Transfers of 1 wei from the funded account to 0x22…22, nonces 0 and 1, signed by ethers for chain 1. */
+static string[] TRANSFERS = [
+  "0x02f8670180018502540be4008252089422222222222222222222222222222222222222220180c001a05065635dbb8c9d50fec33bf0408fea1b5189ca6e03c73d849e88abb36fc1d562a0409e0bc47f86ff65c69e434559d8ae00973f4822a2ce6917fa26b3897104e821",
+  "0x02f8670101018502540be4008252089422222222222222222222222222222222222222220180c080a0f38aa8b9f25875da87ce6999bc4e7198161913940dd1f151a22d752be2ba6b1ea00888e981904c5405a39a6eab79d84b9504e9d7e3d6071481d5898c4f92ac1d41"];
+static string ZERO = "0x0000000000000000000000000000000000000000000000000000000000000000";
+static string TO = "0x2222222222222222222222222222222222222222";
+
+Answer forkchoice(Engine e, U256 head, JsonValue attrs) { return finalizing(e, head, U256.zero(), attrs); }
+
+Answer finalizing(Engine e, U256 head, U256 finalized, JsonValue attrs) {
+  JsonObject st = JsonObject.create();
+  st.push("headBlockHash".toBytes(), str(head.toHex()));
+  st.push("safeBlockHash".toBytes(), str(finalized.toHex()));
+  st.push("finalizedBlockHash".toBytes(), str(finalized.toHex()));
+  JsonArray ps = JsonArray.create();
+  ps.push(JsonValue.Object(st));
+  ps.push(attrs);
+  return e.call("engine_forkchoiceUpdatedV3", JsonValue.Array(ps));
+}
+
+/** Build a block on `parent`, import it, and return its hash; the head is left where it was. */
+U256 extend(Check t, Engine e, U256 parent, i32 time, string recipient) {
+  U256 head = e.head;
+  JsonObject attrs = JsonObject.create();
+  attrs.push("timestamp".toBytes(), str(U256.ofI32(time).toHex()));
+  attrs.push("prevRandao".toBytes(), str(ZERO));
+  attrs.push("suggestedFeeRecipient".toBytes(), str(recipient));
+  attrs.push("withdrawals".toBytes(), JsonValue.Array(JsonArray.create()));
+  attrs.push("parentBeaconBlockRoot".toBytes(), str(ZERO));
+  Answer f = forkchoice(e, parent, JsonValue.Object(attrs));
+  JsonValue? id = f.result?.member("payloadId");
+  if (id is null || id!.isNull()) {
+    t.fail("no payload on \{parent.toHex()}: \{f.message}");
+    return U256.zero();
+  }
+  Answer g = e.call("engine_getPayloadV4", one(id!));
+  JsonValue payload = g.result!.member("executionPayload")!;
+  JsonArray np = JsonArray.create();
+  np.push(payload);
+  np.push(JsonValue.Array(JsonArray.create()));
+  np.push(str(ZERO));
+  np.push(g.result!.member("executionRequests")!);
+  Answer a = e.call("engine_newPayloadV4", JsonValue.Array(np));
+  string st = a.result?.member("status")?.text() ?? a.message;
+  t.eqStr(st, "VALID", "the block built on \{parent.toHex()} imports");
+  forkchoice(e, head, JsonValue.Null);
+  return U256.fromHex(payload.member("blockHash")!.text()!)!;
+}
+
+U256 balanceAt(Engine e, U256 head, string addr) {
+  forkchoice(e, head, JsonValue.Null);
+  return U256.fromHex(e.call("eth_getBalance", one(str(addr))).result!.text()!)!;
+}
+
+void send(Engine e, i32 i) {
+  e.call("eth_sendRawTransaction", one(str(TRANSFERS[i])));
+}
+
+export string test_the_world_follows_the_head_across_forks() {
+  Check t = Check.create();
+  Engine e = engineFor("\"cancunTime\": 0, \"pragueTime\": 0")!;
+  U256 genesis = e.head;
+
+  // A: two blocks, each with a transfer. B: one empty block on the genesis, then one with the first transfer.
+  send(e, 0);
+  U256 a1 = extend(t, e, genesis, 12, "0x00000000000000000000000000000000000000aa");
+  forkchoice(e, a1, JsonValue.Null);
+  send(e, 1);
+  U256 a2 = extend(t, e, a1, 24, "0x00000000000000000000000000000000000000aa");
+  U256 b1 = extend(t, e, genesis, 12, "0x00000000000000000000000000000000000000bb");
+  t.ok(!b1.eq(a1), "the forks differ");
+
+  t.eqU256(balanceAt(e, a2, TO), U256.ofI32(2), "A2 has both transfers");
+  t.eqU256(balanceAt(e, b1, TO), U256.zero(), "B1 has neither");
+  t.eqU256(balanceAt(e, a1, TO), U256.one(), "A1 has the first");
+
+  // The first transfer is valid again on B, since B's world never saw it.
+  forkchoice(e, b1, JsonValue.Null);
+  send(e, 0);
+  U256 b2 = extend(t, e, b1, 24, "0x00000000000000000000000000000000000000bb");
+  t.eqU256(balanceAt(e, b2, TO), U256.one(), "B2 has the first transfer");
+  t.ok(!balanceAt(e, b2, "0x00000000000000000000000000000000000000bb").isZero(), "B's recipient was paid");
+  t.eqU256(balanceAt(e, b2, "0x00000000000000000000000000000000000000aa"), U256.zero(), "A's was not, on B");
+
+  // And A can still be extended after all that moving about.
+  U256 a3 = extend(t, e, a2, 36, "0x00000000000000000000000000000000000000aa");
+  t.eqU256(balanceAt(e, a3, TO), U256.ofI32(2), "A3 on A2's state");
+
+  // Finalizing A2 rules B out: its blocks are forgotten, and asking for one as the head is SYNCING.
+  finalizing(e, a3, a2, JsonValue.Null);
+  Answer gone = forkchoice(e, b2, JsonValue.Null);
+  t.eqStr(gone.result!.member("payloadStatus")!.member("status")!.text()!, "SYNCING", "B2 is gone");
+  t.eqU256(balanceAt(e, a3, TO), U256.ofI32(2), "A3 is where it was");
+  U256 a4 = extend(t, e, a3, 48, "0x00000000000000000000000000000000000000aa");
+  t.ok(!a4.isZero(), "and A goes on");
+  return t.report();
+}

@@ -21,7 +21,7 @@ import { json.JsonValue, json.JsonObject, json.JsonArray } from "wac";
 import { rlp.Item, rlp.encode, rlp.decode, rlp.Decoded } from "wac";
 import { U256 } from "../u256.wac";
 import { hexToBytes, bytesToHex } from "../hex.wac";
-import { World, hashU256, eqU256 } from "../state/world.wac";
+import { World, ChangeSet, hashU256, eqU256 } from "../state/world.wac";
 import { u256Bytes } from "../state/root.wac";
 import { trieRoot } from "../trie/trie.wac";
 import { addressBytes, Evm, BlockEnv, TxEnv, Message, processMessage } from "../evm/evm.wac";
@@ -35,10 +35,14 @@ import { decodeTransaction, DecodedTx } from "../tx/decode.wac";
 import { Attributes, Built, buildBlock } from "../chain/build.wac";
 import { Sidecar, Unwrapped, unwrap, sidecarsFit, CELLS_PER_BLOB } from "./blobs.wac";
 
-/** A block this client has executed, with the state after it. */
+/**
+ * A block this client has executed, and what executing it changed: enough to move the one world there
+ * from its parent and back. Null for the genesis, and for blocks at or below the finalized one, which no
+ * fork choice can leave and so which the world never moves across again.
+ */
 struct Node {
   Header header;
-  World world;
+  ChangeSet? changes;
 }
 
 /** A JSON-RPC answer: a result, or an error with its code. */
@@ -66,6 +70,12 @@ export struct Engine {
   /** Blocks built for a payload id, waiting for engine_getPayload. */
   Map<U256, Built> payloads;
   u64 nextPayloadId;
+  /**
+   * The state, at the block `at`. There is one, moved from block to block across their change sets, so
+   * what the engine holds grows with what blocks change rather than with the state times the blocks.
+   */
+  World world;
+  U256 at;
   /** The blobs of the blob transactions in the mempool, by versioned hash. */
   Map<U256, Sidecar> sidecars;
   /**
@@ -78,8 +88,8 @@ export struct Engine {
   /** An engine whose chain starts at `genesis`, with `world` its state. */
   Engine create(ChainConfig config, Header genesis, World world) {
     Engine e = Engine(config, config.chainId, Map.create(hashU256, eqU256), Map.create(hashU256, eqU256), genesis.hash, genesis.hash,
-                      genesis.hash, Vec.create(), Map.create(hashU256, eqU256), 1, Map.create(hashU256, eqU256), false);
-    e.blocks.set(genesis.hash, Node(genesis, world));
+                      genesis.hash, Vec.create(), Map.create(hashU256, eqU256), 1, world, genesis.hash, Map.create(hashU256, eqU256), false);
+    e.blocks.set(genesis.hash, Node(genesis, null));
     e.canonical.set(genesis.number, genesis.hash);
     return e;
   }
@@ -207,11 +217,18 @@ export struct Engine {
     if (this.blocks.has(h.hash)) { return status("VALID", h.hash.toHex(), ""); }
     Node? parent = this.blocks.get(h.parentHash);
     if (parent is null) { return status("SYNCING", "", ""); }
-    World w = parent!.world.clone();
+    // A parent this client has but cannot reach the state of is on a fork that finality has ruled out.
+    if (!this.moveTo(h.parentHash)) { return status("SYNCING", "", ""); }
     Block b = Block(h, txs.toArray(), false, withdrawals);
-    string err = applyBlock(spec, w, b, parent!.header, this.chainId, this.ancestorHashes(parent!.header));
-    if (err != "") { return this.invalid(h, err); }
-    this.blocks.set(h.hash, Node(h, w));
+    this.world.record();
+    string err = applyBlock(spec, this.world, b, parent!.header, this.chainId, this.ancestorHashes(parent!.header));
+    ChangeSet cs = this.world.seal();
+    if (err != "") {
+      this.world.undo(cs);
+      return this.invalid(h, err);
+    }
+    this.blocks.set(h.hash, Node(h, cs));
+    this.at = h.hash;
     return status("VALID", h.hash.toHex(), "");
   }
 
@@ -221,6 +238,40 @@ export struct Engine {
   }
 
   Answer invalidNoAncestor(this, string why) { return status("INVALID", "", why); }
+
+  /**
+   * Move the world to the state after block `target`: back across change sets to the common ancestor of
+   * where it is and where it is going, then forward. False, with the world unmoved, when the way crosses a
+   * block whose change set has been dropped — a fork below the finalized block.
+   */
+  bool moveTo(this, U256 target) {
+    if (this.at.eq(target)) { return true; }
+    Vec<ChangeSet> back = Vec.create();
+    Vec<ChangeSet> forward = Vec.create();
+    Header a = this.blocks.get(this.at)!.header;
+    Node? tn = this.blocks.get(target);
+    if (tn is null) { return false; }
+    Header b = tn!.header;
+    // Step back whichever side is higher (the departure side on a tie) until the two meet.
+    while (!a.hash.eq(b.hash)) {
+      bool fromHere = !b.number.gt(a.number);
+      Header cur = fromHere ? a : b;
+      Node n = this.blocks.get(cur.hash)!;
+      Node? p = this.blocks.get(cur.parentHash);
+      if (n.changes is null || p is null) { return false; }
+      if (fromHere) {
+        back.push(n.changes!);
+        a = p!.header;
+      } else {
+        forward.push(n.changes!);
+        b = p!.header;
+      }
+    }
+    for (i32 i = 0; i < back.len(); i++) { this.world.undo(back.get(i)); }
+    for (i32 i = forward.len() - 1; i >= 0; i--) { this.world.redo(forward.get(i)); }
+    this.at = target;
+    return true;
+  }
 
   /** Number to hash for the chain ending at `tip`, back as far as BLOCKHASH can see. */
   Map<U256, U256> ancestorHashes(this, Header tip) {
@@ -256,6 +307,7 @@ export struct Engine {
       cur = p!.header;
     }
     this.prune();
+    this.forgetBelowFinalized();
     JsonValue payloadId = JsonValue.Null;
     if (ps.len() >= 2 && ps.get(1).object() is not null) {
       JsonValue at = ps.get(1);
@@ -265,8 +317,13 @@ export struct Engine {
                                     hexU256(at.member("suggestedFeeRecipient")), withdrawalsFrom(at.member("withdrawals")),
                                     hexU256(at.member("parentBeaconBlockRoot")));
       Spec spec = this.config.specAt(attrs.timestamp);
-      Built built = buildBlock(spec, this.blocks.get(head)!.world.clone(), parent, attrs, this.candidates(spec),
-                               this.chainId, this.ancestorHashes(parent));
+      // Built on the head's state and then taken back off it: the block exists only as a payload until the
+      // consensus client sends it back with newPayload.
+      this.moveTo(head);
+      this.world.record();
+      Built built = buildBlock(spec, this.world, parent, attrs, this.candidates(spec), this.chainId,
+                               this.ancestorHashes(parent));
+      this.world.undo(this.world.seal());
       // A body that fails is a chain this client cannot extend at all — a system contract missing or
       // broken — and not something to hand out as an empty block.
       if (built.body.error != "") { return Answer.error(-32603, "cannot build on this head: " + built.body.error); }
@@ -279,6 +336,28 @@ export struct Engine {
     o.push("payloadStatus".toBytes(), status("VALID", head.toHex(), "").result!);
     o.push("payloadId".toBytes(), payloadId);
     return Answer.ok(JsonValue.Object(o));
+  }
+
+  /**
+   * Nothing at or below the finalized block can be reorganised away, so the change sets of the canonical
+   * blocks there are dropped, and so are the blocks of forks that branch off below it.
+   */
+  void forgetBelowFinalized(this) {
+    Node? f = this.blocks.get(this.finalized);
+    if (f is null) { return; }
+    this.moveTo(this.head);
+    U256 fin = f!.header.number;
+    U256[] hashes = this.blocks.keys();
+    for (i32 i = 0; i < hashes.len(); i++) {
+      Node n = this.blocks.get(hashes[i])!;
+      if (n.header.number.gt(fin)) { continue; }
+      U256? c = this.canonical.get(n.header.number);
+      if (c is not null && c!.eq(hashes[i])) {
+        n.changes = null;
+      } else if (!hashes[i].eq(this.at)) {
+        this.blocks.remove(hashes[i]);
+      }
+    }
   }
 
   /** Drop what the head's state has made stale: a transaction whose nonce its sender has already used. */
@@ -444,7 +523,7 @@ export struct Engine {
     JsonValue c = ps.get(0);
     Header h = this.blocks.get(this.head)!.header;
     Spec spec = this.config.specAt(h.timestamp.add(U256.ofU64(12)));
-    World w = this.headState().clone();
+    World w = this.headState();
     BlockEnv env = BlockEnv(h.coinbase, h.number.add(U256.one()), h.timestamp.add(U256.ofU64(12)), h.gasLimit,
                             h.prevRandao, nextBaseFee(h), blobGasPrice(spec, nextExcessBlobGas(spec, h)), this.chainId,
                             this.ancestorHashes(h));
@@ -456,7 +535,9 @@ export struct Engine {
     w.warmAddress(from);
     w.warmAddress(to);
     Message m = Message(from, to, to, hexU256(c.member("value")), data, gas.low() as@ i64, false, 0, true, false);
+    w.record();
     Outcome o = processMessage(evm, m);
+    w.undo(w.seal());
     if (!o.succeeded()) { return Answer.error(3, "execution reverted: " + bytesToHex(o.output())); }
     return Answer.ok(str(bytesToHex(o.output())));
   }
@@ -494,7 +575,10 @@ export struct Engine {
   }
 
   /** The state at the head of the chain. */
-  World headState(this) { return this.blocks.get(this.head)!.world; }
+  World headState(this) {
+    this.moveTo(this.head);
+    return this.world;
+  }
 }
 
 // ── JSON helpers ─────────────────────────────────────────────────────────────────

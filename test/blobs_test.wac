@@ -10,19 +10,13 @@ import { json.parse, json.JsonValue, json.JsonObject, json.JsonArray } from "wac
 import { rlp.Item, rlp.encode, rlp.decode } from "wac";
 import { U256 } from "../src/u256.wac";
 import { hexToBytes, bytesToHex } from "../src/hex.wac";
-import { genesisFrom, Genesis } from "../src/chain/genesis.wac";
 import { Engine, Answer } from "../src/engine/engine.wac";
 import { BLOB_BYTES, CELLS_PER_BLOB } from "../src/engine/blobs.wac";
 import { verifyBlobProof } from "../src/crypto/kzg.wac";
+import { engineFor, str, one } from "./chainkit.wac";
 import { Check } from "./check.wac";
 
 static string SIGNED = "0x03f88e0180018502540be4008252089422222222222222222222222222222222222222220180c0843b9aca00e1a0010657f37554c781402a22917dee2f75def7ab966d7b770905398eba3c44401401a00e85a3cc5946bcec0b4a6cc6f63a83f187d371e7ed6403eb1af918a7f104d042a05049608605d8318e2d23e248b9855bfbccaeabb10855a6d6588baee4e4e91bcd";
-// The system contracts a Prague block calls (EIP-4788, EIP-2935, EIP-7002, EIP-7251): without them a block
-// cannot be built at all.
-static string WITHDRAWALS = "0x3373fffffffffffffffffffffffffffffffffffffffe1460cb5760115f54807fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff146101f457600182026001905f5b5f82111560685781019083028483029004916001019190604d565b909390049250505036603814608857366101f457346101f4575f5260205ff35b34106101f457600154600101600155600354806003026004013381556001015f35815560010160203590553360601b5f5260385f601437604c5fa0600101600355005b6003546002548082038060101160df575060105b5f5b8181146101835782810160030260040181604c02815460601b8152601401816001015481526020019060020154807fffffffffffffffffffffffffffffffff00000000000000000000000000000000168252906010019060401c908160381c81600701538160301c81600601538160281c81600501538160201c81600401538160181c81600301538160101c81600201538160081c81600101535360010160e1565b910180921461019557906002556101a0565b90505f6002555f6003555b5f54807fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff14156101cd57505f5b6001546002828201116101e25750505f6101e8565b01600290035b5f555f600155604c025ff35b5f5ffd";
-static string CONSOLIDATIONS = "0x3373fffffffffffffffffffffffffffffffffffffffe1460d35760115f54807fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff1461019a57600182026001905f5b5f82111560685781019083028483029004916001019190604d565b9093900492505050366060146088573661019a573461019a575f5260205ff35b341061019a57600154600101600155600354806004026004013381556001015f358155600101602035815560010160403590553360601b5f5260605f60143760745fa0600101600355005b6003546002548082038060021160e7575060025b5f5b8181146101295782810160040260040181607402815460601b815260140181600101548152602001816002015481526020019060030154905260010160e9565b910180921461013b5790600255610146565b90505f6002555f6003555b5f54807fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff141561017357505f5b6001546001828201116101885750505f61018e565b01600190035b5f555f6001556074025ff35b5f5ffd";
-static string HISTORY = "0x3373fffffffffffffffffffffffffffffffffffffffe14604657602036036042575f35600143038111604257611fff81430311604257611fff9006545f5260205ff35b5f5ffd5b5f35611fff60014303065500";
-static string BEACON_ROOTS = "0x3373fffffffffffffffffffffffffffffffffffffffe14604d57602036146024575f5ffd5b5f35801560495762001fff810690815414603c575f5ffd5b62001fff01545f5260205ff35b5f5ffd5b62001fff42064281555f359062001fff015500";
 static string HASH = "0x010657f37554c781402a22917dee2f75def7ab966d7b770905398eba3c444014";
 
 /** SIGNED in its network form: one zero blob, its commitment, and `proofs` proofs of it. */
@@ -40,27 +34,6 @@ string wrapped(i32 proofs, bool cellProofs) {
     : [decode(body).item, blobs, commitments, Item.List(ps)];
   string hex = bytesToHex(encode(Item.List(parts)));
   return "0x03" + hex.slice(2, hex.len());
-}
-
-Engine? engineFor(string forks) {
-  string g = "{\"config\": {\"chainId\": 1, \{forks}}, \"gasLimit\": \"0x1c9c380\", \"baseFeePerGas\": \"0x3b9aca00\", " +
-             "\"alloc\": {\"0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A\": {\"balance\": \"0x56bc75e2d63100000\"}" + ", \"0x00000961ef480eb55e80d19ad83579a64c007002\": {\"nonce\": \"0x1\", \"code\": \"" + WITHDRAWALS + "\"}" + ", \"0x0000bbddc7ce488642fb579f8b00f3a590007251\": {\"nonce\": \"0x1\", \"code\": \"" + CONSOLIDATIONS + "\"}" + ", \"0x0000f90827f1c53a10cb7a02335b175320002935\": {\"nonce\": \"0x1\", \"code\": \"" + HISTORY + "\"}" + ", \"0x000f3df6d732807ef1319fb7b8bb8522d0beac02\": {\"nonce\": \"0x1\", \"code\": \"" + BEACON_ROOTS + "\"}" + "}}";
-  string[] why = [""];
-  match (parse(g.toBytes())) {
-    Ok(doc): {
-      Genesis gen = genesisFrom(doc, why)!;
-      return Engine.create(gen.config, gen.header, gen.world);
-    }
-    Err(e): { return null; }
-  }
-}
-
-JsonValue str(string s) { return JsonValue.Str(s.toBytes()); }
-
-JsonValue one(JsonValue v) {
-  JsonArray a = JsonArray.create();
-  a.push(v);
-  return JsonValue.Array(a);
 }
 
 /** Build on the genesis and return getPayload's blobs bundle, or null. */
