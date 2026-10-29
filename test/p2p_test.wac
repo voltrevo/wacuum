@@ -7,6 +7,7 @@ import { publicKey, ecdh, sign, recover } from "../src/p2p/secp.wac";
 import { Hello, Session, readAuth, readAck, makeAuth, makeAck, secrets, session, writeFrame, readFrameHeader,
          readFrameBody } from "../src/p2p/rlpx.wac";
 import { snappyEncode, snappyDecode } from "../src/p2p/snappy.wac";
+import { ForkId, forkId } from "../src/p2p/wire.wac";
 import { Check } from "./check.wac";
 
 static string KEY_A = "1111111111111111111111111111111111111111111111111111111111111111";
@@ -138,5 +139,21 @@ export string test_snappy_reads_the_reference_and_round_trips() {
   t.ok(packed.len() < 20000, "and compress: \{packed.len()} bytes");
   t.ok(snappyDecode(hexToBytes("0x0a0100")!) is null, "a short output is refused");
   t.ok(snappyDecode(hexToBytes("0x040d01")!) is null, "a copy from before the start is refused");
+  return t.report();
+}
+
+export string test_fork_ids_are_mainnets() {
+  Check t = Check.create();
+  U256 genesis = U256.fromHex("0xd4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3")!;
+  u64[] blocks = [1150000, 1920000, 2463000, 2675000, 4370000, 7280000, 9069000, 9200000, 12244000, 12965000, 13773000, 15050000];
+  u64[] times = [1681338455, 1710338135];
+  ForkId f0 = forkId(genesis, blocks, times, 0, 0);
+  t.ok(f0.hash == 0xfc64ec04 && f0.next == 1150000, "unsynced: \{f0.hash} \{f0.next}");
+  ForkId london = forkId(genesis, blocks, times, 12965000, 0);
+  t.ok(london.hash == 0xb715077d && london.next == 13773000, "London: \{london.hash}");
+  ForkId gray = forkId(genesis, blocks, times, 15050000, 0);
+  t.ok(gray.hash == 0xf0afd0e3 && gray.next == 1681338455, "Gray Glacier: \{gray.hash}");
+  ForkId shanghai = forkId(genesis, blocks, times, 20000000, 1681338455);
+  t.ok(shanghai.hash == 0xdce96c2d && shanghai.next == 1710338135, "Shanghai: \{shanghai.hash}");
   return t.report();
 }

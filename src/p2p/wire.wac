@@ -1,0 +1,246 @@
+// The messages two devp2p nodes exchange inside RLPx frames: the base protocol's Hello, Disconnect, Ping and
+// Pong, and the eth protocol's (eth/69, EIP-7642), whose codes start at 0x10 because they come after the
+// base protocol's sixteen. eth/69 is the oldest version current clients still speak: it dropped total
+// difficulty from Status and the block announcements the merge made pointless, and added a message for
+// telling peers which blocks one can serve.
+//
+// A frame's payload is the message code as RLP, then the message: its RLP, snappy-compressed once both
+// sides have said p2p version 5 in Hello — which every client has for years, so Hello is the only message
+// that ever goes uncompressed.
+
+import { rlp.Item, rlp.encode, rlp.decode, rlp.Decoded, rlp.bytesOf, rlp.itemsOf, rlp.isList } from "wac";
+import { U256 } from "../u256.wac";
+import { snappyEncode, snappyDecode } from "./snappy.wac";
+import { concat } from "./secp.wac";
+
+export static i32 HELLO = 0x00;
+export static i32 DISCONNECT = 0x01;
+export static i32 PING = 0x02;
+export static i32 PONG = 0x03;
+
+/** eth/69's messages, offset past the base protocol. */
+export static i32 ETH = 0x10;
+export static i32 STATUS = 0x10;
+export static i32 NEW_BLOCK_HASHES = 0x11;
+export static i32 TRANSACTIONS = 0x12;
+export static i32 GET_BLOCK_HEADERS = 0x13;
+export static i32 BLOCK_HEADERS = 0x14;
+export static i32 GET_BLOCK_BODIES = 0x15;
+export static i32 BLOCK_BODIES = 0x16;
+export static i32 NEW_BLOCK = 0x17;
+export static i32 NEW_POOLED_TRANSACTION_HASHES = 0x18;
+export static i32 GET_POOLED_TRANSACTIONS = 0x19;
+export static i32 POOLED_TRANSACTIONS = 0x1a;
+export static i32 GET_RECEIPTS = 0x1f;
+export static i32 RECEIPTS = 0x20;
+export static i32 BLOCK_RANGE_UPDATE = 0x21;
+/** How many codes eth/69 takes, so a later capability's would start after them. */
+export static i32 ETH_LENGTH = 18;
+
+/** A message: its code and its RLP. */
+export struct Message {
+  i32 code;
+  Item body;
+}
+
+/** A U256 as RLP spells an integer. */
+export Item num(U256 v) {
+  u8[] full = v.toBytes();
+  i32 skip = 0;
+  while (skip < 32 && full[skip] == 0) { skip++; }
+  u8[] out = u8[].filled(32 - skip, 0);
+  for (i32 i = 0; i < out.len(); i++) { out[i] = full[skip + i]; }
+  return Item.Bytes(out);
+}
+
+export Item small(u64 v) { return num(U256.ofU64(v)); }
+
+/** An RLP integer item's value; zero for anything longer than 32 bytes or a list. */
+export U256 numOf(Item it) {
+  if (isList(it)) { return U256.zero(); }
+  u8[] b = bytesOf(it);
+  if (b.len() == 0 || b.len() > 32) { return U256.zero(); }
+  return U256.fromBytes(b, 0, b.len());
+}
+
+/** The payload of a frame carrying `m`. */
+export u8[] framePayload(Message m, bool snappy) {
+  u8[] body = encode(m.body);
+  return concat([encode(small((m.code as@ u32) as u64)), snappy ? snappyEncode(body) : body]);
+}
+
+/** The message in a frame's payload, or null if it is not one. */
+export Message? readPayload(u8[] payload, bool snappy) {
+  if (payload.len() == 0) { return null; }
+  // The code is a one-byte RLP integer: 0x80 for zero, the byte itself below 0x80.
+  i32 first = payload[0] as i32;
+  i32 code = first == 0x80 ? 0 : first;
+  if (first > 0x80) { return null; }
+  u8[] rest = u8[].filled(payload.len() - 1, 0);
+  for (i32 i = 0; i < rest.len(); i++) { rest[i] = payload[i + 1]; }
+  if (snappy) {
+    u8[]? plain = snappyDecode(rest);
+    if (plain is null) { return null; }
+    rest = plain!;
+  }
+  Decoded d = decode(rest);
+  if (!d.ok) { return null; }
+  return Message(code, d.item);
+}
+
+// ── Hello ────────────────────────────────────────────────────────────────────────────────────────────
+
+export struct HelloMsg {
+  u64 version;
+  string client;
+  /** Each capability as `name/version`, e.g. "eth/68". */
+  string[] caps;
+  u8[] nodeId;
+}
+
+export Message hello(string client, u8[] nodeId) {
+  Item caps = Item.List([Item.List([Item.Bytes("eth".toBytes()), small(69)])]);
+  return Message(HELLO, Item.List([small(5), Item.Bytes(client.toBytes()), caps, small(0), Item.Bytes(nodeId)]));
+}
+
+export HelloMsg? readHello(Item body) {
+  if (!isList(body) || itemsOf(body).len() < 5) { return null; }
+  Item[] f = itemsOf(body);
+  if (!isList(f[2])) { return null; }
+  Item[] cs = itemsOf(f[2]);
+  string[] caps = string[].filled(cs.len(), "");
+  for (i32 i = 0; i < cs.len(); i++) {
+    if (!isList(cs[i]) || itemsOf(cs[i]).len() < 2) { return null; }
+    Item[] c = itemsOf(cs[i]);
+    caps[i] = string.fromBytes(bytesOf(c[0])) + "/" + numOf(c[1]).toDecimal();
+  }
+  return HelloMsg(numOf(f[0]).low(), string.fromBytes(bytesOf(f[1])), caps, bytesOf(f[4]));
+}
+
+export Message disconnect(i32 reason) { return Message(DISCONNECT, Item.List([small((reason as@ u32) as u64)])); }
+
+/** Disconnect reasons, devp2p's numbering. */
+export static i32 DISCONNECT_REQUESTED = 0x00;
+export static i32 DISCONNECT_USELESS = 0x03;
+export static i32 DISCONNECT_INCOMPATIBLE = 0x06;
+export static i32 DISCONNECT_SUBPROTOCOL = 0x10;
+
+export string disconnectReason(Item body) {
+  Item r = body;
+  if (isList(body) && itemsOf(body).len() > 0) { r = itemsOf(body)[0]; }
+  string[] names = ["requested", "network error", "breach of protocol", "useless peer", "too many peers", "already connected",
+                    "incompatible version", "invalid identity", "client quitting", "unexpected identity", "connected to self",
+                    "read timeout"];
+  i32 n = numOf(r).low() as! i32;
+  if (n < names.len()) { return names[n]; }
+  return n == 0x10 ? "subprotocol error" : "reason \{n}";
+}
+
+// ── Status and the fork id ───────────────────────────────────────────────────────────────────────────
+
+static u32[] CRC_TABLE = crcTable();
+
+u32[] crcTable() {
+  u32[] t = u32[].filled(256, 0);
+  for (u32 i = 0; i < 256; i++) {
+    u32 c = i;
+    for (i32 k = 0; k < 8; k++) { c = (c & 1) != 0 ? (0xedb88320 ^ (c >> 1)) : (c >> 1); }
+    t[i as! i32] = c;
+  }
+  return t;
+}
+
+export u32 crc32(u8[] data) {
+  u32 c = 0xffffffff;
+  for (i32 i = 0; i < data.len(); i++) { c = CRC_TABLE[((c ^ (data[i] as u32)) & 0xff) as! i32] ^ (c >> 8); }
+  return c ^ 0xffffffff;
+}
+
+/** EIP-2124's fork id at a head: CRC32 of the genesis hash and every fork passed, and the next fork or 0. */
+export struct ForkId {
+  u32 hash;
+  u64 next;
+}
+
+export ForkId forkId(U256 genesisHash, u64[] blocks, u64[] times, u64 headNumber, u64 headTime) {
+  u8[] data = genesisHash.toBytes();
+  for (i32 i = 0; i < blocks.len(); i++) {
+    if (blocks[i] > headNumber) { return ForkId(crc32(data), blocks[i]); }
+    data = concat([data, be64(blocks[i])]);
+  }
+  for (i32 i = 0; i < times.len(); i++) {
+    if (times[i] > headTime) { return ForkId(crc32(data), times[i]); }
+    data = concat([data, be64(times[i])]);
+  }
+  return ForkId(crc32(data), 0);
+}
+
+u8[] be64(u64 v) {
+  u8[] out = u8[].filled(8, 0);
+  for (i32 i = 0; i < 8; i++) { out[i] = ((v >> (8 * (7 - i))) & 0xff) as! u8; }
+  return out;
+}
+
+/** eth/69's Status: version, network id, genesis, fork id, and the range of blocks this node can serve. */
+export struct StatusMsg {
+  u64 version;
+  U256 networkId;
+  U256 genesis;
+  ForkId fork;
+  u64 earliest;
+  u64 latest;
+  U256 latestHash;
+}
+
+export Message status(StatusMsg s) {
+  u8[] fh = [((s.fork.hash >> 24) & 0xff) as! u8, ((s.fork.hash >> 16) & 0xff) as! u8, ((s.fork.hash >> 8) & 0xff) as! u8,
+             (s.fork.hash & 0xff) as! u8];
+  return Message(STATUS, Item.List([small(s.version), num(s.networkId), Item.Bytes(s.genesis.toBytes()),
+                                    Item.List([Item.Bytes(fh), small(s.fork.next)]), small(s.earliest), small(s.latest),
+                                    Item.Bytes(s.latestHash.toBytes())]));
+}
+
+export StatusMsg? readStatus(Item body) {
+  if (!isList(body) || itemsOf(body).len() < 7) { return null; }
+  Item[] f = itemsOf(body);
+  if (!isList(f[3]) || itemsOf(f[3]).len() < 2) { return null; }
+  u8[] fh = bytesOf(itemsOf(f[3])[0]);
+  if (fh.len() != 4 || bytesOf(f[2]).len() != 32 || bytesOf(f[6]).len() != 32) { return null; }
+  u32 hash = ((fh[0] as u32) << 24) | ((fh[1] as u32) << 16) | ((fh[2] as u32) << 8) | (fh[3] as u32);
+  return StatusMsg(numOf(f[0]).low(), numOf(f[1]), U256.fromBytes(bytesOf(f[2]), 0, 32), ForkId(hash, numOf(itemsOf(f[3])[1]).low()),
+                   numOf(f[4]).low(), numOf(f[5]).low(), U256.fromBytes(bytesOf(f[6]), 0, 32));
+}
+
+/** BlockRangeUpdate: the blocks this node can now serve, sent as its head moves. */
+export Message blockRange(u64 earliest, u64 latest, U256 latestHash) {
+  return Message(BLOCK_RANGE_UPDATE, Item.List([small(earliest), small(latest), Item.Bytes(latestHash.toBytes())]));
+}
+
+// ── Requests ─────────────────────────────────────────────────────────────────────────────────────────
+
+/** GetBlockHeaders from a number: `amount` headers, `skip` apart, descending if `reverse`. */
+export Message getHeadersByNumber(u64 id, u64 from, u64 amount, u64 skip, bool reverse) {
+  return Message(GET_BLOCK_HEADERS, Item.List([small(id), Item.List([small(from), small(amount), small(skip), small(reverse ? 1 : 0)])]));
+}
+
+export Message getHeadersByHash(u64 id, U256 from, u64 amount, u64 skip, bool reverse) {
+  return Message(GET_BLOCK_HEADERS, Item.List([small(id), Item.List([Item.Bytes(from.toBytes()), small(amount), small(skip),
+                                                                      small(reverse ? 1 : 0)])]));
+}
+
+export Message getBodies(u64 id, U256[] hashes) {
+  Item[] hs = Item[].filled(hashes.len(), Item.Bytes(u8[].filled(0, 0)));
+  for (i32 i = 0; i < hashes.len(); i++) { hs[i] = Item.Bytes(hashes[i].toBytes()); }
+  return Message(GET_BLOCK_BODIES, Item.List([small(id), Item.List(hs)]));
+}
+
+/** A response's request id and its list of items, or null if it is not shaped as one. */
+export struct Response {
+  u64 id;
+  Item[] items;
+}
+
+export Response? readResponse(Item body) {
+  if (!isList(body) || itemsOf(body).len() < 2 || !isList(itemsOf(body)[1])) { return null; }
+  return Response(numOf(itemsOf(body)[0]).low(), itemsOf(itemsOf(body)[1]));
+}

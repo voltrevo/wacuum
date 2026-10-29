@@ -1,0 +1,141 @@
+// Dial a devp2p node, say Hello and Status, and fetch its chain into a fresh engine: every header from the
+// genesis up, every body, each block imported (and so executed and checked) as it comes.
+//
+//     wac run --allow-read --allow-net tools/dial.wac -- --genesis genesis.json --enode enode://ID@HOST:PORT
+//
+// What it prints is a conversation with another client, which is the point: each step a real client has
+// to agree with.
+
+import { Sys } from "std";
+import { Vec } from "core";
+import { json.parse } from "wac";
+import { rlp.Item, rlp.encode, rlp.itemsOf, rlp.isList } from "wac";
+import { crypto.keccak256 } from "wac";
+import { U256 } from "../src/u256.wac";
+import { hexToBytes, bytesToHex } from "../src/hex.wac";
+import { Genesis, genesisFrom } from "../src/chain/genesis.wac";
+import { headerItem, decodeBlock, BlockDecode, blockTimestamp } from "../src/chain/block.wac";
+import { Spec } from "../src/evm/spec.wac";
+import { Engine, Answer } from "../src/engine/engine.wac";
+import { publicKey } from "../src/p2p/secp.wac";
+import { Conn } from "../src/p2p/peer.wac";
+import { Message, HelloMsg, StatusMsg, Response, hello, readHello, status, readStatus, forkId, ForkId, disconnect,
+         disconnectReason, getHeadersByNumber, getBodies, readResponse, HELLO, DISCONNECT, PING, PONG, STATUS, BLOCK_HEADERS,
+         BLOCK_BODIES, DISCONNECT_REQUESTED } from "../src/p2p/wire.wac";
+
+/** The next message that is not housekeeping: pings are answered, and a disconnect ends it. */
+async Message? next(Sys sys, Conn c) {
+  while (true) {
+    Message? m = await c.receive();
+    if (m is null) {
+      sys.warn("dial: \{c.error}");
+      return null;
+    }
+    if (m!.code == PING) {
+      await c.send(Message(PONG, Item.List(Item[].filled(0, Item.Bytes(u8[].filled(0, 0))))));
+      continue;
+    }
+    if (m!.code == DISCONNECT) {
+      sys.warn("dial: the peer disconnected: \{disconnectReason(m!.body)}");
+      return null;
+    }
+    return m;
+  }
+}
+
+export async i32 main(Sys sys) {
+  string[] args = sys.args();
+  string genesisPath = "";
+  string enode = "";
+  for (i32 i = 0; i + 1 < args.len(); i += 2) {
+    if (args[i] == "--genesis") { genesisPath = args[i + 1]; }
+    if (args[i] == "--enode") { enode = args[i + 1]; }
+  }
+  // enode://<128 hex>@host:port
+  i32 at = enode.indexOf("@");
+  u8[] remote = hexToBytes(enode.slice(8, at))!;
+  string hostPort = enode.slice(at + 1, enode.len());
+  i32 q = hostPort.indexOf("?");
+  if (q >= 0) { hostPort = hostPort.slice(0, q); }
+  i32 colon = hostPort.indexOf(":");
+  string host = hostPort.slice(0, colon);
+  i32 port = 0;
+  u8[] pd = hostPort.slice(colon + 1, hostPort.len()).toBytes();
+  for (i32 i = 0; i < pd.len(); i++) { port = port * 10 + ((pd[i] - 48) as i32); }
+
+  Genesis? g = null;
+  match (await sys.readFile(genesisPath)) {
+    Err(e): { sys.warn("dial: \{e}"); return 1; }
+    Ok(b): {
+      string[] why = [""];
+      g = genesisFrom(parse(b).ok()!, why);
+    }
+  }
+  Genesis gen = g!;
+  gen.header.hash = U256.fromBytes(keccak256(encode(headerItem(gen.spec, gen.header))), 0, 32);
+  Engine e = Engine.create(gen.config, gen.header, gen.world);
+  sys.log("dial: our genesis \{gen.header.hash.toHex()}");
+
+  u8[] rand = (await sys.random().bytes(144)).ok()!;
+  u8[] nodeKey = u8[].filled(32, 0);
+  for (i32 i = 0; i < 32; i++) { nodeKey[i] = rand[112 + i]; }
+  Conn? cc = null;
+  match (await sys.net().connect(host, port)) {
+    Err(err): { sys.warn("dial: \{host}:\{port}: \{err}"); return 1; }
+    Ok(sock): { cc = Conn.over(sock); }
+  }
+  Conn c = cc!;
+  if (!(await c.initiate(nodeKey, remote, rand))) { sys.warn("dial: handshake: \{c.error}"); return 1; }
+  sys.log("dial: RLPx handshake done");
+
+  await c.send(hello("wacuum/v0.1.0", publicKey(nodeKey)));
+  Message? hm = await next(sys, c);
+  if (hm is null || hm!.code != HELLO) { sys.warn("dial: no Hello"); return 1; }
+  HelloMsg h = readHello(hm!.body)!;
+  sys.log("dial: Hello from \{h.client}, p2p \{h.version}, caps \{h.caps.len()}: \{h.caps[0]}…");
+  c.s!.snappy = h.version >= 5;
+
+  ForkId f = forkId(gen.header.hash, gen.forkBlocks, gen.forkTimes, 0, gen.header.timestamp.low());
+  await c.send(status(StatusMsg(69, gen.config.chainId, gen.header.hash, f, 0, 0, gen.header.hash)));
+  Message? sm = await next(sys, c);
+  if (sm is null || sm!.code != STATUS) { sys.warn("dial: no Status"); return 1; }
+  StatusMsg st = readStatus(sm!.body)!;
+  sys.log("dial: Status: eth/\{st.version}, network \{st.networkId.toDecimal()}, genesis \{st.genesis.toHex()}, blocks \{st.earliest}-\{st.latest}, fork \{st.fork.hash} next \{st.fork.next} (ours \{f.hash})");
+  if (!st.genesis.eq(gen.header.hash)) { sys.warn("dial: a different chain"); return 1; }
+
+  // Headers 1 up to its latest, then their bodies, then import.
+  u64 have = 0;
+  u64 reqId = 1;
+  while (have < st.latest) {
+    await c.send(getHeadersByNumber(reqId, have + 1, 64, 0, false));
+    Message? hr = await next(sys, c);
+    while (hr is not null && hr!.code != BLOCK_HEADERS) { hr = await next(sys, c); }
+    if (hr is null) { return 1; }
+    Response r = readResponse(hr!.body)!;
+    if (r.items.len() == 0) { break; }
+    U256[] hashes = U256[].filled(r.items.len(), U256.zero());
+    for (i32 i = 0; i < r.items.len(); i++) { hashes[i] = U256.fromBytes(keccak256(encode(r.items[i])), 0, 32); }
+    await c.send(getBodies(reqId + 1, hashes));
+    Message? br = await next(sys, c);
+    while (br is not null && br!.code != BLOCK_BODIES) { br = await next(sys, c); }
+    if (br is null) { return 1; }
+    Response bodies = readResponse(br!.body)!;
+    for (i32 i = 0; i < bodies.items.len(); i++) {
+      Item[] parts = itemsOf(bodies.items[i]);
+      Item[] whole = [r.items[i], parts[0], parts[1], parts.len() > 2 ? parts[2] : Item.List(Item[].filled(0, parts[1]))];
+      u8[] raw = encode(Item.List(whole));
+      Spec spec = gen.config.specAt(blockTimestamp(raw));
+      BlockDecode bd = decodeBlock(spec, raw);
+      if (bd.block is null) { sys.warn("dial: block \{have + 1}: \{bd.error}"); return 1; }
+      Answer a = e.importBlock(spec, bd.block!);
+      string verdict = a.result!.member("status")!.text()!;
+      sys.log("dial: block \{bd.block!.header.number.toDecimal()} \{bd.block!.header.hash.toHex()}: \{bd.block!.txs.len()} txs, \{verdict}");
+      if (verdict != "VALID") { sys.warn("dial: \{a.result!.member("validationError")!.text() ?? ""}"); return 1; }
+      have++;
+    }
+    reqId += 2;
+  }
+  await c.send(disconnect(DISCONNECT_REQUESTED));
+  sys.log("dial: imported \{have} blocks from the peer");
+  return 0;
+}

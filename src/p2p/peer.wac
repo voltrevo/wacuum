@@ -1,0 +1,154 @@
+// One devp2p connection over TCP: the RLPx handshake from either end, then messages in frames.
+//
+// What to say is the caller's; this reads and writes. Reading buffers what the socket hands over, since a
+// frame arrives in however many pieces TCP likes and two frames can arrive in one.
+
+import { Sys, Socket } from "std";
+import { rlp.Item } from "wac";
+import { publicKey, concat } from "./secp.wac";
+import { Session, Hello, makeAuth, readAuth, makeAck, readAck, packetLength, session, writeFrame, readFrameHeader,
+         frameBodyLength, readFrameBody } from "./rlpx.wac";
+import { Message, framePayload, readPayload } from "./wire.wac";
+
+export struct Conn {
+  Socket sock;
+  u8[] buf;
+  i32 len;
+  Session? s;
+  /** Why the connection ended, once it has. */
+  string error;
+
+  Conn over(Socket sock) { return Conn(sock, u8[].filled(4096, 0), 0, null, ""); }
+
+  /** Exactly `n` bytes, or null when the other end closes first. */
+  async u8[]? read(this, i32 n) {
+    while (this.len < n) {
+      match (await this.sock.recv()) {
+        Err(e): {
+          this.error = "\{e}";
+          return null;
+        }
+        Ok(r): {
+          match (r) {
+            End: {
+              this.error = "the peer closed the connection";
+              return null;
+            }
+            Data(bytes): {
+              if (this.len + bytes.len() > this.buf.len()) {
+                i32 cap = this.buf.len() * 2;
+                while (cap < this.len + bytes.len()) { cap = cap * 2; }
+                u8[] grown = u8[].filled(cap, 0);
+                for (i32 i = 0; i < this.len; i++) { grown[i] = this.buf[i]; }
+                this.buf = grown;
+              }
+              for (i32 i = 0; i < bytes.len(); i++) { this.buf[this.len + i] = bytes[i]; }
+              this.len += bytes.len();
+            }
+          }
+        }
+      }
+    }
+    u8[] out = u8[].filled(n, 0);
+    for (i32 i = 0; i < n; i++) { out[i] = this.buf[i]; }
+    for (i32 i = n; i < this.len; i++) { this.buf[i - n] = this.buf[i]; }
+    this.len -= n;
+    return out;
+  }
+
+  async bool write(this, u8[] bytes) {
+    match (await this.sock.send(bytes)) {
+      Err(e): {
+        this.error = "\{e}";
+        return false;
+      }
+      Ok(_): { return true; }
+    }
+  }
+
+  /** A whole handshake packet, in either form. */
+  async u8[]? readPacket(this) {
+    u8[]? head = await this.read(2);
+    if (head is null) { return null; }
+    i32 total = packetLength(head!);
+    // The old form has no size; its packets are 307 bytes (auth) or 210 (ack), told apart by the caller.
+    if (total < 0) {
+      this.error = "a pre-EIP-8 handshake, which this does not answer";
+      return null;
+    }
+    u8[]? rest = await this.read(total - 2);
+    if (rest is null) { return null; }
+    return concat([head!, rest!]);
+  }
+
+  /** Dial: send auth, read ack. `rand` is 32 + 32 + 32 + 16 random bytes: ephemeral key, nonce, ECIES key, IV. */
+  async bool initiate(this, u8[] nodeKey, u8[] remote, u8[] rand) {
+    u8[] eph = slice(rand, 0, 32);
+    u8[] nonce = slice(rand, 32, 64);
+    u8[] auth = makeAuth(nodeKey, remote, eph, nonce, u8[].filled(100 + (rand[0] as i32), 0), slice(rand, 64, 96),
+                         slice(rand, 96, 112));
+    if (!(await this.write(auth))) { return false; }
+    u8[]? ack = await this.readPacket();
+    if (ack is null) { return false; }
+    Hello h = readAck(nodeKey, ack!);
+    if (h.error != "") {
+      this.error = h.error;
+      return false;
+    }
+    this.s = session(true, eph, h.ephemeralKey, nonce, h.nonce, auth, ack!, remote);
+    return true;
+  }
+
+  /** Answer a dialler: read auth, send ack. `rand` as for `initiate`. */
+  async bool respond(this, u8[] nodeKey, u8[] rand) {
+    u8[]? auth = await this.readPacket();
+    if (auth is null) { return false; }
+    Hello h = readAuth(nodeKey, auth!);
+    if (h.error != "") {
+      this.error = h.error;
+      return false;
+    }
+    u8[] eph = slice(rand, 0, 32);
+    u8[] nonce = slice(rand, 32, 64);
+    u8[] ack = makeAck(h.staticKey, eph, nonce, u8[].filled(100 + (rand[0] as i32), 0), slice(rand, 64, 96), slice(rand, 96, 112));
+    if (!(await this.write(ack))) { return false; }
+    this.s = session(false, eph, h.ephemeralKey, h.nonce, nonce, auth!, ack, h.staticKey);
+    return true;
+  }
+
+  async bool send(this, Message m) {
+    Session s = this.s!;
+    return await this.write(writeFrame(s, framePayload(m, s.snappy)));
+  }
+
+  /** The next message, or null when the connection has failed (and `error` says why). */
+  async Message? receive(this) {
+    Session s = this.s!;
+    u8[]? head = await this.read(32);
+    if (head is null) { return null; }
+    i32 size = readFrameHeader(s, head!);
+    if (size < 0) {
+      this.error = "a frame header with a bad MAC";
+      return null;
+    }
+    u8[]? rest = await this.read(frameBodyLength(size));
+    if (rest is null) { return null; }
+    u8[]? payload = readFrameBody(s, rest!, size);
+    if (payload is null) {
+      this.error = "a frame with a bad MAC";
+      return null;
+    }
+    Message? m = readPayload(payload!, s.snappy);
+    if (m is null) { this.error = "a message that does not decode"; }
+    return m;
+  }
+
+  /** The remote node's key, once the handshake is done. */
+  u8[] remote(this) { return this.s!.remote; }
+}
+
+u8[] slice(u8[] b, i32 from, i32 to) {
+  u8[] out = u8[].filled(to - from, 0);
+  for (i32 i = from; i < to; i++) { out[i - from] = b[i]; }
+  return out;
+}
