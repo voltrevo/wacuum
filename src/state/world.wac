@@ -132,13 +132,16 @@ export struct World {
   Map<U256, bool> touched;
   Vec<Log> logs;
   i64 refund;
-  /** The change set being recorded, while a block runs. */
-  ChangeSet? recording;
+  /**
+   * The change sets being recorded: a block's while it runs, and inside it one transaction's when a builder
+   * may want to take that transaction back out. Each change is noted in every one.
+   */
+  Vec<ChangeSet> recording;
 
   World create() {
     return World(Map.create(hashU256, eqU256), Vec.create(), Map.create(hashU256, eqU256), Map.create(hashU256, eqU256),
                  Map.create(hashU256, eqU256), Map.create(hashU256, eqU256), Map.create(hashU256, eqU256),
-                 Map.create(hashU256, eqU256), Map.create(hashU256, eqU256), Vec.create(), 0, null);
+                 Map.create(hashU256, eqU256), Map.create(hashU256, eqU256), Vec.create(), 0, Vec.create());
   }
 
   // ── Reading ─────────────────────────────────────────────────────────────────
@@ -405,30 +408,31 @@ export struct World {
   }
 
   void noteAccount(this, U256 addr) {
-    if (this.recording is null) { return; }
-    ChangeSet cs = this.recording!;
-    if (!cs.before.has(addr)) { cs.before.set(addr, this.stateOf(addr)); }
+    for (i32 i = 0; i < this.recording.len(); i++) {
+      ChangeSet cs = this.recording.get(i);
+      if (!cs.before.has(addr)) { cs.before.set(addr, this.stateOf(addr)); }
+    }
   }
 
   void noteSlot(this, U256 addr, U256 key) {
-    if (this.recording is null) { return; }
-    ChangeSet cs = this.recording!;
-    Map<U256, U256>? m = cs.slotsBefore.get(addr);
-    if (m is null) {
-      Map<U256, U256> fresh = slotMap();
-      cs.slotsBefore.set(addr, fresh);
-      m = fresh;
+    for (i32 i = 0; i < this.recording.len(); i++) {
+      ChangeSet cs = this.recording.get(i);
+      Map<U256, U256>? m = cs.slotsBefore.get(addr);
+      if (m is null) {
+        Map<U256, U256> fresh = slotMap();
+        cs.slotsBefore.set(addr, fresh);
+        m = fresh;
+      }
+      if (!m!.has(key)) { m!.set(key, this.storage(addr, key)); }
     }
-    if (!m!.has(key)) { m!.set(key, this.storage(addr, key)); }
   }
 
-  /** Start recording a block's changes. */
-  void record(this) { this.recording = ChangeSet.create(); }
+  /** Start recording changes, inside any recording already going on. */
+  void record(this) { this.recording.push(ChangeSet.create()); }
 
-  /** Stop recording, and fill in what each recorded account and slot holds now. */
+  /** Stop the innermost recording, and fill in what each account and slot it noted holds now. */
   ChangeSet seal(this) {
-    ChangeSet cs = this.recording!;
-    this.recording = null;
+    ChangeSet cs = this.recording.pop()!;
     U256[] addrs = cs.before.keys();
     for (i32 i = 0; i < addrs.len(); i++) { cs.after.set(addrs[i], this.stateOf(addrs[i])); }
     U256[] holders = cs.slotsBefore.keys();

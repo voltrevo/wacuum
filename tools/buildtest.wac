@@ -71,6 +71,9 @@ string runTest(ChainConfig chain, JsonValue test) {
       Answer sent = e.call("eth_sendRawTransaction", JsonValue.Array(one));
       if (sent.result is null) { return "payload \{i + 1}: transaction \{k} refused by the mempool: \{sent.message}"; }
     }
+    // The fixture's block says what its builder put in the extra data; a builder here says the same, so a
+    // block built at EIP-7934's size limit is the same size.
+    e.extraData = bytes(want.member("extraData"));
     JsonObject attrs = JsonObject.create();
     attrs.push("timestamp".toBytes(), want.member("timestamp")!);
     attrs.push("prevRandao".toBytes(), want.member("prevRandao")!);

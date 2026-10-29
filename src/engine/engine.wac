@@ -120,6 +120,8 @@ export struct Engine {
   Map<U256, Archived> archive;
   /** Transaction hash to where it is, for the canonical chain; a stale entry is checked away on lookup. */
   Map<U256, TxAt> txIndex;
+  /** What the blocks this engine builds say in their header's extra data. */
+  u8[] extraData;
   /** The finalized block `forgetBelowFinalized` last pruned for. */
   U256 forgottenAt;
   /**
@@ -132,7 +134,7 @@ export struct Engine {
   Engine create(ChainConfig config, Header genesis, World world) {
     Engine e = Engine(config, config.chainId, Map.create(hashU256, eqU256), Map.create(hashU256, eqU256), genesis.hash, genesis.hash,
                       genesis.hash, Vec.create(), Map.create(hashU256, eqU256), 1, world, genesis.hash, Map.create(hashU256, eqU256), false, Map.create(hashU256, eqU256), Map.create(hashU256, eqU256),
-                      U256.zero(), Vec.create());
+                      "wacuum".toBytes(), U256.zero(), Vec.create());
     e.blocks.set(genesis.hash, Node(genesis, null));
     e.archive.set(genesis.hash, Archived(genesis, Item[].filled(0, Item.Bytes(u8[].filled(0, 0))),
                                          Withdrawal[].filled(0, Withdrawal(U256.zero(), U256.zero(), U256.zero(), U256.zero())),
@@ -419,7 +421,7 @@ export struct Engine {
       this.moveTo(head);
       this.world.record();
       Built built = buildBlock(spec, this.world, parent, attrs, this.candidates(spec), this.chainId,
-                               this.ancestorHashes(parent));
+                               this.ancestorHashes(parent), this.extraData);
       this.world.undo(this.world.seal());
       // A body that fails is a chain this client cannot extend at all — a system contract missing or
       // broken — and not something to hand out as an empty block.

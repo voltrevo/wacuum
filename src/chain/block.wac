@@ -11,7 +11,7 @@ import { Map, Vec } from "core";
 import { crypto.keccak256, crypto.sha256 } from "wac";
 import { rlp.Item, rlp.encode, rlp.decode, rlp.Decoded, rlp.bytesOf, rlp.itemsOf, rlp.isList } from "wac";
 import { U256 } from "../u256.wac";
-import { World, Log, hashU256, eqU256 } from "../state/world.wac";
+import { World, Log, ChangeSet, hashU256, eqU256 } from "../state/world.wac";
 import { stateRoot, u256Bytes } from "../state/root.wac";
 import { trieRoot } from "../trie/trie.wac";
 import { BlockEnv, TxEnv, Evm, Message, processMessage, addressBytes, createAddress } from "../evm/evm.wac";
@@ -47,6 +47,13 @@ export struct Header {
   U256 requestsHash;
   /** keccak256 of the header's RLP. */
   U256 hash;
+
+  Header copy(this) {
+    return Header(this.parentHash, this.ommersHash, this.coinbase, this.stateRoot, this.txRoot, this.receiptsRoot, this.bloom,
+                  this.difficulty, this.number, this.gasLimit, this.gasUsed, this.timestamp, this.extraData, this.prevRandao,
+                  this.nonce, this.baseFee, this.withdrawalsRoot, this.blobGasUsed, this.excessBlobGas,
+                  this.parentBeaconBlockRoot, this.requestsHash, this.hash);
+  }
 }
 
 export struct Withdrawal {
@@ -468,6 +475,16 @@ export Body executeBody(Spec spec, World w, BlockEnv env, Header h, Item[] txs, 
   Vec<u8[]> txRaw = Vec.create();
   Vec<u8[]> receipts = Vec.create();
   Vec<Receipt> receiptList = Vec.create();
+  // Building under EIP-7934, a transaction goes in only if the block still fits with it, which depends on
+  // the gas it used (the header says how much), so it runs recorded and comes back out if it does not fit.
+  bool sized = skipInvalid && spec.isOsaka;
+  i64 wsSize = sized ? listSize(withdrawalsSize(withdrawals)) : 0;
+  i64 txsSize = 0;
+  Header shape = h.copy();
+  shape.txRoot = U256.fromHex(EMPTY_OMMERS)!;
+  shape.receiptsRoot = shape.txRoot;
+  shape.stateRoot = shape.txRoot;
+  shape.requestsHash = shape.txRoot;
   u8[] blockBloom = u8[].filled(256, 0);
   Vec<u8[]> deposits = Vec.create();
   for (i32 i = 0; i < txs.len(); i++) {
@@ -477,10 +494,23 @@ export Body executeBody(Spec spec, World w, BlockEnv env, Header h, Item[] txs, 
       return failed("transaction \{i}: \{d.error}");
     }
     Transaction tx = d.tx;
+    i64 itemSize = encode(txs[i]).len() as i64;
+    if (sized) { w.record(); }
     Processed p = processTransaction(spec, w, env, tx, gasLimit - used, spec.maxBlobGasPerBlock - blobUsed, null);
     if (p.invalid != "") {
+      if (sized) { w.seal(); }
       if (skipInvalid) { continue; }
       return failed("transaction \{i}: \{p.invalid}");
+    }
+    if (sized) {
+      ChangeSet mine = w.seal();
+      shape.gasUsed = U256.ofU64((used + p.gasUsed) as@ u64);
+      shape.blobGasUsed = U256.ofU64((blobUsed + GAS_PER_BLOB * (tx.blobHashes.len() as i64)) as@ u64);
+      i64 size = listSize((encode(headerItem(spec, shape)).len() as i64) + listSize(txsSize + itemSize) + 1 + wsSize);
+      if (size > (MAX_RLP_BLOCK_SIZE as i64)) {
+        w.undo(mine);
+        continue;
+      }
     }
     used += p.gasUsed;
     blobUsed += GAS_PER_BLOB * (tx.blobHashes.len() as i64);
@@ -498,6 +528,7 @@ export Body executeBody(Spec spec, World w, BlockEnv env, Header h, Item[] txs, 
     }
     for (i32 k = 0; k < 256; k++) { blockBloom[k] = blockBloom[k] | bloom[k]; }
     included.push(txs[i]);
+    txsSize += itemSize;
     txRaw.push(d.raw);
     receipts.push(receiptOf(tx.txType, p.success, used, bloom, p.logs));
     U256 price = tx.gasPrice;
@@ -547,6 +578,26 @@ export Body executeBody(Spec spec, World w, BlockEnv env, Header h, Item[] txs, 
   return Body("", included.toArray(), used, blobUsed, fees, blockBloom, U256.fromBytes(indexedRoot(txRaw.toArray()), 0, 32),
               U256.fromBytes(indexedRoot(receipts.toArray()), 0, 32), U256.fromBytes(indexedRoot(wsRaw), 0, 32),
               U256.fromBytes(stateRoot(w), 0, 32), requests, requestsHash, receiptList.toArray());
+}
+
+/** The size of an RLP list whose items take `payload` bytes: the items and the list's own header. */
+i64 listSize(i64 payload) {
+  if (payload < 56) { return payload + 1; }
+  i64 n = 0;
+  for (i64 v = payload; v > 0; v = v >> 8) { n++; }
+  return payload + 1 + n;
+}
+
+/** The bytes the withdrawals take inside their list. */
+i64 withdrawalsSize(Withdrawal[] ws) {
+  i64 n = 0;
+  for (i32 i = 0; i < ws.len(); i++) {
+    Withdrawal wd = ws[i];
+    Item[] fields = [Item.Bytes(u256Bytes(wd.index)), Item.Bytes(u256Bytes(wd.validator)), Item.Bytes(addressBytes(wd.address)),
+                     Item.Bytes(u256Bytes(wd.amount))];
+    n += encode(Item.List(fields)).len() as i64;
+  }
+  return n;
 }
 
 /** The length of the block's RLP. */
