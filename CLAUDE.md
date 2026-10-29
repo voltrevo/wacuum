@@ -39,6 +39,7 @@ nonce whose bytes are not a palindrome, and ethers' `getCreateAddress` showed it
     wac task vectors     # regenerate the U256 cases (needs node)
     wac task fixtures    # execution-spec-tests v5.4.0 into fixtures/
     wac task statetests  # every Cancun state test, about a minute
+    wac task blocktests  # every Cancun blockchain test, about a minute; add Prague as an argument to the scripts
 
 - `wac update` could not reach the network in the container this was started in. `sh tools/use-local-wac.sh
   <wac clone>` fills the package cache from a clone instead.

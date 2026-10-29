@@ -1,0 +1,280 @@
+// Transactions as they arrive in a block: decoded from RLP, and their senders recovered from the signature.
+//
+// A legacy transaction is an RLP list; every other type is a byte string, its type byte followed by the
+// RLP of its fields (EIP-2718). Each field that is a number must be RLP's canonical spelling of one —
+// big-endian with no leading zero — and a transaction that spells one otherwise is refused: two encodings
+// of one transaction would be two hashes for it.
+//
+// The sender is whoever's key recovers from the signature over the signing hash, which differs per type;
+// EIP-2 bounds s to the lower half of the curve order so that no signature has a twin.
+
+import { crypto.keccak256 } from "wac";
+import { rlp.Item, rlp.encode, rlp.decode, rlp.Decoded, rlp.bytesOf, rlp.itemsOf, rlp.isList } from "wac";
+import { U256 } from "../u256.wac";
+import { ecrecover, secpN } from "../precompiles/ecrecover.wac";
+import { Transaction, AccessEntry, Authorization } from "./process.wac";
+
+export struct DecodedTx {
+  Transaction tx;
+  /** The transaction's own encoding: what the transactions trie holds and what its hash is of. */
+  u8[] raw;
+  /** Why it could not be decoded or its sender recovered, or "". */
+  string error;
+}
+
+/** Reads fields off an RLP list, remembering the first thing wrong with them. */
+struct Fields {
+  Item[] items;
+  i32 at;
+  string error;
+
+  Fields of(Item it) {
+    if (!isList(it)) { return Fields(Item[].filled(0, it), 0, "not a list"); }
+    return Fields(itemsOf(it), 0, "");
+  }
+
+  bool fail(this, string why) {
+    if (this.error == "") { this.error = why; }
+    return false;
+  }
+
+  Item next(this) {
+    if (this.at >= this.items.len()) {
+      this.fail("too few fields");
+      return Item.Bytes(u8[].filled(0, 0));
+    }
+    Item it = this.items[this.at];
+    this.at++;
+    return it;
+  }
+
+  u8[] bytes(this) {
+    Item it = this.next();
+    if (isList(it)) {
+      this.fail("a list where bytes belong");
+      return u8[].filled(0, 0);
+    }
+    return bytesOf(it);
+  }
+
+  /** A canonical integer of at most 32 bytes. */
+  U256 int(this) {
+    u8[] b = this.bytes();
+    if (b.len() > 32) { this.fail("an integer over 256 bits"); }
+    if (b.len() > 0 && b[0] == 0) { this.fail("an integer with a leading zero"); }
+    return U256.fromBytes(b, 0, b.len() < 32 ? b.len() : 32);
+  }
+
+  /** Twenty bytes, or none for a creation's empty `to`. */
+  U256? address(this, bool mayBeEmpty) {
+    u8[] b = this.bytes();
+    if (b.len() == 0 && mayBeEmpty) { return null; }
+    if (b.len() != 20) {
+      this.fail("an address that is not 20 bytes");
+      return U256.zero();
+    }
+    return U256.fromBytes(b, 0, 20);
+  }
+
+  U256 hash32(this) {
+    u8[] b = this.bytes();
+    if (b.len() != 32) { this.fail("a hash that is not 32 bytes"); }
+    return U256.fromBytes(b, 0, 32);
+  }
+
+  Item list(this) {
+    Item it = this.next();
+    if (!isList(it)) { this.fail("bytes where a list belongs"); }
+    return it;
+  }
+
+  bool done(this) {
+    if (this.at != this.items.len()) { return this.fail("extra fields"); }
+    return this.error == "";
+  }
+}
+
+AccessEntry[] accessListOf(Fields f) {
+  Item list = f.list();
+  if (!isList(list)) { return AccessEntry[].filled(0, AccessEntry(U256.zero(), U256[].filled(0, U256.zero()))); }
+  Item[] entries = itemsOf(list);
+  AccessEntry[] out = AccessEntry[].filled(entries.len(), AccessEntry(U256.zero(), U256[].filled(0, U256.zero())));
+  for (i32 i = 0; i < entries.len(); i++) {
+    Fields e = Fields.of(entries[i]);
+    U256 addr = e.address(false)!;
+    Item keysItem = e.list();
+    U256[] keys = U256[].filled(0, U256.zero());
+    if (isList(keysItem)) {
+      Item[] ks = itemsOf(keysItem);
+      keys = U256[].filled(ks.len(), U256.zero());
+      for (i32 k = 0; k < ks.len(); k++) {
+        if (isList(ks[k]) || bytesOf(ks[k]).len() != 32) { e.fail("a storage key that is not 32 bytes"); continue; }
+        keys[k] = U256.fromBytes(bytesOf(ks[k]), 0, 32);
+      }
+    }
+    if (!e.done()) { f.fail("access list: " + e.error); }
+    out[i] = AccessEntry(addr, keys);
+  }
+  return out;
+}
+
+Authorization[] authorizationsOf(Fields f) {
+  Item list = f.list();
+  Authorization none = Authorization(U256.zero(), U256.zero(), U256.zero(), U256.zero(), U256.zero(), U256.zero());
+  if (!isList(list)) { return Authorization[].filled(0, none); }
+  Item[] entries = itemsOf(list);
+  Authorization[] out = Authorization[].filled(entries.len(), none);
+  for (i32 i = 0; i < entries.len(); i++) {
+    Fields e = Fields.of(entries[i]);
+    U256 chainId = e.int();
+    U256 addr = e.address(false)!;
+    U256 nonce = e.int();
+    U256 yParity = e.int();
+    U256 r = e.int();
+    U256 s = e.int();
+    if (!e.done()) { f.fail("authorization: " + e.error); }
+    out[i] = Authorization(chainId, addr, nonce, yParity, r, s);
+  }
+  return out;
+}
+
+DecodedTx refuse(string why) {
+  Transaction t = Transaction(0, U256.zero(), U256.zero(), U256.zero(), U256.zero(), U256.zero(), null, U256.zero(),
+                              u8[].filled(0, 0), AccessEntry[].filled(0, AccessEntry(U256.zero(), U256[].filled(0, U256.zero()))),
+                              U256.zero(), U256[].filled(0, U256.zero()),
+                              Authorization[].filled(0, Authorization(U256.zero(), U256.zero(), U256.zero(), U256.zero(), U256.zero(), U256.zero())),
+                              U256.zero());
+  return DecodedTx(t, u8[].filled(0, 0), why);
+}
+
+/** One transaction from a block body's list, typed or legacy, with its sender recovered. */
+export DecodedTx decodeTransaction(Item item, U256 chainId) {
+  if (isList(item)) { return decodeLegacy(item, chainId); }
+  u8[] raw = bytesOf(item);
+  if (raw.len() == 0) { return refuse("an empty typed transaction"); }
+  i32 txType = raw[0] as i32;
+  if (txType < 1 || txType > 4) { return refuse("unknown transaction type \{txType}"); }
+  u8[] payload = u8[].filled(raw.len() - 1, 0);
+  for (i32 i = 0; i < payload.len(); i++) { payload[i] = raw[i + 1]; }
+  Decoded d = decode(payload);
+  if (!d.ok) { return refuse("type \{txType}: \{d.error}"); }
+  Fields f = Fields.of(d.item);
+  U256 txChain = f.int();
+  U256 nonce = f.int();
+  U256 gasPrice = U256.zero();
+  U256 maxPriority = U256.zero();
+  U256 maxFee = U256.zero();
+  if (txType == 1) {
+    gasPrice = f.int();
+  } else {
+    maxPriority = f.int();
+    maxFee = f.int();
+  }
+  U256 gas = f.int();
+  U256? to = f.address(txType != 3 && txType != 4);
+  U256 value = f.int();
+  u8[] data = f.bytes();
+  AccessEntry[] access = accessListOf(f);
+  U256 maxBlobFee = U256.zero();
+  U256[] blobs = U256[].filled(0, U256.zero());
+  if (txType == 3) {
+    maxBlobFee = f.int();
+    Item hs = f.list();
+    if (isList(hs)) {
+      Item[] items = itemsOf(hs);
+      blobs = U256[].filled(items.len(), U256.zero());
+      for (i32 i = 0; i < items.len(); i++) {
+        if (isList(items[i]) || bytesOf(items[i]).len() != 32) { f.fail("a blob hash that is not 32 bytes"); continue; }
+        blobs[i] = U256.fromBytes(bytesOf(items[i]), 0, 32);
+      }
+    }
+  }
+  Authorization[] auths = Authorization[].filled(0, Authorization(U256.zero(), U256.zero(), U256.zero(), U256.zero(), U256.zero(), U256.zero()));
+  if (txType == 4) { auths = authorizationsOf(f); }
+  i32 unsigned = f.at;
+  U256 yParity = f.int();
+  U256 r = f.int();
+  U256 s = f.int();
+  if (!f.done()) { return refuse("type \{txType}: \{f.error}"); }
+  if (!txChain.eq(chainId)) { return refuse("chain id \{txChain.toDecimal()}, want \{chainId.toDecimal()}"); }
+  if (yParity.gt(U256.one())) { return refuse("y parity above 1"); }
+
+  // The signing hash: the type byte, then the RLP of every field but the signature.
+  Item[] fields = itemsOf(d.item);
+  Item[] signed = Item[].filled(unsigned, fields[0]);
+  for (i32 i = 0; i < unsigned; i++) { signed[i] = fields[i]; }
+  u8[] body = encode(Item.List(signed));
+  u8[] msg = u8[].filled(body.len() + 1, 0);
+  msg[0] = txType as! u8;
+  for (i32 i = 0; i < body.len(); i++) { msg[i + 1] = body[i]; }
+  U256? sender = recover(keccak256(msg), yParity, r, s);
+  if (sender is null) { return refuse("the signature recovers no sender"); }
+  Transaction tx = Transaction(txType, nonce, gasPrice, maxFee, maxPriority, gas, to, value, data, access, maxBlobFee, blobs,
+                               auths, sender!);
+  return DecodedTx(tx, raw, "");
+}
+
+/**
+ * A legacy transaction: nine fields, and EIP-155's chain id folded into v. A v of 27 or 28 is a signature
+ * from before EIP-155, which still verifies — it is valid on every chain.
+ */
+DecodedTx decodeLegacy(Item item, U256 chainId) {
+  Fields f = Fields.of(item);
+  U256 nonce = f.int();
+  U256 gasPrice = f.int();
+  U256 gas = f.int();
+  U256? to = f.address(true);
+  U256 value = f.int();
+  u8[] data = f.bytes();
+  U256 v = f.int();
+  U256 r = f.int();
+  U256 s = f.int();
+  if (!f.done()) { return refuse("legacy: \{f.error}"); }
+  Item[] fields = itemsOf(item);
+  U256 yParity;
+  u8[] msg;
+  if (v.eq(U256.ofU64(27)) || v.eq(U256.ofU64(28))) {
+    yParity = v.sub(U256.ofU64(27));
+    Item[] signed = Item[].filled(6, fields[0]);
+    for (i32 i = 0; i < 6; i++) { signed[i] = fields[i]; }
+    msg = encode(Item.List(signed));
+  } else {
+    U256 base = chainId.add(chainId).add(U256.ofU64(35));
+    if (!v.eq(base) && !v.eq(base.add(U256.one()))) { return refuse("legacy: v \{v.toDecimal()} is for another chain"); }
+    yParity = v.sub(base);
+    Item[] signed = Item[].filled(9, fields[0]);
+    for (i32 i = 0; i < 6; i++) { signed[i] = fields[i]; }
+    signed[6] = Item.Bytes(minimal(chainId));
+    signed[7] = Item.Bytes(u8[].filled(0, 0));
+    signed[8] = Item.Bytes(u8[].filled(0, 0));
+    msg = encode(Item.List(signed));
+  }
+  U256? sender = recover(keccak256(msg), yParity, r, s);
+  if (sender is null) { return refuse("the signature recovers no sender"); }
+  AccessEntry[] none = AccessEntry[].filled(0, AccessEntry(U256.zero(), U256[].filled(0, U256.zero())));
+  Authorization[] noAuths = Authorization[].filled(0, Authorization(U256.zero(), U256.zero(), U256.zero(), U256.zero(), U256.zero(), U256.zero()));
+  Transaction tx = Transaction(0, nonce, gasPrice, U256.zero(), U256.zero(), gas, to, value, data, none, U256.zero(),
+                               U256[].filled(0, U256.zero()), noAuths, sender!);
+  return DecodedTx(tx, encode(item), "");
+}
+
+/** The sender, if (yParity, r, s) is a valid low-s signature over `hash`. */
+U256? recover(u8[] hash, U256 yParity, U256 r, U256 s) {
+  if (s.gt(secpN().shr(1))) { return null; }
+  u8[] input = u8[].filled(128, 0);
+  for (i32 i = 0; i < 32; i++) { input[i] = hash[i]; }
+  U256.ofU64(27).add(yParity).writeBytes(input, 32);
+  r.writeBytes(input, 64);
+  s.writeBytes(input, 96);
+  u8[] out = ecrecover(input);
+  return out.len() == 0 ? null : U256.fromBytes(out, 0, 32);
+}
+
+u8[] minimal(U256 v) {
+  u8[] full = v.toBytes();
+  i32 skip = 0;
+  while (skip < 32 && full[skip] == 0) { skip++; }
+  u8[] out = u8[].filled(32 - skip, 0);
+  for (i32 i = 0; i < out.len(); i++) { out[i] = full[skip + i]; }
+  return out;
+}

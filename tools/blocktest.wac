@@ -1,0 +1,116 @@
+// Run execution-spec-tests' blockchain tests: import each test's blocks from their RLP, one after another,
+// and check that the chain ends where the fixture says it does.
+//
+//     wac build --allow-read tools/blocktest.wac -o dist/blocktest
+//     wac dist/blocktest.wasm [--fork Cancun] [--verbose] [--filter text] FILE...
+//
+// A block the fixture marks with `expectException` must be refused, and the chain must carry on from its
+// parent as if it had never arrived. Every other block must be accepted — which means its header's every
+// commitment matched what executing it produced. A test passes when all of that held and the last block
+// accepted is the fixture's `lastblockhash`.
+
+import { Map } from "core";
+import { Sys } from "std";
+import { json.parse, json.JsonValue, json.JsonObject, json.JsonArray } from "wac";
+import { rlp.decode, rlp.Decoded, rlp.itemsOf, rlp.isList } from "wac";
+import { U256 } from "../src/u256.wac";
+import { bytesToHex } from "../src/hex.wac";
+import { World, hashU256, eqU256 } from "../src/state/world.wac";
+import { stateRoot } from "../src/state/root.wac";
+import { Spec } from "../src/evm/spec.wac";
+import { Header, Block, BlockDecode, headerOf, decodeBlock, applyBlock } from "../src/chain/block.wac";
+import { num, bytes, worldFrom, diffState } from "./fixture.wac";
+
+struct Tally {
+  i32 passed;
+  i32 failed;
+  bool verbose;
+  string fork;
+  string filter;
+}
+
+/** One test; "" when it passes, otherwise why not. */
+string runTest(Sys sys, Tally tally, Spec spec, JsonValue test) {
+  World w = worldFrom(test.member("pre")!);
+  JsonValue? config = test.member("config");
+  U256 chainId = config is null ? U256.one() : num(config!.member("chainid"));
+  if (chainId.isZero()) { chainId = U256.one(); }
+
+  Decoded g = decode(bytes(test.member("genesisRLP")));
+  if (!g.ok || !isList(g.item)) { return "genesis RLP does not decode"; }
+  string[] why = [""];
+  Header? genesis = headerOf(spec, itemsOf(g.item)[0], why);
+  if (genesis is null) { return "genesis header: " + why[0]; }
+  if (!U256.fromBytes(stateRoot(w), 0, 32).eq(genesis!.stateRoot)) { return "the pre-state does not hash to the genesis state root"; }
+
+  Header head = genesis!;
+  Map<U256, U256> hashes = Map.create(hashU256, eqU256);
+  hashes.set(head.number, head.hash);
+  JsonArray blocks = test.member("blocks")!.array()!;
+  for (i32 i = 0; i < blocks.len(); i++) {
+    JsonValue b = blocks.get(i);
+    bool expectInvalid = b.member("expectException") is not null;
+    BlockDecode d = decodeBlock(spec, bytes(b.member("rlp")));
+    string err = d.error;
+    World next = w;
+    if (err == "") {
+      Block blk = d.block!;
+      next = w.clone();
+      // BLOCKHASH sees this block's ancestors, which are exactly the chain so far.
+      err = applyBlock(spec, next, blk, head, chainId, hashes);
+      if (err == "") {
+        if (expectInvalid) { return "block \{i + 1} was accepted; the fixture expects it refused"; }
+        w = next;
+        head = blk.header;
+        hashes.set(head.number, head.hash);
+        continue;
+      }
+    }
+    if (!expectInvalid) {
+      if (tally.verbose) { diffState(sys, next, test.member("postState")); }
+      return "block \{i + 1} refused: \{err}";
+    }
+  }
+  string want = test.member("lastblockhash")!.text()!;
+  if (head.hash.toHex() != U256.fromHex(want)!.toHex()) { return "the chain ends at \{head.hash.toHex()}, want \{want}"; }
+  return "";
+}
+
+export async i32 main(Sys sys) {
+  string[] args = sys.args();
+  Tally tally = Tally(0, 0, false, "Cancun", "");
+  for (i32 a = 0; a < args.len(); a++) {
+    string arg = args[a];
+    if (arg == "--verbose") { tally.verbose = true; continue; }
+    if (arg == "--fork") { a++; tally.fork = args[a]; continue; }
+    if (arg == "--filter") { a++; tally.filter = args[a]; continue; }
+    match (await sys.readFile(arg)) {
+      Err(e): { sys.log("FAIL \{arg}: \{e}"); tally.failed++; }
+      Ok(src): {
+        match (parse(src)) {
+          Err(e): { sys.log("FAIL \{arg}: not JSON"); tally.failed++; }
+          Ok(doc): {
+            JsonObject tests = doc.object()!;
+            for (i32 i = 0; i < tests.len(); i++) {
+              string name = tests.at(i).keyStr();
+              JsonValue test = tests.at(i).value;
+              if (tally.filter != "" && name.indexOf(tally.filter) < 0) { continue; }
+              if ((test.member("network")!.text() ?? "") != tally.fork) { continue; }
+              Spec? spec = Spec.byName(tally.fork);
+              if (spec is null) { continue; }
+              string why = runTest(sys, tally, spec!, test);
+              if (why == "") {
+                tally.passed++;
+              } else {
+                tally.failed++;
+                sys.log("FAIL \{name}: \{why}");
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  sys.log("\{tally.passed} passed, \{tally.failed} failed");
+  return tally.failed == 0 ? 0 : 1;
+}

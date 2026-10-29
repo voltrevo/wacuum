@@ -254,6 +254,24 @@ export struct World {
     this.journal.push(Change.Destructed(addr));
   }
 
+  /**
+   * A copy that shares nothing writable with this one, between transactions. A block that turns out to be
+   * invalid runs on a copy and is thrown away with it, which no journal can do: a block spans many
+   * transactions, and each one ends by forgetting how to undo itself.
+   */
+  World clone(this) {
+    World c = World.create();
+    U256[] addrs = this.accounts.keys();
+    for (i32 i = 0; i < addrs.len(); i++) {
+      Account a = this.accounts.get(addrs[i])!;
+      Map<U256, U256> st = slotMap();
+      U256[] keys = a.storage.keys();
+      for (i32 k = 0; k < keys.len(); k++) { st.set(keys[k], a.storage.get(keys[k])!); }
+      c.accounts.set(addrs[i], Account(a.nonce, a.balance, a.code, a.codeHash, st));
+    }
+    return c;
+  }
+
   // ── Snapshots ───────────────────────────────────────────────────────────────
 
   Snapshot snapshot(const this) { return Snapshot(this.journal.len(), this.logs.len()); }

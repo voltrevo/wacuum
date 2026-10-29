@@ -7,15 +7,17 @@ export struct Spec {
   /** EIP-7702 delegation and EIP-7623's calldata floor, which arrive together. */
   bool isPrague;
   i64 maxBlobGasPerBlock;
+  /** EIP-4844's target, which the excess is measured against: half the maximum in Cancun, two thirds in Prague. */
+  i64 targetBlobGasPerBlock;
   u64 blobBaseFeeUpdateFraction;
   /** The precompiles are 0x01 up to this address. */
   u64 lastPrecompile;
 
   /** Cancun: six blobs a block and ten precompiles. */
-  Spec cancun() { return Spec("Cancun", false, 786432, 3338477, 0x0a); }
+  Spec cancun() { return Spec("Cancun", false, 786432, 393216, 3338477, 0x0a); }
 
   /** Prague: EIP-7691's nine blobs and new fraction, and EIP-2537's seven BLS12-381 precompiles. */
-  Spec prague() { return Spec("Prague", true, 1179648, 5007716, 0x11); }
+  Spec prague() { return Spec("Prague", true, 1179648, 786432, 5007716, 0x11); }
 
   /** The spec a fixture names, or null for a fork this client does not run. */
   Spec? byName(string name) {

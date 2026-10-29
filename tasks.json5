@@ -7,4 +7,6 @@
   fixtures: "sh tools/fetch-fixtures.sh",
   // Every state test for Cancun; the log of the run is dist/statetests.log.
   statetests: "sh tools/statetests.sh",
+  // Every blockchain test for Cancun, importing each block from its RLP; the log is dist/blocktests.log.
+  blocktests: "sh tools/blocktests.sh",
 }

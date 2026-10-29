@@ -10,9 +10,15 @@ imports a chain.
 
 ## Where it is
 
-Of execution-spec-tests' state tests (v5.4.0), **16,782 of 16,847 pass for Cancun and 18,218 of 18,869 for
-Prague**. Every one that fails needs BLS12-381: KZG point evaluation (0x0a) and EIP-2537's precompiles
-(0x0b to 0x11), which wait on wac's `bls` package; see `docs/wac-asks.md`.
+Against execution-spec-tests v5.4.0:
+
+| | Cancun | Prague |
+| --- | --- | --- |
+| state tests | 16,782 of 16,847 | 18,218 of 18,869 |
+| blockchain tests, imported from block RLP | 17,619 of 17,685 | 20,207 of 20,859 |
+
+Every one that fails needs BLS12-381: KZG point evaluation (0x0a) and EIP-2537's precompiles (0x0b to 0x11),
+which wait on wac's `bls` package; see `docs/wac-asks.md`.
 
 | | state |
 | --- | --- |
@@ -24,7 +30,8 @@ Prague**. Every one that fails needs BLS12-381: KZG point evaluation (0x0a) and 
 | state root, logs hash | **done**. A Merkle-Patricia trie built from scratch, checked against `trieanyorder.json` |
 | precompiles | **all but one**. ecrecover (secp256k1), SHA-256, RIPEMD-160, identity, MODEXP, bn254 add, mul and pairing, BLAKE2F. KZG point evaluation waits on BLS12-381; see `docs/wac-asks.md` |
 | Prague | **done but for BLS12-381**. EIP-7702 delegation (authorities recovered, not taken from the fixture), EIP-7623's calldata floor, EIP-7691's blob schedule. EIP-2935 and the requests of EIP-7685 belong to blocks, below |
-| blocks, the Engine API, persistence, devp2p, sync | not started |
+| blocks | **done for Cancun and Prague**. Blocks and transactions decoded from RLP with every sender recovered, headers checked against their parents (base fee, blob gas, gas limit), EIP-4788 and EIP-2935 system calls, withdrawals, EIP-7685 requests (deposits, withdrawal and consolidation requests), and every root and the bloom checked. An invalid block runs on a copy of the world and leaves no trace |
+| the Engine API, persistence, devp2p, sync | not started |
 
 ## Running it
 
@@ -56,6 +63,10 @@ wac task fixtures     # execution-spec-tests v5.4.0 into fixtures/, once: 250 MB
 wac task statetests   # every Cancun state test, in about a minute; `sh tools/statetests.sh Prague` for Prague
 ```
 
+```bash
+wac task blocktests   # every Cancun blockchain test; `sh tools/blocktests.sh Prague` for Prague
+```
+
 `dist/statetest.wasm` also runs one file at a time: `wac dist/statetest.wasm --verbose --filter <name> <file>`
 prints which accounts differ from the fixture's post-state, and `--trace` prints every step.
 
@@ -74,9 +85,13 @@ prints which accounts differ from the fixture's post-state, and `--trace` prints
     src/state/root.wac       the state root and the logs hash
     src/trie/trie.wac        a Merkle-Patricia root from a set of pairs
     src/tx/process.wac       a transaction, from validity to the coinbase's fee
+    src/tx/decode.wac        transactions from RLP, and their senders recovered
+    src/chain/block.wac      a block: header rules, system calls, execution, every root
     src/crypto/              a Montgomery field, short-Weierstrass curves, bn254 and its pairing
     src/precompiles/         ecrecover, RIPEMD-160, MODEXP, BLAKE2F
     test/                    wac tests; `test*` exports returning "" for a pass
     tools/statetest.wac      the state-test runner
+    tools/blocktest.wac      the blockchain-test runner, importing blocks from RLP
+    tools/fixture.wac        what both runners read from a fixture
     tools/                   vector generators, the fixture fetcher, the cache filler
     docs/wac-asks.md         what wacuum has found wrong with, or wants from, wac
