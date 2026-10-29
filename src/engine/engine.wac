@@ -1040,6 +1040,25 @@ export struct Engine {
     return Item.List([Item.List(a!.txs), Item.List(Item[].filled(0, Item.Bytes(u8[].filled(0, 0)))), Item.List(ws)]);
   }
 
+  /** A block's receipts as eth/69 carries them — [type, status, cumulative gas, logs] each, no bloom — or null. */
+  Item? receiptsItem(this, U256 hash) {
+    Archived? a = this.archive.get(hash);
+    if (a is null) { return null; }
+    Item[] rs = Item[].filled(a!.receipts.len(), Item.Bytes(u8[].filled(0, 0)));
+    for (i32 i = 0; i < rs.len(); i++) {
+      Receipt r = a!.receipts[i];
+      Item[] logs = Item[].filled(r.logs.len(), Item.Bytes(u8[].filled(0, 0)));
+      for (i32 l = 0; l < logs.len(); l++) {
+        Item[] topics = Item[].filled(r.logs[l].topics.len(), Item.Bytes(u8[].filled(0, 0)));
+        for (i32 t = 0; t < topics.len(); t++) { topics[t] = Item.Bytes(r.logs[l].topics[t].toBytes()); }
+        logs[l] = Item.List([Item.Bytes(addressBytes(r.logs[l].address)), Item.List(topics), Item.Bytes(r.logs[l].data)]);
+      }
+      rs[i] = Item.List([Item.Bytes(u256Bytes(U256.ofI32(r.txType))), Item.Bytes(r.success ? [1 as u8] : u8[].filled(0, 0)),
+                         Item.Bytes(u256Bytes(U256.ofU64(r.cumulativeGasUsed as@ u64))), Item.List(logs)]);
+    }
+    return Item.List(rs);
+  }
+
   /** The head's header. */
   Header headHeader(this) { return this.blocks.get(this.head)!.header; }
 

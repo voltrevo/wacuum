@@ -182,8 +182,7 @@ async void run(Sys sys, Network n, Peer p) {
     } else if (code == GET_BLOCK_BODIES) {
       await p.c.send(answerBodies(n.e, body));
     } else if (code == GET_RECEIPTS) {
-      // Receipts are for snap sync, which this does not serve yet: an empty answer says so without a fault.
-      await p.c.send(Message(RECEIPTS, Item.List([small(requestId(body)), emptyList()])));
+      await p.c.send(answerReceipts(n.e, body));
     } else if (code == GET_POOLED_TRANSACTIONS) {
       await p.c.send(answerPooled(n.e, body));
     } else if (code == BLOCK_HEADERS || code == BLOCK_BODIES || code == POOLED_TRANSACTIONS || code == RECEIPTS) {
@@ -257,6 +256,23 @@ Message answerBodies(Engine e, Item body) {
     }
   }
   return Message(BLOCK_BODIES, Item.List([small(id), Item.List(out.toArray())]));
+}
+
+/** Receipts for each block asked for, in order, stopping at the first this has not got. */
+Message answerReceipts(Engine e, Item body) {
+  u64 id = requestId(body);
+  Vec<Item> out = Vec.create();
+  if (isList(body) && itemsOf(body).len() >= 2 && isList(itemsOf(body)[1])) {
+    Item[] hashes = itemsOf(itemsOf(body)[1]);
+    for (i32 i = 0; i < hashes.len() && i < 256; i++) {
+      u8[] h = bytesOf(hashes[i]);
+      if (h.len() != 32) { break; }
+      Item? r = e.receiptsItem(U256.fromBytes(h, 0, 32));
+      if (r is null) { break; }
+      out.push(r!);
+    }
+  }
+  return Message(RECEIPTS, Item.List([small(id), Item.List(out.toArray())]));
 }
 
 /** PooledTransactions: those of the hashes asked for that are in the mempool, in their network form. */

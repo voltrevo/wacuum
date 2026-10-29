@@ -3,6 +3,7 @@
 // test of moving it back (undo), forward (redo), and across a common ancestor.
 
 import { json.JsonValue, json.JsonObject, json.JsonArray } from "wac";
+import { rlp.Item, rlp.itemsOf, rlp.bytesOf } from "wac";
 import { U256 } from "../src/u256.wac";
 import { Engine, Answer, Replayed } from "../src/engine/engine.wac";
 import { engineFor, str, one } from "./chainkit.wac";
@@ -103,6 +104,13 @@ export string test_the_world_follows_the_head_across_forks() {
   t.eqU256(balanceAt(e, a3, TO), U256.ofI32(2), "A3 is where it was");
   U256 a4 = extend(t, e, a3, 48, "0x00000000000000000000000000000000000000aa");
   t.ok(!a4.isZero(), "and A goes on");
+
+  // Each block's receipts, as eth/69 serves them: [type, status, cumulative gas, logs].
+  Item? rs = e.receiptsItem(a1);
+  t.ok(rs is not null && itemsOf(rs!).len() == 1, "A1 has one receipt");
+  Item[] r0 = itemsOf(itemsOf(rs!)[0]);
+  t.ok(r0.len() == 4 && bytesOf(r0[0])[0] == 2 && bytesOf(r0[1])[0] == 1 && U256.fromBytes(bytesOf(r0[2]), 0, bytesOf(r0[2]).len()).eq(U256.ofI32(21000)),
+       "a type-2 success that used 21000");
 
   // Everything above, replayed from its records into a fresh engine, ends in the same place.
   i32 total = 0;
