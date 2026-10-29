@@ -16,6 +16,7 @@ Against execution-spec-tests v5.4.0:
 | --- | --- | --- |
 | state tests | 16,782 of 16,847 | 18,218 of 18,869 |
 | blockchain tests, imported from block RLP | 17,619 of 17,685 | 20,207 of 20,859 |
+| engine tests, through `engine_newPayload` and `engine_forkchoiceUpdated` | 17,619 of 17,685 | 20,226 of 20,878 |
 
 Every one that fails needs BLS12-381: KZG point evaluation (0x0a) and EIP-2537's precompiles (0x0b to 0x11),
 which wait on wac's `bls` package; see `docs/wac-asks.md`.
@@ -31,7 +32,8 @@ which wait on wac's `bls` package; see `docs/wac-asks.md`.
 | precompiles | **all but one**. ecrecover (secp256k1), SHA-256, RIPEMD-160, identity, MODEXP, bn254 add, mul and pairing, BLAKE2F. KZG point evaluation waits on BLS12-381; see `docs/wac-asks.md` |
 | Prague | **done but for BLS12-381**. EIP-7702 delegation (authorities recovered, not taken from the fixture), EIP-7623's calldata floor, EIP-7691's blob schedule. EIP-2935 and the requests of EIP-7685 belong to blocks, below |
 | blocks | **done for Cancun and Prague**. Blocks and transactions decoded from RLP with every sender recovered, headers checked against their parents (base fee, blob gas, gas limit), EIP-4788 and EIP-2935 system calls, withdrawals, EIP-7685 requests (deposits, withdrawal and consolidation requests), and every root and the bloom checked. An invalid block runs on a copy of the world and leaves no trace |
-| the Engine API, persistence, devp2p, sync | not started |
+| the Engine API | **in progress**. `engine_newPayloadV1`–`V4` (payload to block, the hash and versioned-hash checks, VALID / INVALID / SYNCING, the `-32602` refusals) and `engine_forkchoiceUpdated`, over JSON-RPC and HTTP with HS256 JWT authentication, from a geth-format `genesis.json`. Not yet: building payloads (`forkchoiceUpdated` with attributes, `getPayload`) |
+| persistence, devp2p, sync | not started |
 
 ## Running it
 
@@ -70,6 +72,20 @@ wac task blocktests   # every Cancun blockchain test; `sh tools/blocktests.sh Pr
 `dist/statetest.wasm` also runs one file at a time: `wac dist/statetest.wasm --verbose --filter <name> <file>`
 prints which accounts differ from the fixture's post-state, and `--trace` prints every step.
 
+## Running the node
+
+```bash
+wac app --allow-read --allow-net cmd/wacuum.wac -o dist/wacuum
+```
+
+```bash
+./dist/wacuum --genesis genesis.json --jwt-secret jwt.hex --port 8551
+```
+
+It needs a `wac` on a native host (`./bootstrap.sh --host wasmtime` or the default v8): on the JavaScript
+hosts a program is given no network, whatever it is granted. `node tools/engine-e2e.mjs FIXTURE` drives a
+running node through an engine fixture over HTTP, JWT and all.
+
 ## Layout
 
     src/u256.wac             the 256-bit word, with the EVM's semantics
@@ -87,11 +103,17 @@ prints which accounts differ from the fixture's post-state, and `--trace` prints
     src/tx/process.wac       a transaction, from validity to the coinbase's fee
     src/tx/decode.wac        transactions from RLP, and their senders recovered
     src/chain/block.wac      a block: header rules, system calls, execution, every root
+    src/chain/genesis.wac    a chain's first block from a geth-format genesis.json
+    src/engine/engine.wac    the Engine API's methods, from JSON params to JSON results
+    src/engine/rpc.wac       JSON-RPC over HTTP, and the JWT gate in front of it
+    src/engine/jwt.wac       HS256 JWTs, as the Engine API authenticates them
+    cmd/wacuum.wac           the node: genesis, then the Engine API on a socket
     src/crypto/              a Montgomery field, short-Weierstrass curves, bn254 and its pairing
     src/precompiles/         ecrecover, RIPEMD-160, MODEXP, BLAKE2F
     test/                    wac tests; `test*` exports returning "" for a pass
     tools/statetest.wac      the state-test runner
     tools/blocktest.wac      the blockchain-test runner, importing blocks from RLP
+    tools/enginetest.wac     the engine-test runner, through the Engine API's own methods
     tools/fixture.wac        what both runners read from a fixture
     tools/                   vector generators, the fixture fetcher, the cache filler
     docs/wac-asks.md         what wacuum has found wrong with, or wants from, wac

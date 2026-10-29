@@ -179,7 +179,7 @@ export BlockDecode decodeBlock(Spec spec, u8[] rlpBytes) {
 
 // ── Header rules ────────────────────────────────────────────────────────────────
 
-static string EMPTY_OMMERS = "0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347";
+export static string EMPTY_OMMERS = "0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347";
 
 /** EIP-1559's base fee for a child of `parent`, which moves by at most an eighth toward the gas target. */
 export U256 nextBaseFee(Header parent) {
@@ -262,7 +262,7 @@ u8[]? requestCall(Spec spec, World w, BlockEnv env, string address) {
 }
 
 /** The trie of a list keyed by each entry's index, RLP-encoded: transactions, receipts, withdrawals. */
-u8[] indexedRoot(u8[][] values) {
+export u8[] indexedRoot(u8[][] values) {
   u8[][] keys = u8[][].defaulted(values.len());
   for (i32 i = 0; i < values.len(); i++) { keys[i] = encode(Item.Bytes(u256Bytes(U256.ofI32(i)))); }
   return trieRoot(keys, values);
@@ -405,7 +405,7 @@ export string applyBlock(Spec spec, World w, Block b, Header parent, U256 chainI
 }
 
 /** EIP-7685: sha256 over the sha256 of each non-empty request list, its type byte first. */
-U256 requestsHashOf(u8[][] byType) {
+export U256 requestsHashOf(u8[][] byType) {
   Vec<u8> all = Vec.create();
   for (i32 t = 0; t < byType.len(); t++) {
     if (byType[t].len() == 0) { continue; }

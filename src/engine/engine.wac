@@ -1,0 +1,326 @@
+// The Engine API: how a consensus client drives an execution client. It hands over blocks as execution
+// payloads (`engine_newPayloadV*`) and says which one is the head (`engine_forkchoiceUpdatedV*`), and
+// this answers whether each payload is VALID, INVALID, or cannot be judged yet because its parent is
+// unknown (SYNCING).
+//
+// This layer takes a method name and JSON params and gives back a JSON result or a JSON-RPC error. It
+// knows nothing of HTTP or of the JWT that authenticates a caller — `server.wac` wraps it in those — so
+// execution-spec-tests' engine fixtures can call it directly.
+//
+// ## From payload to block
+//
+// A payload is a block with its header flattened into fields and its transactions as opaque bytes. Two
+// header fields are not sent at all and are derived: the transactions root and the withdrawals root, and
+// from Prague the requests hash, from the execution requests sent beside the payload. The block hash the
+// consensus client sends must equal the hash of the header rebuilt that way, which is what makes the
+// payload's own fields binding.
+
+import { Map, Vec } from "core";
+import { crypto.keccak256, crypto.sha256 } from "wac";
+import { json.JsonValue, json.JsonObject, json.JsonArray } from "wac";
+import { rlp.Item, rlp.encode, rlp.decode, rlp.Decoded } from "wac";
+import { U256 } from "../u256.wac";
+import { hexToBytes, bytesToHex } from "../hex.wac";
+import { World, hashU256, eqU256 } from "../state/world.wac";
+import { u256Bytes } from "../state/root.wac";
+import { trieRoot } from "../trie/trie.wac";
+import { addressBytes } from "../evm/evm.wac";
+import { Spec } from "../evm/spec.wac";
+import { Header, Block, Withdrawal, applyBlock, EMPTY_OMMERS, requestsHashOf, indexedRoot } from "../chain/block.wac";
+import { decodeTransaction, DecodedTx } from "../tx/decode.wac";
+
+/** A block this client has executed, with the state after it. */
+struct Node {
+  Header header;
+  World world;
+}
+
+/** A JSON-RPC answer: a result, or an error with its code. */
+export struct Answer {
+  JsonValue? result;
+  i32 code;
+  string message;
+
+  Answer ok(JsonValue v) { return Answer(v, 0, ""); }
+  Answer error(i32 code, string message) { return Answer(null, code, message); }
+}
+
+export struct Engine {
+  Spec spec;
+  U256 chainId;
+  Map<U256, Node> blocks;
+  /** Block number to hash along the canonical chain, for BLOCKHASH. */
+  Map<U256, U256> canonical;
+  U256 head;
+  U256 safe;
+  U256 finalized;
+
+  /** An engine whose chain starts at `genesis`, with `world` its state. */
+  Engine create(Spec spec, U256 chainId, Header genesis, World world) {
+    Engine e = Engine(spec, chainId, Map.create(hashU256, eqU256), Map.create(hashU256, eqU256), genesis.hash, genesis.hash,
+                      genesis.hash);
+    e.blocks.set(genesis.hash, Node(genesis, world));
+    e.canonical.set(genesis.number, genesis.hash);
+    return e;
+  }
+
+  Answer call(this, string method, JsonValue params) {
+    JsonArray? ps = params.array();
+    if (ps is null) { return Answer.error(-32602, "params must be an array"); }
+    if (method == "engine_newPayloadV1") { return this.newPayload(1, ps!); }
+    if (method == "engine_newPayloadV2") { return this.newPayload(2, ps!); }
+    if (method == "engine_newPayloadV3") { return this.newPayload(3, ps!); }
+    if (method == "engine_newPayloadV4") { return this.newPayload(4, ps!); }
+    if (method == "engine_forkchoiceUpdatedV1" || method == "engine_forkchoiceUpdatedV2" ||
+        method == "engine_forkchoiceUpdatedV3") {
+      return this.forkchoiceUpdated(ps!);
+    }
+    if (method == "engine_exchangeCapabilities") { return Answer.ok(capabilities()); }
+    if (method == "eth_chainId") { return Answer.ok(str(this.chainId.toHex())); }
+    if (method == "eth_blockNumber") { return Answer.ok(str(this.blocks.get(this.head)!.header.number.toHex())); }
+    return Answer.error(-32601, "method not found: " + method);
+  }
+
+  // ── engine_newPayload ──
+
+  Answer newPayload(this, i32 version, JsonArray ps) {
+    if (ps.len() < 1) { return Answer.error(-32602, "no payload"); }
+    JsonValue p = ps.get(0);
+    if (p.object() is null) { return Answer.error(-32602, "the payload is not an object"); }
+    bool hasWithdrawals = p.member("withdrawals") is not null && !p.member("withdrawals")!.isNull();
+    bool hasBlobFields = p.member("blobGasUsed") is not null || p.member("excessBlobGas") is not null;
+    // Each version names exactly the fields its fork has; a payload that disagrees is a malformed call.
+    if (version == 2 && hasBlobFields) { return Answer.error(-32602, "blob fields before V3"); }
+    if (version >= 3) {
+      if (!hasWithdrawals || p.member("blobGasUsed") is null || p.member("excessBlobGas") is null) {
+        return Answer.error(-32602, "a V\{version} payload needs withdrawals, blobGasUsed and excessBlobGas");
+      }
+      if (ps.len() < 3 || ps.get(1).array() is null || ps.get(2).text() is null) {
+        return Answer.error(-32602, "V\{version} needs expected blob hashes and a parent beacon root");
+      }
+    }
+    u8[][] requests = u8[][].defaulted(0);
+    if (version >= 4) {
+      if (ps.len() < 4 || ps.get(3).array() is null) { return Answer.error(-32602, "V4 needs execution requests"); }
+      JsonArray rs = ps.get(3).array()!;
+      requests = u8[][].defaulted(rs.len());
+      i32 lastType = -1;
+      for (i32 i = 0; i < rs.len(); i++) {
+        u8[]? r = hexToBytes(rs.get(i).text() ?? "x");
+        // Each request list is its type byte and then its data: types strictly ascending, none empty.
+        if (r is null || r!.len() < 2 || (r![0] as i32) <= lastType) { return Answer.error(-32602, "malformed execution requests"); }
+        lastType = r![0] as i32;
+        requests[i] = r!;
+      }
+    }
+
+    Header h = headerFrom(p);
+    U256 claimed = hexU256(p.member("blockHash"));
+    Vec<Item> txs = Vec.create();
+    JsonArray rawTxs = p.member("transactions")?.array() ?? JsonArray.create();
+    Vec<U256> blobHashes = Vec.create();
+    u8[][] txBytes = u8[][].defaulted(rawTxs.len());
+    for (i32 i = 0; i < rawTxs.len(); i++) {
+      u8[] raw = hexToBytes(rawTxs.get(i).text() ?? "x") ?? u8[].filled(0, 0);
+      txBytes[i] = raw;
+      Item? it = txItem(raw);
+      if (it is null) { return this.invalid(h, "transaction \{i} does not decode"); }
+      txs.push(it!);
+      DecodedTx d = decodeTransaction(it!, this.chainId);
+      for (i32 k = 0; k < d.tx.blobHashes.len(); k++) { blobHashes.push(d.tx.blobHashes[k]); }
+    }
+    Withdrawal[] withdrawals = withdrawalsFrom(p.member("withdrawals"));
+
+    // The header the payload describes, with the fields the payload does not carry derived.
+    h.txRoot = U256.fromBytes(indexedRoot(txBytes), 0, 32);
+    u8[][] wsRaw = u8[][].defaulted(withdrawals.len());
+    for (i32 i = 0; i < withdrawals.len(); i++) {
+      Withdrawal wd = withdrawals[i];
+      Item[] fields = [Item.Bytes(u256Bytes(wd.index)), Item.Bytes(u256Bytes(wd.validator)), Item.Bytes(addressBytes(wd.address)),
+                       Item.Bytes(u256Bytes(wd.amount))];
+      wsRaw[i] = encode(Item.List(fields));
+    }
+    h.withdrawalsRoot = U256.fromBytes(indexedRoot(wsRaw), 0, 32);
+    if (version >= 3) { h.parentBeaconBlockRoot = hexU256(ps.get(2)); }
+    if (version >= 4) {
+      // The requests hash is over each list's data with its type byte; the payload already has them so.
+      u8[][] byType = u8[][].defaulted(3);
+      for (i32 t = 0; t < 3; t++) { byType[t] = u8[].filled(0, 0); }
+      for (i32 i = 0; i < requests.len(); i++) {
+        i32 t = requests[i][0] as i32;
+        if (t < 3) {
+          u8[] data = u8[].filled(requests[i].len() - 1, 0);
+          for (i32 k = 0; k < data.len(); k++) { data[k] = requests[i][k + 1]; }
+          byType[t] = data;
+        }
+      }
+      h.requestsHash = requestsHashOf(byType);
+    }
+    h.hash = U256.fromBytes(keccak256(encode(headerItem(this.spec, h))), 0, 32);
+    if (!h.hash.eq(claimed)) { return this.invalidNoAncestor("block hash \{claimed.toHex()} is not the payload's, \{h.hash.toHex()}"); }
+
+    // EIP-4844: the blob hashes the consensus layer expects must be exactly the transactions', in order.
+    if (version >= 3) {
+      JsonArray expected = ps.get(1).array()!;
+      U256[] got = blobHashes.toArray();
+      bool same = expected.len() == got.len();
+      for (i32 i = 0; same && i < got.len(); i++) { same = hexU256(expected.get(i)).eq(got[i]); }
+      if (!same) { return this.invalidNoAncestor("the versioned hashes do not match the transactions'"); }
+    }
+
+    if (this.blocks.has(h.hash)) { return status("VALID", h.hash.toHex(), ""); }
+    Node? parent = this.blocks.get(h.parentHash);
+    if (parent is null) { return status("SYNCING", "", ""); }
+    World w = parent!.world.clone();
+    Block b = Block(h, txs.toArray(), false, withdrawals);
+    string err = applyBlock(this.spec, w, b, parent!.header, this.chainId, this.ancestorHashes(parent!.header));
+    if (err != "") { return this.invalid(h, err); }
+    this.blocks.set(h.hash, Node(h, w));
+    return status("VALID", h.hash.toHex(), "");
+  }
+
+  /** INVALID, naming the parent as the latest valid ancestor when this client has it. */
+  Answer invalid(this, Header h, string why) {
+    return status("INVALID", this.blocks.has(h.parentHash) ? h.parentHash.toHex() : "", why);
+  }
+
+  Answer invalidNoAncestor(this, string why) { return status("INVALID", "", why); }
+
+  /** Number to hash for the chain ending at `tip`, back as far as BLOCKHASH can see. */
+  Map<U256, U256> ancestorHashes(this, Header tip) {
+    Map<U256, U256> m = Map.create(hashU256, eqU256);
+    Header cur = tip;
+    for (i32 i = 0; i < 256; i++) {
+      m.set(cur.number, cur.hash);
+      Node? p = this.blocks.get(cur.parentHash);
+      if (p is null) { break; }
+      cur = p!.header;
+    }
+    return m;
+  }
+
+  // ── engine_forkchoiceUpdated ──
+
+  Answer forkchoiceUpdated(this, JsonArray ps) {
+    if (ps.len() < 1 || ps.get(0).object() is null) { return Answer.error(-32602, "no forkchoice state"); }
+    JsonValue fc = ps.get(0);
+    U256 head = hexU256(fc.member("headBlockHash"));
+    if (!this.blocks.has(head)) { return Answer.ok(forkchoiceResult(status("SYNCING", "", "").result!)); }
+    this.head = head;
+    this.safe = hexU256(fc.member("safeBlockHash"));
+    this.finalized = hexU256(fc.member("finalizedBlockHash"));
+    // Walk back from the new head, rewriting the canonical number-to-hash map until it agrees.
+    Header cur = this.blocks.get(head)!.header;
+    while (true) {
+      U256? known = this.canonical.get(cur.number);
+      if (known is not null && known!.eq(cur.hash)) { break; }
+      this.canonical.set(cur.number, cur.hash);
+      Node? p = this.blocks.get(cur.parentHash);
+      if (p is null) { break; }
+      cur = p!.header;
+    }
+    return Answer.ok(forkchoiceResult(status("VALID", head.toHex(), "").result!));
+  }
+
+  /** The state at the head of the chain. */
+  World headState(this) { return this.blocks.get(this.head)!.world; }
+}
+
+// ── JSON helpers ─────────────────────────────────────────────────────────────────
+
+JsonValue str(string s) { return JsonValue.Str(s.toBytes()); }
+
+Answer status(string st, string latestValid, string why) {
+  JsonObject o = JsonObject.create();
+  o.push("status".toBytes(), str(st));
+  o.push("latestValidHash".toBytes(), latestValid == "" ? JsonValue.Null : str(latestValid));
+  o.push("validationError".toBytes(), why == "" ? JsonValue.Null : str(why));
+  return Answer.ok(JsonValue.Object(o));
+}
+
+JsonValue forkchoiceResult(JsonValue payloadStatus) {
+  JsonObject o = JsonObject.create();
+  o.push("payloadStatus".toBytes(), payloadStatus);
+  o.push("payloadId".toBytes(), JsonValue.Null);
+  return JsonValue.Object(o);
+}
+
+JsonValue capabilities() {
+  string[] names = ["engine_newPayloadV1", "engine_newPayloadV2", "engine_newPayloadV3", "engine_newPayloadV4",
+                    "engine_forkchoiceUpdatedV1", "engine_forkchoiceUpdatedV2", "engine_forkchoiceUpdatedV3"];
+  JsonArray a = JsonArray.create();
+  for (i32 i = 0; i < names.len(); i++) { a.push(str(names[i])); }
+  return JsonValue.Array(a);
+}
+
+/** A quantity or data field as a number, zero when absent or malformed. */
+U256 hexU256(JsonValue? v) {
+  if (v is null) { return U256.zero(); }
+  string? s = v!.text();
+  if (s is null || s! == "0x") { return U256.zero(); }
+  return U256.fromHex(s!) ?? U256.zero();
+}
+
+u8[] hexBytes(JsonValue? v) {
+  if (v is null) { return u8[].filled(0, 0); }
+  return hexToBytes(v!.text() ?? "") ?? u8[].filled(0, 0);
+}
+
+/** A transaction's bytes as the block body's item: a legacy one is its RLP list, a typed one opaque bytes. */
+Item? txItem(u8[] raw) {
+  if (raw.len() == 0) { return null; }
+  if ((raw[0] as i32) >= 0xc0) {
+    Decoded d = decode(raw);
+    return d.ok ? d.item : null;
+  }
+  return Item.Bytes(raw);
+}
+
+Withdrawal[] withdrawalsFrom(JsonValue? v) {
+  JsonArray a = v?.array() ?? JsonArray.create();
+  Withdrawal[] out = Withdrawal[].filled(a.len(), Withdrawal(U256.zero(), U256.zero(), U256.zero(), U256.zero()));
+  for (i32 i = 0; i < a.len(); i++) {
+    JsonValue w = a.get(i);
+    out[i] = Withdrawal(hexU256(w.member("index")), hexU256(w.member("validatorIndex")), hexU256(w.member("address")),
+                        hexU256(w.member("amount")));
+  }
+  return out;
+}
+
+Header headerFrom(JsonValue p) {
+  u8[] bloom = hexBytes(p.member("logsBloom"));
+  return Header(hexU256(p.member("parentHash")), U256.fromHex(EMPTY_OMMERS)!, hexU256(p.member("feeRecipient")),
+                hexU256(p.member("stateRoot")), U256.zero(), hexU256(p.member("receiptsRoot")),
+                bloom.len() == 256 ? bloom : u8[].filled(256, 0), U256.zero(), hexU256(p.member("blockNumber")),
+                hexU256(p.member("gasLimit")), hexU256(p.member("gasUsed")), hexU256(p.member("timestamp")),
+                hexBytes(p.member("extraData")), hexU256(p.member("prevRandao")), u8[].filled(8, 0),
+                hexU256(p.member("baseFeePerGas")), U256.zero(), hexU256(p.member("blobGasUsed")),
+                hexU256(p.member("excessBlobGas")), U256.zero(), U256.zero(), U256.zero());
+}
+
+/** The header's RLP, field by field, as `headerOf` reads it. */
+export Item headerItem(Spec spec, Header h) {
+  Vec<Item> f = Vec.create();
+  f.push(Item.Bytes(h.parentHash.toBytes()));
+  f.push(Item.Bytes(h.ommersHash.toBytes()));
+  f.push(Item.Bytes(addressBytes(h.coinbase)));
+  f.push(Item.Bytes(h.stateRoot.toBytes()));
+  f.push(Item.Bytes(h.txRoot.toBytes()));
+  f.push(Item.Bytes(h.receiptsRoot.toBytes()));
+  f.push(Item.Bytes(h.bloom));
+  f.push(Item.Bytes(u256Bytes(h.difficulty)));
+  f.push(Item.Bytes(u256Bytes(h.number)));
+  f.push(Item.Bytes(u256Bytes(h.gasLimit)));
+  f.push(Item.Bytes(u256Bytes(h.gasUsed)));
+  f.push(Item.Bytes(u256Bytes(h.timestamp)));
+  f.push(Item.Bytes(h.extraData));
+  f.push(Item.Bytes(h.prevRandao.toBytes()));
+  f.push(Item.Bytes(h.nonce));
+  f.push(Item.Bytes(u256Bytes(h.baseFee)));
+  f.push(Item.Bytes(h.withdrawalsRoot.toBytes()));
+  f.push(Item.Bytes(u256Bytes(h.blobGasUsed)));
+  f.push(Item.Bytes(u256Bytes(h.excessBlobGas)));
+  f.push(Item.Bytes(h.parentBeaconBlockRoot.toBytes()));
+  if (spec.isPrague) { f.push(Item.Bytes(h.requestsHash.toBytes())); }
+  return Item.List(f.toArray());
+}

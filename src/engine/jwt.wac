@@ -1,0 +1,80 @@
+// The Engine API's authentication: every request carries a JWT signed with HMAC-SHA256 under a 32-byte
+// secret the two clients share, and an `iat` (issued-at) within a minute of now, so a captured token is
+// useful to a replayer for a minute at most.
+//
+// Only HS256 is accepted. A token naming any other algorithm — `none` above all — is refused before its
+// signature is looked at, because accepting the algorithm a token names is the classic JWT forgery.
+
+import { crypto.hmacSha256 } from "wac";
+import { json.parse, json.JsonValue } from "wac";
+
+/** "" when `token` is a valid HS256 JWT under `secret` with an `iat` within 60 seconds of `nowSeconds`. */
+export string checkJwt(string token, u8[] secret, i64 nowSeconds) {
+  i32 dot1 = token.indexOf(".");
+  if (dot1 < 0) { return "not a JWT"; }
+  string rest = token.slice(dot1 + 1, token.len());
+  i32 dot2 = rest.indexOf(".");
+  if (dot2 < 0) { return "not a JWT"; }
+  string headerPart = token.slice(0, dot1);
+  string payloadPart = rest.slice(0, dot2);
+  string sigPart = rest.slice(dot2 + 1, rest.len());
+
+  u8[]? header = base64url(headerPart);
+  u8[]? payload = base64url(payloadPart);
+  u8[]? sig = base64url(sigPart);
+  if (header is null || payload is null || sig is null) { return "a JWT part is not base64url"; }
+  JsonValue? h = parse(header!).ok();
+  if (h is null || (h!.member("alg")?.text() ?? "") != "HS256") { return "the JWT algorithm is not HS256"; }
+
+  u8[] expected = hmacSha256(secret, (headerPart + "." + payloadPart).toBytes());
+  if (!sameBytes(expected, sig!)) { return "the JWT signature does not verify"; }
+
+  JsonValue? claims = parse(payload!).ok();
+  f64? iat = claims?.member("iat")?.number();
+  if (iat is null) { return "the JWT has no iat"; }
+  i64 at = iat!.trunc() as~ i64;
+  i64 skew = at > nowSeconds ? at - nowSeconds : nowSeconds - at;
+  if (skew > 60) { return "the JWT was issued \{skew} seconds from now"; }
+  return "";
+}
+
+/** Equal bytes, looking at every one: the comparison of a MAC should not say how far it got. */
+bool sameBytes(u8[] a, u8[] b) {
+  if (a.len() != b.len()) { return false; }
+  u8 diff = 0;
+  for (i32 i = 0; i < a.len(); i++) { diff = diff | (a[i] ^ b[i]); }
+  return diff == 0;
+}
+
+i32 b64(u8 c) {
+  if (c >= 65 && c <= 90) { return (c as i32) - 65; }
+  if (c >= 97 && c <= 122) { return (c as i32) - 71; }
+  if (c >= 48 && c <= 57) { return (c as i32) + 4; }
+  if (c == 45) { return 62; }
+  if (c == 95) { return 63; }
+  return -1;
+}
+
+/** RFC 4648's base64url without padding, as JWTs write it. Null for anything else. */
+export u8[]? base64url(string s) {
+  u8[] t = s.toBytes();
+  if (t.len() % 4 == 1) { return null; }
+  u8[] out = u8[].filled(t.len() * 3 / 4, 0);
+  u32 acc = 0;
+  i32 bits = 0;
+  i32 n = 0;
+  for (i32 i = 0; i < t.len(); i++) {
+    i32 v = b64(t[i]);
+    if (v < 0) { return null; }
+    acc = (acc << 6) | ((v as@ u32) & 63);
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      out[n] = (acc >> bits) as@ u8;
+      n++;
+    }
+  }
+  u8[] exact = u8[].filled(n, 0);
+  for (i32 i = 0; i < n; i++) { exact[i] = out[i]; }
+  return exact;
+}

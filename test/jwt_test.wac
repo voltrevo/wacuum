@@ -1,0 +1,22 @@
+// The Engine API's JWT check, against a token Node's crypto signed, and the ways a token must be refused.
+
+import { checkJwt, base64url } from "../src/engine/jwt.wac";
+import { hexToBytes } from "../src/hex.wac";
+import { Check } from "./check.wac";
+
+static string GOOD = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpYXQiOjE3OTMwMDAwMDB9.btpjknB0wfg5ITnZd5d9BG8bgGx_J0HtupqdAvmQ9Ok";
+static string NONE = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJpYXQiOjE3OTMwMDAwMDB9.";
+
+export string test_a_token_node_signed_verifies_and_its_forgeries_do_not() {
+  Check t = Check.create();
+  u8[] secret = hexToBytes("7365637265742d7365637265742d7365637265742d7365637265742d73656372")!;
+  t.eqStr(checkJwt(GOOD, secret, 1793000000), "", "fresh and signed");
+  t.eqStr(checkJwt(GOOD, secret, 1793000059), "", "59 seconds later");
+  t.ok(checkJwt(GOOD, secret, 1793000061) != "", "61 seconds later is stale");
+  t.ok(checkJwt(GOOD.slice(0, GOOD.len() - 2) + "AA", secret, 1793000000) != "", "a changed signature");
+  t.ok(checkJwt(NONE, secret, 1793000000) != "", "alg none");
+  u8[] other = hexToBytes("0000000000000000000000000000000000000000000000000000000000000000")!;
+  t.ok(checkJwt(GOOD, other, 1793000000) != "", "another secret");
+  t.ok(base64url("aGk")!.len() == 2 && base64url("a") is null, "base64url lengths");
+  return t.report();
+}

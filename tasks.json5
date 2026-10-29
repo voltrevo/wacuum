@@ -9,4 +9,8 @@
   statetests: "sh tools/statetests.sh",
   // Every blockchain test for Cancun, importing each block from its RLP; the log is dist/blocktests.log.
   blocktests: "sh tools/blocktests.sh",
+  // Every engine test for Cancun, through engine_newPayload and engine_forkchoiceUpdated.
+  enginetests: "sh tools/enginetests.sh",
+  // The node, as one executable file.
+  build: "wac app --allow-read --allow-net cmd/wacuum.wac -o dist/wacuum",
 }

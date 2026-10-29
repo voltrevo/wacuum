@@ -1,0 +1,137 @@
+// wacuum: the execution client, serving the Engine API to a consensus client.
+//
+//     wac run --allow-read --allow-net cmd/wacuum.wac -- --genesis genesis.json --jwt-secret jwt.hex [--port 8551]
+//
+// It starts from a geth-format genesis, listens on 127.0.0.1 (the Engine API is for a consensus client on
+// the same machine, and is not meant to face a network), and executes whatever payloads it is sent. State
+// lives in memory and is gone when the process stops: persistence is the next step.
+
+import { Sys } from "std";
+import { json.parse } from "wac";
+import { rlp.encode } from "wac";
+import { crypto.keccak256 } from "wac";
+import { U256 } from "../src/u256.wac";
+import { hexToBytes } from "../src/hex.wac";
+import { Genesis, genesisFrom } from "../src/chain/genesis.wac";
+import { Engine, headerItem } from "../src/engine/engine.wac";
+import { HttpRequest, headersEnd, parseHead, answerHttp } from "../src/engine/rpc.wac";
+
+string usage() { return "usage: wacuum --genesis FILE --jwt-secret FILE [--addr 127.0.0.1] [--port 8551]"; }
+
+export async i32 main(Sys sys) {
+  string[] args = sys.args();
+  string genesisPath = "";
+  string secretPath = "";
+  string addr = "127.0.0.1";
+  i32 port = 8551;
+  for (i32 i = 0; i + 1 < args.len(); i += 2) {
+    if (args[i] == "--genesis") { genesisPath = args[i + 1]; }
+    else if (args[i] == "--jwt-secret") { secretPath = args[i + 1]; }
+    else if (args[i] == "--addr") { addr = args[i + 1]; }
+    else if (args[i] == "--port") {
+      i32 n = 0;
+      u8[] d = args[i + 1].toBytes();
+      for (i32 k = 0; k < d.len(); k++) { n = n * 10 + ((d[k] - 48) as i32); }
+      port = n;
+    } else {
+      sys.warn(usage());
+      return 2;
+    }
+  }
+  if (genesisPath == "" || secretPath == "") {
+    sys.warn(usage());
+    return 2;
+  }
+
+  u8[] secret = u8[].filled(0, 0);
+  match (await sys.readFile(secretPath)) {
+    Err(e): { sys.warn("wacuum: \{secretPath}: \{e}"); return 1; }
+    Ok(b): {
+      // The secret file is hex, with or without 0x, and maybe a trailing newline.
+      string text = string.fromBytes(b);
+      while (text.len() > 0 && (text.slice(text.len() - 1, text.len()) == "\n" || text.slice(text.len() - 1, text.len()) == "\r")) {
+        text = text.slice(0, text.len() - 1);
+      }
+      u8[]? s = hexToBytes(text);
+      if (s is null || s!.len() != 32) { sys.warn("wacuum: the JWT secret must be 32 bytes of hex"); return 1; }
+      secret = s!;
+    }
+  }
+
+  Genesis? g = null;
+  match (await sys.readFile(genesisPath)) {
+    Err(e): { sys.warn("wacuum: \{genesisPath}: \{e}"); return 1; }
+    Ok(b): {
+      match (parse(b)) {
+        Err(e): { sys.warn("wacuum: \{genesisPath} is not JSON"); return 1; }
+        Ok(doc): {
+          string[] why = [""];
+          g = genesisFrom(doc, why);
+          if (g is null) { sys.warn("wacuum: \{genesisPath}: \{why[0]}"); return 1; }
+        }
+      }
+    }
+  }
+  Genesis gen = g!;
+  gen.header.hash = U256.fromBytes(keccak256(encode(headerItem(gen.spec, gen.header))), 0, 32);
+  Engine e = Engine.create(gen.spec, gen.chainId, gen.header, gen.world);
+  sys.log("wacuum: \{gen.spec.name}, chain \{gen.chainId.toDecimal()}, genesis \{gen.header.hash.toHex()}");
+
+  match (await sys.net().listen(addr, port)) {
+    Err(err): { sys.warn("wacuum: cannot listen on \{addr}:\{port}: \{err}"); return 1; }
+    Ok(listener): {
+      sys.log("wacuum: Engine API on \{listener.addr}");
+      while (true) {
+        match (await listener.accept()) {
+          Err(err): { sys.warn("wacuum: accept: \{err}"); }
+          Ok(sock): {
+            // Read until the headers are complete, then until the body is.
+            u8[] buf = u8[].filled(4096, 0);
+            i32 len = 0;
+            i32 end = -1;
+            HttpRequest? req = null;
+            bool done = false;
+            while (!done) {
+              match (await sock.recv()) {
+                Err(err): { done = true; }
+                Ok(r): {
+                  match (r) {
+                    End: { done = true; }
+                    Data(bytes): {
+                      if (len + bytes.len() > buf.len()) {
+                        i32 cap = buf.len() * 2;
+                        while (cap < len + bytes.len()) { cap = cap * 2; }
+                        u8[] grown = u8[].filled(cap, 0);
+                        for (i32 i = 0; i < len; i++) { grown[i] = buf[i]; }
+                        buf = grown;
+                      }
+                      for (i32 i = 0; i < bytes.len(); i++) { buf[len + i] = bytes[i]; }
+                      len += bytes.len();
+                      if (end < 0) {
+                        end = headersEnd(buf, len);
+                        if (end >= 0) {
+                          req = parseHead(buf, end);
+                          if (req is null) { done = true; }
+                        }
+                      }
+                      if (req is not null && len - end >= req!.contentLength) { done = true; }
+                    }
+                  }
+                }
+              }
+            }
+            if (req is not null && len - end >= req!.contentLength) {
+              HttpRequest rq = req!;
+              u8[] body = u8[].filled(rq.contentLength, 0);
+              for (i32 i = 0; i < body.len(); i++) { body[i] = buf[end + i]; }
+              rq.body = body;
+              i64 now = (await sys.clock().nowMillis()).orElse(0 as i64) / 1000;
+              await sock.send(answerHttp(e, rq, secret, now));
+            }
+            sock.close();
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,111 @@
+// A chain's first block from a `genesis.json` in geth's format — the one devnets and testnets publish:
+// a `config` naming the chain and its fork times, an `alloc` of accounts, and the genesis header's own
+// fields. The state root is computed from the alloc, and the header's hash is what every later block
+// chains back to, so getting any field wrong here shows as the consensus client's first payload being
+// refused for an unknown parent.
+
+import { crypto.sha256 } from "wac";
+import { json.JsonValue, json.JsonObject } from "wac";
+import { U256 } from "../u256.wac";
+import { hexToBytes } from "../hex.wac";
+import { World, Account } from "../state/world.wac";
+import { stateRoot } from "../state/root.wac";
+import { emptyRoot } from "../trie/trie.wac";
+import { Spec } from "../evm/spec.wac";
+import { Header, EMPTY_OMMERS } from "./block.wac";
+
+export struct Genesis {
+  Spec spec;
+  U256 chainId;
+  Header header;
+  World world;
+}
+
+/** A number written in hex with `0x`, or in decimal, as geth accepts both. Null for anything else. */
+export U256? quantity(string s) {
+  if (s.len() >= 2 && s.slice(0, 2) == "0x") { return s.len() == 2 ? U256.zero() : U256.fromHex(s); }
+  if (s.len() == 0) { return null; }
+  U256 v = U256.zero();
+  U256 ten = U256.ofU64(10);
+  u8[] b = s.toBytes();
+  for (i32 i = 0; i < b.len(); i++) {
+    if (b[i] < 48 || b[i] > 57) { return null; }
+    v = v.mul(ten).add(U256.ofU64((b[i] - 48) as u64));
+  }
+  return v;
+}
+
+U256 field(JsonValue o, string key, U256 dflt) {
+  JsonValue? v = o.member(key);
+  if (v is null || v!.isNull()) { return dflt; }
+  string? s = v!.text();
+  if (s is not null) { return quantity(s!) ?? dflt; }
+  f64? n = v!.number();
+  return n is null ? dflt : U256.ofU64(n!.trunc() as~ u64);
+}
+
+u8[] data(JsonValue o, string key) {
+  JsonValue? v = o.member(key);
+  if (v is null || v!.text() is null) { return u8[].filled(0, 0); }
+  return hexToBytes(v!.text()!) ?? u8[].filled(0, 0);
+}
+
+/** The genesis described by `g`, or null with `why[0]` saying what is wrong. */
+export Genesis? genesisFrom(JsonValue g, string[] why) {
+  JsonValue? config = g.member("config");
+  if (config is null) {
+    why[0] = "no config";
+    return null;
+  }
+  U256 chainId = field(config!, "chainId", U256.one());
+  U256 timestamp = field(g, "timestamp", U256.zero());
+  // The fork at genesis decides the header's shape. Forks scheduled later are not followed yet.
+  JsonValue? prague = config!.member("pragueTime");
+  JsonValue? cancun = config!.member("cancunTime");
+  Spec spec;
+  if (prague is not null && field(config!, "pragueTime", U256.max()).le(timestamp)) {
+    spec = Spec.prague();
+  } else if (cancun is not null && field(config!, "cancunTime", U256.max()).le(timestamp)) {
+    spec = Spec.cancun();
+  } else {
+    why[0] = "the chain is not on Cancun or Prague at genesis";
+    return null;
+  }
+
+  World w = World.create();
+  JsonValue? alloc = g.member("alloc");
+  JsonObject accounts = alloc?.object() ?? JsonObject.create();
+  for (i32 i = 0; i < accounts.len(); i++) {
+    string key = accounts.at(i).keyStr();
+    U256? addr = U256.fromHex(key);
+    if (addr is null) {
+      why[0] = "alloc address \{key} is not hex";
+      return null;
+    }
+    JsonValue a = accounts.at(i).value;
+    Account acct = w.touch(addr!);
+    acct.nonce = field(a, "nonce", U256.zero()).low();
+    acct.balance = field(a, "balance", U256.zero());
+    JsonObject st = a.member("storage")?.object() ?? JsonObject.create();
+    for (i32 k = 0; k < st.len(); k++) {
+      U256 v = U256.fromHex(st.at(k).value.text() ?? "0x0") ?? U256.zero();
+      if (!v.isZero()) { acct.storage.set(U256.fromHex(st.at(k).keyStr()) ?? U256.zero(), v); }
+    }
+    w.setCode(addr!, data(a, "code"));
+  }
+  w.endTransaction();
+
+  U256 empty = U256.fromBytes(emptyRoot(), 0, 32);
+  u8[] nonce = data(g, "nonce");
+  u8[] nonce8 = u8[].filled(8, 0);
+  for (i32 i = 0; i < nonce.len() && i < 8; i++) { nonce8[8 - nonce.len() + i] = nonce[i]; }
+  Header h = Header(field(g, "parentHash", U256.zero()), U256.fromHex(EMPTY_OMMERS)!, field(g, "coinbase", U256.zero()),
+                    U256.fromBytes(stateRoot(w), 0, 32), empty, empty, u8[].filled(256, 0), field(g, "difficulty", U256.zero()),
+                    field(g, "number", U256.zero()), field(g, "gasLimit", U256.ofU64(5000)), field(g, "gasUsed", U256.zero()),
+                    timestamp, data(g, "extraData"), field(g, "mixHash", U256.zero()), nonce8,
+                    field(g, "baseFeePerGas", U256.ofU64(1000000000)), empty, field(g, "blobGasUsed", U256.zero()),
+                    field(g, "excessBlobGas", U256.zero()), U256.zero(),
+                    // EIP-7685's hash of no requests at all: sha256 of nothing.
+                    U256.fromBytes(sha256(u8[].filled(0, 0)), 0, 32), U256.zero());
+  return Genesis(spec, chainId, h, w);
+}

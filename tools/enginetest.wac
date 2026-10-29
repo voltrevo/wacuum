@@ -1,0 +1,134 @@
+// Run execution-spec-tests' engine fixtures: each test's payloads go through the Engine API as a consensus
+// client would send them — `engine_newPayloadV*` with the fixture's own params, then a forkchoice update
+// to it when it was valid.
+//
+//     wac build --allow-read tools/enginetest.wac -o dist/enginetest
+//     wac dist/enginetest.wasm [--fork Cancun] [--filter text] FILE...
+//
+// A payload with a `validationError` must come back INVALID, one with an `errorCode` must be refused as a
+// malformed call with that code, and every other one must be VALID. The test passes when all of that held
+// and the head ends at the fixture's `lastblockhash`.
+
+import { Sys } from "std";
+import { json.parse, json.JsonValue, json.JsonObject, json.JsonArray } from "wac";
+import { rlp.encode } from "wac";
+import { crypto.keccak256 } from "wac";
+import { U256 } from "../src/u256.wac";
+import { World } from "../src/state/world.wac";
+import { stateRoot } from "../src/state/root.wac";
+import { Spec } from "../src/evm/spec.wac";
+import { Header } from "../src/chain/block.wac";
+import { Engine, Answer, headerItem } from "../src/engine/engine.wac";
+import { num, bytes, worldFrom } from "./fixture.wac";
+
+struct Tally {
+  i32 passed;
+  i32 failed;
+  string fork;
+  string filter;
+}
+
+Header genesisOf(JsonValue g) {
+  return Header(num(g.member("parentHash")), num(g.member("uncleHash")), num(g.member("coinbase")), num(g.member("stateRoot")),
+                num(g.member("transactionsTrie")), num(g.member("receiptTrie")), bytes(g.member("bloom")),
+                num(g.member("difficulty")), num(g.member("number")), num(g.member("gasLimit")), num(g.member("gasUsed")),
+                num(g.member("timestamp")), bytes(g.member("extraData")), num(g.member("mixHash")), bytes(g.member("nonce")),
+                num(g.member("baseFeePerGas")), num(g.member("withdrawalsRoot")), num(g.member("blobGasUsed")),
+                num(g.member("excessBlobGas")), num(g.member("parentBeaconBlockRoot")), num(g.member("requestsHash")),
+                num(g.member("hash")));
+}
+
+JsonValue str(string s) { return JsonValue.Str(s.toBytes()); }
+
+string statusOf(Answer a) {
+  if (a.result is null) { return "error \{a.code}: \{a.message}"; }
+  return a.result!.member("status")?.text() ?? "?";
+}
+
+string runTest(Spec spec, JsonValue test) {
+  World w = worldFrom(test.member("pre")!);
+  JsonValue? config = test.member("config");
+  U256 chainId = config is null ? U256.one() : num(config!.member("chainid"));
+  if (chainId.isZero()) { chainId = U256.one(); }
+  Header genesis = genesisOf(test.member("genesisBlockHeader")!);
+  U256 rebuilt = U256.fromBytes(keccak256(encode(headerItem(spec, genesis))), 0, 32);
+  if (!rebuilt.eq(genesis.hash)) { return "the genesis header rebuilds to \{rebuilt.toHex()}, not its hash"; }
+  if (!U256.fromBytes(stateRoot(w), 0, 32).eq(genesis.stateRoot)) { return "the pre-state does not hash to the genesis state root"; }
+  Engine e = Engine.create(spec, chainId, genesis, w);
+
+  JsonArray payloads = test.member("engineNewPayloads")!.array()!;
+  for (i32 i = 0; i < payloads.len(); i++) {
+    JsonValue p = payloads.get(i);
+    string v = p.member("newPayloadVersion")!.text()!;
+    Answer a = e.call("engine_newPayloadV" + v, p.member("params")!);
+    JsonValue? code = p.member("errorCode");
+    if (code is not null) {
+      string want = code!.text() ?? "";
+      if (a.result is not null || "\{a.code}" != want) { return "payload \{i + 1}: \{statusOf(a)}, want error \{want}"; }
+      continue;
+    }
+    bool expectInvalid = p.member("validationError") is not null;
+    string st = statusOf(a);
+    if (expectInvalid) {
+      if (st != "INVALID") { return "payload \{i + 1}: \{st}, want INVALID (\{p.member("validationError")!.text() ?? ""})"; }
+      continue;
+    }
+    if (st != "VALID") {
+      string why = a.result is null ? "" : (a.result!.member("validationError")?.text() ?? "");
+      return "payload \{i + 1}: \{st}, want VALID: \{why}";
+    }
+    // Make it the head, as the consensus client would.
+    JsonObject fc = JsonObject.create();
+    JsonValue hash = p.member("params")!.item(0)!.member("blockHash")!;
+    fc.push("headBlockHash".toBytes(), hash);
+    fc.push("safeBlockHash".toBytes(), hash);
+    fc.push("finalizedBlockHash".toBytes(), str("0x0000000000000000000000000000000000000000000000000000000000000000"));
+    JsonArray args = JsonArray.create();
+    args.push(JsonValue.Object(fc));
+    args.push(JsonValue.Null);
+    Answer f = e.call("engine_forkchoiceUpdatedV" + p.member("forkchoiceUpdatedVersion")!.text()!, JsonValue.Array(args));
+    string fst = f.result is null ? "error" : (f.result!.member("payloadStatus")?.member("status")?.text() ?? "?");
+    if (fst != "VALID") { return "payload \{i + 1}: forkchoice update answered \{fst}"; }
+  }
+  string want = test.member("lastblockhash")!.text()!;
+  if (!e.head.eq(U256.fromHex(want)!)) { return "the head is \{e.head.toHex()}, want \{want}"; }
+  return "";
+}
+
+export async i32 main(Sys sys) {
+  string[] args = sys.args();
+  Tally tally = Tally(0, 0, "Cancun", "");
+  for (i32 a = 0; a < args.len(); a++) {
+    string arg = args[a];
+    if (arg == "--fork") { a++; tally.fork = args[a]; continue; }
+    if (arg == "--filter") { a++; tally.filter = args[a]; continue; }
+    match (await sys.readFile(arg)) {
+      Err(e): { sys.log("FAIL \{arg}: \{e}"); tally.failed++; }
+      Ok(src): {
+        match (parse(src)) {
+          Err(e): { sys.log("FAIL \{arg}: not JSON"); tally.failed++; }
+          Ok(doc): {
+            JsonObject tests = doc.object()!;
+            for (i32 i = 0; i < tests.len(); i++) {
+              string name = tests.at(i).keyStr();
+              JsonValue test = tests.at(i).value;
+              if (tally.filter != "" && name.indexOf(tally.filter) < 0) { continue; }
+              if ((test.member("network")!.text() ?? "") != tally.fork) { continue; }
+              Spec? spec = Spec.byName(tally.fork);
+              if (spec is null) { continue; }
+              string why = runTest(spec!, test);
+              if (why == "") {
+                tally.passed++;
+              } else {
+                tally.failed++;
+                sys.log("FAIL \{name}: \{why}");
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  sys.log("\{tally.passed} passed, \{tally.failed} failed");
+  return tally.failed == 0 ? 0 : 1;
+}
