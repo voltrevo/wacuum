@@ -1,0 +1,207 @@
+// The shapes the `eth_` methods answer in: blocks, transactions, receipts and logs as JSON, the way geth and
+// every library that talks to it spell them. Numbers are hex quantities without leading zeros, hashes and
+// addresses are fixed-width hex, and absent things are null rather than missing.
+
+import { json.JsonValue, json.JsonObject, json.JsonArray } from "wac";
+import { rlp.Item, rlp.decode, rlp.Decoded, rlp.bytesOf, rlp.itemsOf, rlp.isList } from "wac";
+import { crypto.keccak256 } from "wac";
+import { U256 } from "../u256.wac";
+import { bytesToHex } from "../hex.wac";
+import { Log } from "../state/world.wac";
+import { addressBytes } from "../evm/evm.wac";
+import { Header, Withdrawal, Receipt, EMPTY_OMMERS } from "../chain/block.wac";
+import { decodeTransaction, DecodedTx } from "../tx/decode.wac";
+import { Transaction } from "../tx/process.wac";
+
+export JsonValue text(string s) { return JsonValue.Str(s.toBytes()); }
+export JsonValue quantity(U256 v) { return text(v.toHex()); }
+export JsonValue small(i64 v) { return quantity(U256.ofU64(v as@ u64)); }
+export JsonValue word(U256 v) { return text(bytesToHex(v.toBytes())); }
+export JsonValue address(U256 a) { return text(bytesToHex(addressBytes(a))); }
+export JsonValue data(u8[] b) { return text(bytesToHex(b)); }
+
+/** A block, with its transactions as hashes or (`full`) as objects. */
+export JsonValue blockJson(Header h, Item[] txs, Withdrawal[] withdrawals, Receipt[] receipts, i32 size, bool full,
+                           U256 chainId) {
+  JsonObject o = JsonObject.create();
+  o.push("number".toBytes(), quantity(h.number));
+  o.push("hash".toBytes(), word(h.hash));
+  o.push("parentHash".toBytes(), word(h.parentHash));
+  o.push("sha3Uncles".toBytes(), word(U256.fromHex(EMPTY_OMMERS)!));
+  o.push("miner".toBytes(), address(h.coinbase));
+  o.push("stateRoot".toBytes(), word(h.stateRoot));
+  o.push("transactionsRoot".toBytes(), word(h.txRoot));
+  o.push("receiptsRoot".toBytes(), word(h.receiptsRoot));
+  o.push("logsBloom".toBytes(), data(h.bloom));
+  o.push("difficulty".toBytes(), quantity(h.difficulty));
+  o.push("totalDifficulty".toBytes(), quantity(U256.zero()));
+  o.push("gasLimit".toBytes(), quantity(h.gasLimit));
+  o.push("gasUsed".toBytes(), quantity(h.gasUsed));
+  o.push("timestamp".toBytes(), quantity(h.timestamp));
+  o.push("extraData".toBytes(), data(h.extraData));
+  o.push("mixHash".toBytes(), word(h.prevRandao));
+  o.push("nonce".toBytes(), data(h.nonce));
+  o.push("baseFeePerGas".toBytes(), quantity(h.baseFee));
+  o.push("withdrawalsRoot".toBytes(), word(h.withdrawalsRoot));
+  o.push("blobGasUsed".toBytes(), quantity(h.blobGasUsed));
+  o.push("excessBlobGas".toBytes(), quantity(h.excessBlobGas));
+  o.push("parentBeaconBlockRoot".toBytes(), word(h.parentBeaconBlockRoot));
+  if (!h.requestsHash.isZero()) { o.push("requestsHash".toBytes(), word(h.requestsHash)); }
+  o.push("size".toBytes(), small(size as i64));
+  JsonArray ts = JsonArray.create();
+  for (i32 i = 0; i < txs.len(); i++) {
+    if (full) { ts.push(txJson(txs[i], chainId, h, i)); } else { ts.push(word(receipts[i].txHash)); }
+  }
+  o.push("transactions".toBytes(), JsonValue.Array(ts));
+  o.push("uncles".toBytes(), JsonValue.Array(JsonArray.create()));
+  JsonArray ws = JsonArray.create();
+  for (i32 i = 0; i < withdrawals.len(); i++) {
+    Withdrawal w = withdrawals[i];
+    JsonObject wo = JsonObject.create();
+    wo.push("index".toBytes(), quantity(w.index));
+    wo.push("validatorIndex".toBytes(), quantity(w.validator));
+    wo.push("address".toBytes(), address(w.address));
+    wo.push("amount".toBytes(), quantity(w.amount));
+    ws.push(JsonValue.Object(wo));
+  }
+  o.push("withdrawals".toBytes(), JsonValue.Array(ws));
+  return JsonValue.Object(o);
+}
+
+/** The signature's three fields, read back off the transaction's own RLP: they are always its last three. */
+U256[] signatureOf(u8[] raw) {
+  u8[] body = raw;
+  if (raw.len() > 0 && (raw[0] as i32) < 0xc0) {
+    body = u8[].filled(raw.len() - 1, 0);
+    for (i32 i = 0; i < body.len(); i++) { body[i] = raw[i + 1]; }
+  }
+  Decoded d = decode(body);
+  U256[] out = [U256.zero(), U256.zero(), U256.zero()];
+  if (!d.ok || !isList(d.item)) { return out; }
+  Item[] f = itemsOf(d.item);
+  for (i32 i = 0; i < 3 && f.len() >= 3; i++) {
+    u8[] b = bytesOf(f[f.len() - 3 + i]);
+    out[i] = b.len() == 0 ? U256.zero() : U256.fromBytes(b, 0, b.len());
+  }
+  return out;
+}
+
+/** A transaction; with `h`, the block it is in and where, and its effective gas price there. */
+export JsonValue txJson(Item it, U256 chainId, Header? h, i32 index) {
+  DecodedTx d = decodeTransaction(it, chainId);
+  Transaction tx = d.tx;
+  JsonObject o = JsonObject.create();
+  o.push("type".toBytes(), small(tx.txType as i64));
+  o.push("hash".toBytes(), word(U256.fromBytes(keccak256(d.raw), 0, 32)));
+  o.push("nonce".toBytes(), quantity(tx.nonce));
+  o.push("blockHash".toBytes(), h is null ? JsonValue.Null : word(h!.hash));
+  o.push("blockNumber".toBytes(), h is null ? JsonValue.Null : quantity(h!.number));
+  o.push("transactionIndex".toBytes(), h is null ? JsonValue.Null : small(index as i64));
+  o.push("from".toBytes(), address(tx.sender));
+  o.push("to".toBytes(), tx.to is null ? JsonValue.Null : address(tx.to!));
+  o.push("value".toBytes(), quantity(tx.value));
+  o.push("gas".toBytes(), quantity(tx.gasLimit));
+  o.push("input".toBytes(), data(tx.data));
+  if (tx.txType >= 2) {
+    U256 price = tx.maxFeePerGas;
+    if (h is not null) {
+      U256 capped = h!.baseFee.add(tx.maxPriorityFeePerGas);
+      if (capped.lt(price)) { price = capped; }
+    }
+    o.push("gasPrice".toBytes(), quantity(price));
+    o.push("maxFeePerGas".toBytes(), quantity(tx.maxFeePerGas));
+    o.push("maxPriorityFeePerGas".toBytes(), quantity(tx.maxPriorityFeePerGas));
+  } else {
+    o.push("gasPrice".toBytes(), quantity(tx.gasPrice));
+  }
+  if (tx.txType >= 1) {
+    o.push("chainId".toBytes(), quantity(chainId));
+    JsonArray al = JsonArray.create();
+    for (i32 i = 0; i < tx.accessList.len(); i++) {
+      JsonObject e = JsonObject.create();
+      e.push("address".toBytes(), address(tx.accessList[i].address));
+      JsonArray keys = JsonArray.create();
+      for (i32 k = 0; k < tx.accessList[i].keys.len(); k++) { keys.push(word(tx.accessList[i].keys[k])); }
+      e.push("storageKeys".toBytes(), JsonValue.Array(keys));
+      al.push(JsonValue.Object(e));
+    }
+    o.push("accessList".toBytes(), JsonValue.Array(al));
+  }
+  if (tx.txType == 3) {
+    o.push("maxFeePerBlobGas".toBytes(), quantity(tx.maxFeePerBlobGas));
+    JsonArray hs = JsonArray.create();
+    for (i32 i = 0; i < tx.blobHashes.len(); i++) { hs.push(word(tx.blobHashes[i])); }
+    o.push("blobVersionedHashes".toBytes(), JsonValue.Array(hs));
+  }
+  if (tx.txType == 4) {
+    JsonArray auths = JsonArray.create();
+    for (i32 i = 0; i < tx.authorizations.len(); i++) {
+      JsonObject a = JsonObject.create();
+      a.push("chainId".toBytes(), quantity(tx.authorizations[i].chainId));
+      a.push("address".toBytes(), address(tx.authorizations[i].address));
+      a.push("nonce".toBytes(), quantity(tx.authorizations[i].nonce));
+      a.push("yParity".toBytes(), quantity(tx.authorizations[i].yParity));
+      a.push("r".toBytes(), quantity(tx.authorizations[i].r));
+      a.push("s".toBytes(), quantity(tx.authorizations[i].s));
+      auths.push(JsonValue.Object(a));
+    }
+    o.push("authorizationList".toBytes(), JsonValue.Array(auths));
+  }
+  U256[] sig = signatureOf(d.raw);
+  o.push("v".toBytes(), quantity(sig[0]));
+  if (tx.txType >= 1) { o.push("yParity".toBytes(), quantity(sig[0])); }
+  o.push("r".toBytes(), quantity(sig[1]));
+  o.push("s".toBytes(), quantity(sig[2]));
+  return JsonValue.Object(o);
+}
+
+/** A log, where it was emitted: the block, the transaction, and its index across the whole block. */
+export JsonValue logJson(Log l, Header h, U256 txHash, i32 txIndex, i32 logIndex) {
+  JsonObject o = JsonObject.create();
+  o.push("address".toBytes(), address(l.address));
+  JsonArray topics = JsonArray.create();
+  for (i32 i = 0; i < l.topics.len(); i++) { topics.push(word(l.topics[i])); }
+  o.push("topics".toBytes(), JsonValue.Array(topics));
+  o.push("data".toBytes(), data(l.data));
+  o.push("blockNumber".toBytes(), quantity(h.number));
+  o.push("blockHash".toBytes(), word(h.hash));
+  o.push("blockTimestamp".toBytes(), quantity(h.timestamp));
+  o.push("transactionHash".toBytes(), word(txHash));
+  o.push("transactionIndex".toBytes(), small(txIndex as i64));
+  o.push("logIndex".toBytes(), small(logIndex as i64));
+  o.push("removed".toBytes(), JsonValue.Bool(false));
+  return JsonValue.Object(o);
+}
+
+/** The index in its block of the first log of `receipts[index]`. */
+export i32 firstLogIndex(Receipt[] receipts, i32 index) {
+  i32 n = 0;
+  for (i32 i = 0; i < index; i++) { n += receipts[i].logs.len(); }
+  return n;
+}
+
+export JsonValue receiptJson(Receipt r, Header h, Receipt[] all, i32 index) {
+  JsonObject o = JsonObject.create();
+  o.push("type".toBytes(), small(r.txType as i64));
+  o.push("transactionHash".toBytes(), word(r.txHash));
+  o.push("transactionIndex".toBytes(), small(index as i64));
+  o.push("blockHash".toBytes(), word(h.hash));
+  o.push("blockNumber".toBytes(), quantity(h.number));
+  o.push("from".toBytes(), address(r.from));
+  o.push("to".toBytes(), r.to is null ? JsonValue.Null : address(r.to!));
+  o.push("status".toBytes(), small(r.success ? 1 : 0));
+  o.push("gasUsed".toBytes(), small(r.gasUsed));
+  o.push("cumulativeGasUsed".toBytes(), small(r.cumulativeGasUsed));
+  o.push("effectiveGasPrice".toBytes(), quantity(r.effectiveGasPrice));
+  if (r.txType == 3) {
+    o.push("blobGasUsed".toBytes(), small(r.blobGasUsed));
+    o.push("blobGasPrice".toBytes(), quantity(r.blobGasPrice));
+  }
+  o.push("contractAddress".toBytes(), r.contractAddress is null ? JsonValue.Null : address(r.contractAddress!));
+  o.push("logsBloom".toBytes(), data(r.bloom));
+  JsonArray logs = JsonArray.create();
+  i32 first = firstLogIndex(all, index);
+  for (i32 i = 0; i < r.logs.len(); i++) { logs.push(logJson(r.logs[i], h, r.txHash, index, first + i)); }
+  o.push("logs".toBytes(), JsonValue.Array(logs));
+  return JsonValue.Object(o);
+}

@@ -14,7 +14,7 @@ import { U256 } from "../u256.wac";
 import { World, Log, hashU256, eqU256 } from "../state/world.wac";
 import { stateRoot, u256Bytes } from "../state/root.wac";
 import { trieRoot } from "../trie/trie.wac";
-import { BlockEnv, TxEnv, Evm, Message, processMessage, addressBytes } from "../evm/evm.wac";
+import { BlockEnv, TxEnv, Evm, Message, processMessage, addressBytes, createAddress } from "../evm/evm.wac";
 import { Outcome } from "../evm/interp.wac";
 import { OpTable } from "../evm/table.wac";
 import { Spec, MAX_RLP_BLOCK_SIZE } from "../evm/spec.wac";
@@ -372,27 +372,32 @@ u8[]? depositOf(u8[] data) {
  * in no state anyone should keep — run this on a clone.
  */
 export string applyBlock(Spec spec, World w, Block b, Header parent, U256 chainId, Map<U256, U256> hashes) {
+  return executeBlock(spec, w, b, parent, chainId, hashes).error;
+}
+
+/** `applyBlock`, keeping what executing the block produced: its receipts, for whoever reports them. */
+export Body executeBlock(Spec spec, World w, Block b, Header parent, U256 chainId, Map<U256, U256> hashes) {
   Header h = b.header;
   string bad = checkHeader(spec, h, parent);
-  if (bad != "") { return bad; }
-  if (b.hasOmmers) { return "a block with ommers after the merge"; }
-  if (spec.isOsaka && blockSize(spec, b) > MAX_RLP_BLOCK_SIZE) { return "a block over EIP-7934's size limit"; }
+  if (bad != "") { return failed(bad); }
+  if (b.hasOmmers) { return failed("a block with ommers after the merge"); }
+  if (spec.isOsaka && blockSize(spec, b) > MAX_RLP_BLOCK_SIZE) { return failed("a block over EIP-7934's size limit"); }
 
   BlockEnv env = BlockEnv(h.coinbase, h.number, h.timestamp, h.gasLimit, h.prevRandao, h.baseFee,
                           blobGasPrice(spec, h.excessBlobGas), chainId, hashes);
   Body r = executeBody(spec, w, env, h, b.txs, b.withdrawals, false);
-  if (r.error != "") { return r.error; }
-  if (spec.isPrague && !r.requestsHash.eq(h.requestsHash)) { return "requests hash does not match"; }
-  if (!U256.ofU64(r.gasUsed as! u64).eq(h.gasUsed)) { return "gas used \{r.gasUsed}, header says \{h.gasUsed.toDecimal()}"; }
-  if (!U256.ofU64(r.blobGasUsed as! u64).eq(h.blobGasUsed)) { return "blob gas used does not match"; }
-  if (!r.txRoot.eq(h.txRoot)) { return "transactions root does not match"; }
-  if (!r.receiptsRoot.eq(h.receiptsRoot)) { return "receipts root does not match"; }
+  if (r.error != "") { return r; }
+  if (spec.isPrague && !r.requestsHash.eq(h.requestsHash)) { return failed("requests hash does not match"); }
+  if (!U256.ofU64(r.gasUsed as! u64).eq(h.gasUsed)) { return failed("gas used \{r.gasUsed}, header says \{h.gasUsed.toDecimal()}"); }
+  if (!U256.ofU64(r.blobGasUsed as! u64).eq(h.blobGasUsed)) { return failed("blob gas used does not match"); }
+  if (!r.txRoot.eq(h.txRoot)) { return failed("transactions root does not match"); }
+  if (!r.receiptsRoot.eq(h.receiptsRoot)) { return failed("receipts root does not match"); }
   for (i32 k = 0; k < 256; k++) {
-    if (r.bloom[k] != h.bloom[k]) { return "logs bloom does not match"; }
+    if (r.bloom[k] != h.bloom[k]) { return failed("logs bloom does not match"); }
   }
-  if (!r.withdrawalsRoot.eq(h.withdrawalsRoot)) { return "withdrawals root does not match"; }
-  if (!r.stateRoot.eq(h.stateRoot)) { return "state root does not match"; }
-  return "";
+  if (!r.withdrawalsRoot.eq(h.withdrawalsRoot)) { return failed("withdrawals root does not match"); }
+  if (!r.stateRoot.eq(h.stateRoot)) { return failed("state root does not match"); }
+  return r;
 }
 
 /** What executing a block's body produced: every commitment its header makes, and what went in. */
@@ -417,11 +422,32 @@ export struct Body {
   /** EIP-7685's three request lists — deposits, withdrawal requests, consolidations — and their hash. */
   u8[][] requests;
   U256 requestsHash;
+  /** Each included transaction's receipt, for the JSON-RPC methods that report them. */
+  Receipt[] receipts;
+}
+
+/** What a transaction came to, as `eth_getTransactionReceipt` reports it. */
+export struct Receipt {
+  U256 txHash;
+  i32 txType;
+  U256 from;
+  U256? to;
+  bool success;
+  i64 gasUsed;
+  i64 cumulativeGasUsed;
+  /** What each unit of gas cost the sender. */
+  U256 effectiveGasPrice;
+  i64 blobGasUsed;
+  U256 blobGasPrice;
+  /** The address a creation made. */
+  U256? contractAddress;
+  Log[] logs;
+  u8[] bloom;
 }
 
 Body failed(string why) {
   return Body(why, Item[].filled(0, Item.Bytes(u8[].filled(0, 0))), 0, 0, U256.zero(), u8[].filled(256, 0), U256.zero(), U256.zero(),
-              U256.zero(), U256.zero(), u8[][].defaulted(0), U256.zero());
+              U256.zero(), U256.zero(), u8[][].defaulted(0), U256.zero(), Vec<Receipt>.create().toArray());
 }
 
 /**
@@ -441,6 +467,7 @@ export Body executeBody(Spec spec, World w, BlockEnv env, Header h, Item[] txs, 
   Vec<Item> included = Vec.create();
   Vec<u8[]> txRaw = Vec.create();
   Vec<u8[]> receipts = Vec.create();
+  Vec<Receipt> receiptList = Vec.create();
   u8[] blockBloom = u8[].filled(256, 0);
   Vec<u8[]> deposits = Vec.create();
   for (i32 i = 0; i < txs.len(); i++) {
@@ -473,6 +500,14 @@ export Body executeBody(Spec spec, World w, BlockEnv env, Header h, Item[] txs, 
     included.push(txs[i]);
     txRaw.push(d.raw);
     receipts.push(receiptOf(tx.txType, p.success, used, bloom, p.logs));
+    U256 price = tx.gasPrice;
+    if (tx.txType >= 2) {
+      U256 capped = env.baseFee.add(tx.maxPriorityFeePerGas);
+      price = capped.lt(tx.maxFeePerGas) ? capped : tx.maxFeePerGas;
+    }
+    receiptList.push(Receipt(U256.fromBytes(keccak256(d.raw), 0, 32), tx.txType, tx.sender, tx.to, p.success, p.gasUsed,
+                             used, price, GAS_PER_BLOB * (tx.blobHashes.len() as i64), env.blobBaseFee,
+                             tx.to is null ? createAddress(tx.sender, tx.nonce.low()) : null, p.logs, bloom));
   }
 
   U256 fees = w.balance(env.coinbase).sub(coinbaseBefore);
@@ -511,7 +546,7 @@ export Body executeBody(Spec spec, World w, BlockEnv env, Header h, Item[] txs, 
 
   return Body("", included.toArray(), used, blobUsed, fees, blockBloom, U256.fromBytes(indexedRoot(txRaw.toArray()), 0, 32),
               U256.fromBytes(indexedRoot(receipts.toArray()), 0, 32), U256.fromBytes(indexedRoot(wsRaw), 0, 32),
-              U256.fromBytes(stateRoot(w), 0, 32), requests, requestsHash);
+              U256.fromBytes(stateRoot(w), 0, 32), requests, requestsHash, receiptList.toArray());
 }
 
 /** The length of the block's RLP. */

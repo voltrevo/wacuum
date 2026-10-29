@@ -29,11 +29,14 @@ import { Outcome } from "../evm/interp.wac";
 import { OpTable } from "../evm/table.wac";
 import { blobGasPrice } from "../tx/process.wac";
 import { Spec, ChainConfig } from "../evm/spec.wac";
-import { Header, Block, Withdrawal, applyBlock, encodeBlock, decodeBlock, BlockDecode, blockTimestamp, headerItem, nextBaseFee, nextExcessBlobGas, EMPTY_OMMERS, requestsHashOf,
+import { Header, Block, Withdrawal, Receipt, Body, executeBlock, applyBlock, encodeBlock, decodeBlock, BlockDecode, blockTimestamp, headerItem, nextBaseFee, nextExcessBlobGas, EMPTY_OMMERS, requestsHashOf,
          indexedRoot } from "../chain/block.wac";
 import { decodeTransaction, DecodedTx } from "../tx/decode.wac";
 import { Attributes, Built, buildBlock } from "../chain/build.wac";
 import { Sidecar, Unwrapped, unwrap, sidecarsFit, CELLS_PER_BLOB } from "./blobs.wac";
+import { blockJson, txJson, receiptJson, logJson, firstLogIndex } from "./eth.wac";
+import { Log } from "../state/world.wac";
+import { Transaction, AccessEntry, Authorization, processTransaction, Processed, intrinsicGas } from "../tx/process.wac";
 
 /**
  * A block this client has executed, and what executing it changed: enough to move the one world there
@@ -43,6 +46,25 @@ import { Sidecar, Unwrapped, unwrap, sidecarsFit, CELLS_PER_BLOB } from "./blobs
 struct Node {
   Header header;
   ChangeSet? changes;
+}
+
+/**
+ * What the JSON-RPC methods report about a block: its transactions, withdrawals and receipts, and its
+ * size. Kept for every canonical block, unlike its change set, and for unfinalized forks until finality
+ * rules them out.
+ */
+struct Archived {
+  Header header;
+  Item[] txs;
+  Withdrawal[] withdrawals;
+  Receipt[] receipts;
+  i32 size;
+}
+
+/** Where a canonical transaction is. */
+struct TxAt {
+  U256 block;
+  i32 index;
 }
 
 /** The log's two kinds of record, each `rlp([kind, ...])`: a block's RLP, and a fork choice's three hashes. */
@@ -95,6 +117,9 @@ export struct Engine {
    * set it, and their payloads' blobs bundles are then short of those blobs.
    */
   bool sidecarsOptional;
+  Map<U256, Archived> archive;
+  /** Transaction hash to where it is, for the canonical chain; a stale entry is checked away on lookup. */
+  Map<U256, TxAt> txIndex;
   /** The finalized block `forgetBelowFinalized` last pruned for. */
   U256 forgottenAt;
   /**
@@ -106,8 +131,12 @@ export struct Engine {
   /** An engine whose chain starts at `genesis`, with `world` its state. */
   Engine create(ChainConfig config, Header genesis, World world) {
     Engine e = Engine(config, config.chainId, Map.create(hashU256, eqU256), Map.create(hashU256, eqU256), genesis.hash, genesis.hash,
-                      genesis.hash, Vec.create(), Map.create(hashU256, eqU256), 1, world, genesis.hash, Map.create(hashU256, eqU256), false, U256.zero(), Vec.create());
+                      genesis.hash, Vec.create(), Map.create(hashU256, eqU256), 1, world, genesis.hash, Map.create(hashU256, eqU256), false, Map.create(hashU256, eqU256), Map.create(hashU256, eqU256),
+                      U256.zero(), Vec.create());
     e.blocks.set(genesis.hash, Node(genesis, null));
+    e.archive.set(genesis.hash, Archived(genesis, Item[].filled(0, Item.Bytes(u8[].filled(0, 0))),
+                                         Withdrawal[].filled(0, Withdrawal(U256.zero(), U256.zero(), U256.zero(), U256.zero())),
+                                         Vec<Receipt>.create().toArray(), 0));
     e.canonical.set(genesis.number, genesis.hash);
     return e;
   }
@@ -129,15 +158,70 @@ export struct Engine {
     if (method == "engine_getBlobsV1") { return this.getBlobs(1, ps!); }
     if (method == "engine_getBlobsV2") { return this.getBlobs(2, ps!); }
     if (method == "eth_sendRawTransaction") { return this.sendRawTransaction(ps!); }
-    if (method == "eth_getBalance") { return Answer.ok(str(this.headState().balance(hexU256(arg(ps!, 0))).toHex())); }
-    if (method == "eth_getTransactionCount") {
-      return Answer.ok(str(U256.ofU64(this.headState().nonce(hexU256(arg(ps!, 0)))).toHex()));
+    if (method == "eth_getBalance" || method == "eth_getTransactionCount" || method == "eth_getCode") {
+      World? w = this.stateAt(arg(ps!, 1));
+      if (w is null) { return unavailable(); }
+      U256 a = hexU256(arg(ps!, 0));
+      if (method == "eth_getBalance") { return Answer.ok(str(w!.balance(a).toHex())); }
+      if (method == "eth_getCode") { return Answer.ok(str(bytesToHex(w!.code(a)))); }
+      return Answer.ok(str(U256.ofU64(w!.nonce(a)).toHex()));
     }
-    if (method == "eth_getCode") { return Answer.ok(str(bytesToHex(this.headState().code(hexU256(arg(ps!, 0)))))); }
     if (method == "eth_getStorageAt") {
-      return Answer.ok(str(hex32(this.headState().storage(hexU256(arg(ps!, 0)), hexU256(arg(ps!, 1))))));
+      World? w = this.stateAt(arg(ps!, 2));
+      if (w is null) { return unavailable(); }
+      return Answer.ok(str(hex32(w!.storage(hexU256(arg(ps!, 0)), hexU256(arg(ps!, 1))))));
     }
     if (method == "eth_call") { return this.ethCall(ps!); }
+    if (method == "eth_estimateGas") { return this.estimateGas(ps!); }
+    if (method == "eth_getBlockByNumber" || method == "eth_getBlockByHash") {
+      U256? hash = method == "eth_getBlockByHash" ? hexU256(arg(ps!, 0)) : this.blockFor(arg(ps!, 0));
+      Archived? a = hash is null ? null : this.archive.get(hash!);
+      if (a is null) { return Answer.ok(JsonValue.Null); }
+      bool full = arg(ps!, 1)?.boolean() ?? false;
+      return Answer.ok(blockJson(a!.header, a!.txs, a!.withdrawals, a!.receipts, a!.size, full, this.chainId));
+    }
+    if (method == "eth_getBlockTransactionCountByNumber" || method == "eth_getBlockTransactionCountByHash") {
+      U256? hash = method == "eth_getBlockTransactionCountByHash" ? hexU256(arg(ps!, 0)) : this.blockFor(arg(ps!, 0));
+      Archived? a = hash is null ? null : this.archive.get(hash!);
+      return Answer.ok(a is null ? JsonValue.Null : str(U256.ofI32(a!.txs.len()).toHex()));
+    }
+    if (method == "eth_getTransactionByHash" || method == "eth_getTransactionReceipt") {
+      Archived? a = null;
+      i32 i = this.txWhere(hexU256(arg(ps!, 0)));
+      if (i >= 0) { a = this.archive.get(this.txIndex.get(hexU256(arg(ps!, 0)))!.block); }
+      if (a is null) {
+        if (method == "eth_getTransactionByHash") { return this.pendingTx(hexU256(arg(ps!, 0))); }
+        return Answer.ok(JsonValue.Null);
+      }
+      if (method == "eth_getTransactionByHash") { return Answer.ok(txJson(a!.txs[i], this.chainId, a!.header, i)); }
+      return Answer.ok(receiptJson(a!.receipts[i], a!.header, a!.receipts, i));
+    }
+    if (method == "eth_getBlockReceipts") {
+      U256? hash = this.blockFor(arg(ps!, 0));
+      Archived? a = hash is null ? null : this.archive.get(hash!);
+      if (a is null) { return Answer.ok(JsonValue.Null); }
+      JsonArray out = JsonArray.create();
+      for (i32 i = 0; i < a!.receipts.len(); i++) { out.push(receiptJson(a!.receipts[i], a!.header, a!.receipts, i)); }
+      return Answer.ok(JsonValue.Array(out));
+    }
+    if (method == "eth_getLogs") { return this.getLogs(ps!); }
+    if (method == "eth_gasPrice") {
+      return Answer.ok(str(nextBaseFee(this.blocks.get(this.head)!.header).add(U256.ofU64(SUGGESTED_TIP)).toHex()));
+    }
+    if (method == "eth_maxPriorityFeePerGas") { return Answer.ok(str(U256.ofU64(SUGGESTED_TIP).toHex())); }
+    if (method == "eth_blobBaseFee") {
+      Header h = this.blocks.get(this.head)!.header;
+      Spec spec = this.config.specAt(h.timestamp);
+      return Answer.ok(str(blobGasPrice(spec, nextExcessBlobGas(spec, h)).toHex()));
+    }
+    if (method == "eth_feeHistory") { return this.feeHistory(ps!); }
+    if (method == "eth_syncing") { return Answer.ok(JsonValue.Bool(false)); }
+    if (method == "eth_accounts") { return Answer.ok(JsonValue.Array(JsonArray.create())); }
+    if (method == "net_version") { return Answer.ok(str(this.chainId.toDecimal())); }
+    if (method == "net_listening") { return Answer.ok(JsonValue.Bool(true)); }
+    if (method == "net_peerCount") { return Answer.ok(str("0x0")); }
+    if (method == "web3_clientVersion") { return Answer.ok(str("wacuum/v0.1.0")); }
+    if (method == "web3_sha3") { return Answer.ok(str(bytesToHex(keccak256(hexBytes(arg(ps!, 0)))))); }
     if (method == "engine_exchangeCapabilities") { return Answer.ok(capabilities()); }
     if (method == "eth_chainId") { return Answer.ok(str(this.chainId.toHex())); }
     if (method == "eth_blockNumber") { return Answer.ok(str(this.blocks.get(this.head)!.header.number.toHex())); }
@@ -244,15 +328,17 @@ export struct Engine {
     // A parent this client has but cannot reach the state of is on a fork that finality has ruled out.
     if (!this.moveTo(h.parentHash)) { return status("SYNCING", "", ""); }
     this.world.record();
-    string err = applyBlock(spec, this.world, b, parent!.header, this.chainId, this.ancestorHashes(parent!.header));
+    Body body = executeBlock(spec, this.world, b, parent!.header, this.chainId, this.ancestorHashes(parent!.header));
     ChangeSet cs = this.world.seal();
-    if (err != "") {
+    if (body.error != "") {
       this.world.undo(cs);
-      return this.invalid(h, err);
+      return this.invalid(h, body.error);
     }
     this.blocks.set(h.hash, Node(h, cs));
     this.at = h.hash;
-    this.records.push(encode(Item.List([Item.Bytes([RECORD_BLOCK]), Item.Bytes(encodeBlock(spec, b))])));
+    u8[] rlp = encodeBlock(spec, b);
+    this.archive.set(h.hash, Archived(h, b.txs, b.withdrawals, body.receipts, rlp.len()));
+    this.records.push(encode(Item.List([Item.Bytes([RECORD_BLOCK]), Item.Bytes(rlp)])));
     return status("VALID", h.hash.toHex(), "");
   }
 
@@ -365,6 +451,10 @@ export struct Engine {
       U256? known = this.canonical.get(cur.number);
       if (known is not null && known!.eq(cur.hash)) { break; }
       this.canonical.set(cur.number, cur.hash);
+      Archived? arc = this.archive.get(cur.hash);
+      if (arc is not null) {
+        for (i32 i = 0; i < arc!.receipts.len(); i++) { this.txIndex.set(arc!.receipts[i].txHash, TxAt(cur.hash, i)); }
+      }
       Node? p = this.blocks.get(cur.parentHash);
       if (p is null) { break; }
       cur = p!.header;
@@ -398,6 +488,7 @@ export struct Engine {
         n.changes = null;
       } else if (!hashes[i].eq(this.at)) {
         this.blocks.remove(hashes[i]);
+        if (!canonical) { this.archive.remove(hashes[i]); }
       }
     }
   }
@@ -657,6 +748,187 @@ export struct Engine {
     return Replayed(at, blocks, "");
   }
 
+  /** The block a JSON-RPC block parameter names: a tag, a number on the canonical chain, or `{blockHash}`. */
+  U256? blockFor(this, JsonValue? p) {
+    if (p is null || p!.isNull()) { return this.head; }
+    JsonValue? byHash = p!.member("blockHash");
+    if (byHash is not null) { return this.archive.has(hexU256(byHash)) ? hexU256(byHash) : null; }
+    JsonValue? byNumber = p!.member("blockNumber");
+    string tag = (byNumber ?? p!).text() ?? "latest";
+    if (tag == "latest" || tag == "pending") { return this.head; }
+    if (tag == "safe") { return this.archive.has(this.safe) ? this.safe : null; }
+    if (tag == "finalized") { return this.archive.has(this.finalized) ? this.finalized : null; }
+    U256 n = tag == "earliest" ? U256.zero() : (U256.fromHex(tag) ?? U256.ofU64(0xFFFFFFFFFFFFFFFF));
+    if (n.gt(this.blocks.get(this.head)!.header.number)) { return null; }
+    return this.canonical.get(n);
+  }
+
+  /**
+   * The state after the block `p` names, which the world is moved to. Null for a block whose state is gone:
+   * the world reaches the unfinalized blocks and the finalized one, and nothing older.
+   */
+  World? stateAt(this, JsonValue? p) {
+    U256? b = this.blockFor(p);
+    if (b is null || !this.blocks.has(b!) || !this.moveTo(b!)) { return null; }
+    return this.world;
+  }
+
+  /** The index of a canonical transaction in its block, or −1. */
+  i32 txWhere(this, U256 hash) {
+    TxAt? t = this.txIndex.get(hash);
+    if (t is null) { return -1; }
+    Archived? a = this.archive.get(t!.block);
+    if (a is null) { return -1; }
+    U256? c = this.canonical.get(a!.header.number);
+    if (c is null || !c!.eq(t!.block) || a!.header.number.gt(this.blocks.get(this.head)!.header.number)) { return -1; }
+    return t!.index;
+  }
+
+  /** A transaction still in the mempool, as `eth_getTransactionByHash` reports one: with no block. */
+  Answer pendingTx(this, U256 hash) {
+    for (i32 i = 0; i < this.mempool.len(); i++) {
+      DecodedTx d = decodeTransaction(this.mempool.get(i), this.chainId);
+      if (U256.fromBytes(keccak256(d.raw), 0, 32).eq(hash)) { return Answer.ok(txJson(this.mempool.get(i), this.chainId, null, 0)); }
+    }
+    return Answer.ok(JsonValue.Null);
+  }
+
+  /**
+   * eth_getLogs over a range of canonical blocks or one block by hash, filtered by address (one or a list)
+   * and by topics position by position (null for any, one, or a list of alternatives).
+   */
+  Answer getLogs(this, JsonArray ps) {
+    JsonValue? f = arg(ps, 0);
+    if (f is null || f!.object() is null) { return Answer.error(-32602, "no filter"); }
+    Vec<U256> blocks = Vec.create();
+    if (f!.member("blockHash") is not null) {
+      U256 h = hexU256(f!.member("blockHash"));
+      if (!this.archive.has(h)) { return Answer.error(-32000, "unknown block"); }
+      blocks.push(h);
+    } else {
+      U256? from = this.blockFor(f!.member("fromBlock"));
+      U256? to = this.blockFor(f!.member("toBlock"));
+      if (from is null || to is null) { return Answer.ok(JsonValue.Array(JsonArray.create())); }
+      U256 lo = this.archive.get(from!)!.header.number;
+      U256 hi = this.archive.get(to!)!.header.number;
+      if (hi.sub(lo).gt(U256.ofU64(10000)) && !lo.gt(hi)) { return Answer.error(-32005, "query covers more than 10000 blocks"); }
+      for (U256 n = lo; !n.gt(hi); n = n.add(U256.one())) {
+        U256? h = this.canonical.get(n);
+        if (h is not null && this.archive.has(h!)) { blocks.push(h!); }
+      }
+    }
+    U256[] addresses = U256[].filled(0, U256.zero());
+    JsonValue? av = f!.member("address");
+    if (av is not null && !av!.isNull()) {
+      JsonArray? list = av!.array();
+      if (list is null) { addresses = [hexU256(av)]; }
+      else {
+        addresses = U256[].filled(list!.len(), U256.zero());
+        for (i32 i = 0; i < list!.len(); i++) { addresses[i] = hexU256(list!.get(i)); }
+      }
+    }
+    JsonArray topics = f!.member("topics")?.array() ?? JsonArray.create();
+    JsonArray out = JsonArray.create();
+    for (i32 b = 0; b < blocks.len(); b++) {
+      Archived a = this.archive.get(blocks.get(b))!;
+      i32 logIndex = 0;
+      for (i32 t = 0; t < a.receipts.len(); t++) {
+        Receipt r = a.receipts[t];
+        for (i32 l = 0; l < r.logs.len(); l++) {
+          if (logMatches(r.logs[l], addresses, topics)) { out.push(logJson(r.logs[l], a.header, r.txHash, t, logIndex)); }
+          logIndex++;
+        }
+      }
+    }
+    return Answer.ok(JsonValue.Array(out));
+  }
+
+  /**
+   * eth_estimateGas: the least gas limit with which the call succeeds, by bisection between the intrinsic
+   * cost and the block's gas limit, each try a transaction run on the head's state and undone. The run
+   * charges nothing for gas, as geth's does, so the sender needs only the value it sends.
+   */
+  Answer estimateGas(this, JsonArray ps) {
+    JsonValue? c = arg(ps, 0);
+    if (c is null || c!.object() is null) { return Answer.error(-32602, "no call object"); }
+    Header h = this.blocks.get(this.head)!.header;
+    U256 from = hexU256(c!.member("from"));
+    World w = this.headState();
+    JsonValue? toV = c!.member("to");
+    U256? to = toV is null || toV!.isNull() ? null : hexU256(toV);
+    u8[] input = c!.member("input") is not null ? hexBytes(c!.member("input")) : hexBytes(c!.member("data"));
+    Transaction tx = Transaction(2, U256.ofU64(w.nonce(from)), U256.zero(), U256.zero(), U256.zero(), h.gasLimit, to,
+                                 hexU256(c!.member("value")), input, Vec<AccessEntry>.create().toArray(), U256.zero(),
+                                 U256[].filled(0, U256.zero()), Vec<Authorization>.create().toArray(), from);
+    i64 lo = intrinsicGas(tx) - 1;
+    i64 hi = h.gasLimit.low() as@ i64;
+    Spec spec = this.config.specAt(h.timestamp.add(U256.ofU64(12)));
+    if (spec.isOsaka && hi > 16777216) { hi = 16777216; }
+    string why = this.tryGas(spec, h, tx, hi);
+    if (why != "") { return Answer.error(3, why); }
+    while (hi - lo > 1) {
+      i64 mid = lo + (hi - lo) / 2;
+      if (this.tryGas(spec, h, tx, mid) == "") { hi = mid; } else { lo = mid; }
+    }
+    return Answer.ok(str(U256.ofU64(hi as@ u64).toHex()));
+  }
+
+  /** "" when `tx` with gas limit `gas` succeeds as the next block's first transaction; otherwise why not. */
+  string tryGas(this, Spec spec, Header h, Transaction tx, i64 gas) {
+    tx.gasLimit = U256.ofU64(gas as@ u64);
+    BlockEnv env = BlockEnv(h.coinbase, h.number.add(U256.one()), h.timestamp.add(U256.ofU64(12)), h.gasLimit,
+                            h.prevRandao, U256.zero(), U256.zero(), this.chainId, this.ancestorHashes(h));
+    this.world.record();
+    Processed p = processTransaction(spec, this.world, env, tx, h.gasLimit.low() as@ i64, spec.maxBlobGasPerBlock, null);
+    this.world.undo(this.world.seal());
+    if (p.invalid != "") { return p.invalid; }
+    return p.success ? "" : "execution reverted";
+  }
+
+  /**
+   * eth_feeHistory: base fees and gas-used ratios for the last `count` canonical blocks, and the next base
+   * fee. Reward percentiles are each block's least effective tip, which is honest for the blocks a devnet
+   * makes and short of what a busy chain's distribution would say.
+   */
+  Answer feeHistory(this, JsonArray ps) {
+    U256 count = hexU256(arg(ps, 0));
+    if (count.isZero() || count.gt(U256.ofU64(1024))) { count = U256.ofU64(count.isZero() ? 1 : 1024); }
+    U256? newest = this.blockFor(arg(ps, 1));
+    if (newest is null) { return Answer.error(-32000, "unknown block"); }
+    JsonArray? percentiles = arg(ps, 2)?.array();
+    U256 top = this.archive.get(newest!)!.header.number;
+    U256 oldest = count.gt(top) ? U256.zero() : top.sub(count).add(U256.one());
+    JsonArray baseFees = JsonArray.create();
+    JsonArray ratios = JsonArray.create();
+    JsonArray rewards = JsonArray.create();
+    Header last = this.archive.get(newest!)!.header;
+    for (U256 n = oldest; !n.gt(top); n = n.add(U256.one())) {
+      Archived a = this.archive.get(this.canonical.get(n)!)!;
+      Header h = a.header;
+      baseFees.push(str(h.baseFee.toHex()));
+      f64 ratio = h.gasLimit.isZero() ? 0.0 : (h.gasUsed.low() as~ f64) / (h.gasLimit.low() as~ f64);
+      ratios.push(JsonValue.Number(ratio, "\{ratio}".toBytes()));
+      if (percentiles is not null) {
+        U256 tip = U256.zero();
+        for (i32 i = 0; i < a.receipts.len(); i++) {
+          U256 t = a.receipts[i].effectiveGasPrice.sub(h.baseFee);
+          if (i == 0 || t.lt(tip)) { tip = t; }
+        }
+        JsonArray r = JsonArray.create();
+        for (i32 i = 0; i < percentiles!.len(); i++) { r.push(str(tip.toHex())); }
+        rewards.push(JsonValue.Array(r));
+      }
+      last = h;
+    }
+    baseFees.push(str(nextBaseFee(last).toHex()));
+    JsonObject o = JsonObject.create();
+    o.push("oldestBlock".toBytes(), str(oldest.toHex()));
+    o.push("baseFeePerGas".toBytes(), JsonValue.Array(baseFees));
+    o.push("gasUsedRatio".toBytes(), JsonValue.Array(ratios));
+    if (percentiles is not null) { o.push("reward".toBytes(), JsonValue.Array(rewards)); }
+    return Answer.ok(JsonValue.Object(o));
+  }
+
   /** The state at the head of the chain. */
   World headState(this) {
     this.moveTo(this.head);
@@ -680,6 +952,34 @@ i32 rlpLength(u8[] b, i32 at) {
   } else { n = 1 + (p - 0xc0) as i64; }
   if ((at as i64) + n > (b.len() as i64)) { return -1; }
   return n as! i32;
+}
+
+/** The tip `eth_maxPriorityFeePerGas` suggests: 1 gwei, what a block with room to spare needs. */
+static u64 SUGGESTED_TIP = 1000000000;
+
+Answer unavailable() { return Answer.error(-32000, "the state of that block is not available"); }
+
+/** Whether a log passes an eth_getLogs filter's addresses and topics. */
+bool logMatches(Log l, U256[] addresses, JsonArray topics) {
+  if (addresses.len() > 0) {
+    bool any = false;
+    for (i32 i = 0; i < addresses.len(); i++) { any = any || addresses[i].eq(l.address); }
+    if (!any) { return false; }
+  }
+  for (i32 i = 0; i < topics.len(); i++) {
+    JsonValue want = topics.get(i);
+    if (want.isNull()) { continue; }
+    if (i >= l.topics.len()) { return false; }
+    JsonArray? alts = want.array();
+    if (alts is null) {
+      if (!hexU256(want).eq(l.topics[i])) { return false; }
+    } else {
+      bool any = alts!.len() == 0;
+      for (i32 k = 0; k < alts!.len(); k++) { any = any || alts!.get(k).isNull() || hexU256(alts!.get(k)).eq(l.topics[i]); }
+      if (!any) { return false; }
+    }
+  }
+  return true;
 }
 
 // ── JSON helpers ─────────────────────────────────────────────────────────────────
