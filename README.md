@@ -18,7 +18,7 @@ every fixture of every suite passes:
 | state tests | 16,847 | 18,869 | 19,517 |
 | blockchain tests, imported from block RLP | 17,685 | 20,859 | 21,558 |
 | engine tests, through `engine_newPayload` and `engine_forkchoiceUpdated` | 17,685 | 20,878 | 21,577 |
-| block building: each engine fixture's payloads rebuilt from the mempool, same roots | 17,685 | 20,878 | OSAKA_BUILD |
+| block building: each engine fixture's payloads rebuilt from the mempool, same roots | 17,685 | 20,878 | 21,577 |
 
 And so does every transition network the fixtures have — Cancun to Prague, Prague to Osaka, and Osaka
 through BPO1 to BPO4 — in block import and through the Engine API. `sh tools/all-fixtures.sh` runs it all
