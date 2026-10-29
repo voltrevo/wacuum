@@ -1,0 +1,26 @@
+// What changes from one fork to the next, as data: the interpreter and the transaction processor ask a
+// `Spec` rather than comparing fork names, so a fork is a constructor here and a handful of `if`s at the
+// places its EIPs touch.
+
+export struct Spec {
+  string name;
+  /** EIP-7702 delegation and EIP-7623's calldata floor, which arrive together. */
+  bool isPrague;
+  i64 maxBlobGasPerBlock;
+  u64 blobBaseFeeUpdateFraction;
+  /** The precompiles are 0x01 up to this address. */
+  u64 lastPrecompile;
+
+  /** Cancun: six blobs a block and ten precompiles. */
+  Spec cancun() { return Spec("Cancun", false, 786432, 3338477, 0x0a); }
+
+  /** Prague: EIP-7691's nine blobs and new fraction, and EIP-2537's seven BLS12-381 precompiles. */
+  Spec prague() { return Spec("Prague", true, 1179648, 5007716, 0x11); }
+
+  /** The spec a fixture names, or null for a fork this client does not run. */
+  Spec? byName(string name) {
+    if (name == "Cancun") { return Spec.cancun(); }
+    if (name == "Prague") { return Spec.prague(); }
+    return null;
+  }
+}

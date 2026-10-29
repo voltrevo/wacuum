@@ -19,7 +19,8 @@ import { hexToBytes, bytesToHex } from "../src/hex.wac";
 import { World, Account, Log, hashU256, eqU256 } from "../src/state/world.wac";
 import { stateRoot, logsHash } from "../src/state/root.wac";
 import { BlockEnv } from "../src/evm/evm.wac";
-import { Transaction, AccessEntry, Processed, processTransaction, blobGasPrice, MAX_BLOB_GAS_PER_BLOCK } from "../src/tx/process.wac";
+import { Spec } from "../src/evm/spec.wac";
+import { Transaction, AccessEntry, Authorization, Processed, processTransaction, blobGasPrice } from "../src/tx/process.wac";
 
 struct Tally {
   i32 passed;
@@ -74,11 +75,11 @@ World worldFrom(JsonValue pre) {
   return w;
 }
 
-BlockEnv blockFrom(JsonValue env, U256 chainId) {
+BlockEnv blockFrom(Spec spec, JsonValue env, U256 chainId) {
   JsonValue? excess = env.member("currentExcessBlobGas");
   return BlockEnv(num(env.member("currentCoinbase")), num(env.member("currentNumber")), num(env.member("currentTimestamp")),
                   num(env.member("currentGasLimit")), num(env.member("currentRandom")), num(env.member("currentBaseFee")),
-                  blobGasPrice(num(excess)), chainId, Map.create(hashU256, eqU256));
+                  blobGasPrice(spec, num(excess)), chainId, Map.create(hashU256, eqU256));
 }
 
 Transaction txFrom(JsonValue t, JsonValue indexes) {
@@ -109,11 +110,25 @@ Transaction txFrom(JsonValue t, JsonValue indexes) {
     blobs = U256[].filled(arr.len(), U256.zero());
     for (i32 i = 0; i < arr.len(); i++) { blobs[i] = num(arr.get(i)); }
   }
+  Authorization[] auths = Authorization[].filled(0, Authorization(U256.zero(), U256.zero(), U256.zero(), U256.zero(),
+                                                                  U256.zero(), U256.zero()));
+  JsonValue? authList = t.member("authorizationList");
+  if (authList is not null) {
+    JsonArray arr = authList!.array()!;
+    auths = Authorization[].filled(arr.len(), auths.len() == 0 ? Authorization(U256.zero(), U256.zero(), U256.zero(),
+                                                                               U256.zero(), U256.zero(), U256.zero()) : auths[0]);
+    for (i32 i = 0; i < arr.len(); i++) {
+      JsonValue e = arr.get(i);
+      // The fixture also names each `signer`; it is ignored, and the signer recovered, as a client must.
+      auths[i] = Authorization(num(e.member("chainId")), num(e.member("address")), num(e.member("nonce")),
+                               num(e.member("yParity")), num(e.member("r")), num(e.member("s")));
+    }
+  }
   string toText = t.member("to")!.text() ?? "";
   U256? to = toText == "" ? null : U256.fromHex(toText);
   return Transaction(txType, num(t.member("nonce")), num(t.member("gasPrice")), num(maxFee), num(t.member("maxPriorityFeePerGas")),
                      num(at(t.member("gasLimit"), g)), to, num(at(t.member("value"), v)), bytes(at(t.member("data"), d)),
-                     entries, num(t.member("maxFeePerBlobGas")), blobs, num(t.member("sender")));
+                     entries, num(t.member("maxFeePerBlobGas")), blobs, auths, num(t.member("sender")));
 }
 
 /** One case: true when it matches the fixture. */
@@ -122,19 +137,14 @@ bool runCase(Sys sys, Tally tally, string name, JsonValue test, JsonValue post, 
   JsonValue? config = test.member("config");
   U256 chainId = config is null ? U256.one() : num(config!.member("chainid"));
   if (chainId.isZero()) { chainId = U256.one(); }
-  BlockEnv block = blockFrom(test.member("env")!, chainId);
+  Spec spec = Spec.byName(tally.fork)!;
+  BlockEnv block = blockFrom(spec, test.member("env")!, chainId);
   Transaction tx = txFrom(test.member("transaction")!, post.member("indexes")!);
   bool expectInvalid = post.member("expectException") is not null;
-  Processed p;
-  if (tx.txType == 4) {
-    // EIP-7702 arrives with Prague; before it, the type does not exist.
-    p = Processed("type 4 before Prague", 0, false, noLogs());
-  } else {
-    i64 gl = block.gasLimit.fitsU64() ? block.gasLimit.low() as@ i64 : 0x7FFFFFFFFFFFFFFF;
-    fn<void(string)>? tracer = null;
-    if (tally.trace) { tracer = (string line) => { sys.log(line); }; }
-    p = processTransaction(w, block, tx, gl, MAX_BLOB_GAS_PER_BLOCK, tracer);
-  }
+  i64 gl = block.gasLimit.fitsU64() ? block.gasLimit.low() as@ i64 : 0x7FFFFFFFFFFFFFFF;
+  fn<void(string)>? tracer = null;
+  if (tally.trace) { tracer = (string line) => { sys.log(line); }; }
+  Processed p = processTransaction(spec, w, block, tx, gl, spec.maxBlobGasPerBlock, tracer);
   string why = "";
   if (expectInvalid && p.invalid == "") { why = "accepted a transaction the fixture expects to be refused"; }
   if (!expectInvalid && p.invalid != "") { why = "refused it: \{p.invalid}"; }
@@ -150,7 +160,6 @@ bool runCase(Sys sys, Tally tally, string name, JsonValue test, JsonValue post, 
   return false;
 }
 
-Log[] noLogs() { return Log[].filled(0, Log(U256.zero(), U256[].filled(0, U256.zero()), u8[].filled(0, 0))); }
 
 /** Which accounts differ from the fixture's post-state, and how. */
 void diffState(Sys sys, World w, JsonValue? want) {
@@ -197,7 +206,12 @@ export async i32 main(Sys sys) {
     string arg = args[a];
     if (arg == "--verbose") { tally.verbose = true; continue; }
     if (arg == "--trace") { tally.trace = true; continue; }
-    if (arg == "--fork") { a++; tally.fork = args[a]; continue; }
+    if (arg == "--fork") {
+      a++;
+      tally.fork = args[a];
+      if (Spec.byName(tally.fork) is null) { sys.log("unknown fork \{tally.fork}: Cancun and Prague are what this runs"); return 2; }
+      continue;
+    }
     if (arg == "--filter") { a++; tally.filter = args[a]; continue; }
     match (await sys.readFile(arg)) {
       Err(e): { sys.log("FAIL \{arg}: \{e}"); tally.failed++; }

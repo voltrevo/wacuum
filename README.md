@@ -10,8 +10,9 @@ imports a chain.
 
 ## Where it is
 
-**16,782 of execution-spec-tests' 16,847 Cancun state tests pass** (v5.4.0). The 65 that do not are all
-KZG point evaluation, the one precompile missing.
+Of execution-spec-tests' state tests (v5.4.0), **16,782 of 16,847 pass for Cancun and 18,218 of 18,869 for
+Prague**. Every one that fails needs BLS12-381: KZG point evaluation (0x0a) and EIP-2537's precompiles
+(0x0b to 0x11), which wait on wac's `bls` package; see `docs/wac-asks.md`.
 
 | | state |
 | --- | --- |
@@ -22,7 +23,7 @@ KZG point evaluation, the one precompile missing.
 | transactions | **done for types 0 to 3**. Validity, intrinsic gas, EIP-1559 fees, EIP-4844 blob fees, refunds, the coinbase's share |
 | state root, logs hash | **done**. A Merkle-Patricia trie built from scratch, checked against `trieanyorder.json` |
 | precompiles | **all but one**. ecrecover (secp256k1), SHA-256, RIPEMD-160, identity, MODEXP, bn254 add, mul and pairing, BLAKE2F. KZG point evaluation waits on BLS12-381; see `docs/wac-asks.md` |
-| Prague | not started. EIP-7702, the BLS12-381 precompiles, EIP-2935, EIP-7623 |
+| Prague | **done but for BLS12-381**. EIP-7702 delegation (authorities recovered, not taken from the fixture), EIP-7623's calldata floor, EIP-7691's blob schedule. EIP-2935 and the requests of EIP-7685 belong to blocks, below |
 | blocks, the Engine API, persistence, devp2p, sync | not started |
 
 ## Running it
@@ -52,7 +53,7 @@ wac task fixtures     # execution-spec-tests v5.4.0 into fixtures/, once: 250 MB
 ```
 
 ```bash
-wac task statetests   # every Cancun state test, in about a minute
+wac task statetests   # every Cancun state test, in about a minute; `sh tools/statetests.sh Prague` for Prague
 ```
 
 `dist/statetest.wasm` also runs one file at a time: `wac dist/statetest.wasm --verbose --filter <name> <file>`
@@ -68,6 +69,7 @@ prints which accounts differ from the fixture's post-state, and `--trace` prints
     src/evm/interp.wac       the interpreter loop and the opcodes
     src/evm/evm.wac          messages: calls, creation, addresses
     src/evm/precompiles.wac  the precompile dispatcher and its prices
+    src/evm/spec.wac         what differs between forks, as data
     src/state/world.wac      accounts, storage and the journal that undoes them
     src/state/root.wac       the state root and the logs hash
     src/trie/trie.wac        a Merkle-Patricia root from a set of pairs

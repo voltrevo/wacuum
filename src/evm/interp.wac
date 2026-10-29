@@ -17,7 +17,7 @@ import { World, Log, Account } from "../state/world.wac";
 import { Memory } from "./memory.wac";
 import { OpTable } from "./table.wac";
 import { Evm, Message, processMessage, processCreate, createAddress, create2Address, allButOne64th,
-         MAX_DEPTH, MAX_INITCODE_SIZE } from "./evm.wac";
+         delegationOf, MAX_DEPTH, MAX_INITCODE_SIZE } from "./evm.wac";
 
 export enum Halt {
   Stop,
@@ -504,6 +504,17 @@ Halt? callOp(Frame f, i32 op) {
   i64 mem = f.costOfTwo(inOff, inLen, outOff, outLen);
   if (mem < 0) { return oog(f, op); }
   i64 extra = accessCost(f, to);
+  // EIP-7702: a call into a delegating account runs the delegate's code, and pays to reach it too.
+  U256 codeAddr = to;
+  bool delegated = false;
+  if (f.evm.spec.isPrague) {
+    U256? d = delegationOf(w.code(to));
+    if (d is not null) {
+      codeAddr = d!;
+      delegated = true;
+      extra += accessCost(f, codeAddr);
+    }
+  }
   if (op == 0xf1 && !value.isZero() && w.isDead(to)) { extra += 25000; }
   if (hasValue && !value.isZero()) { extra += 9000; }
   if (f.gas < extra + mem) { return oog(f, op); }
@@ -522,7 +533,7 @@ Halt? callOp(Frame f, i32 op) {
     return null;
   }
   u8[] data = inLen.isZero() ? u8[].filled(0, 0) : f.memory.read(clampI64(inOff), clampI64(inLen));
-  Message m = Message(me, to, to, value, data, sub, f.msg.isStatic, f.msg.depth + 1, true);
+  Message m = Message(me, to, codeAddr, value, data, sub, f.msg.isStatic, f.msg.depth + 1, true, delegated);
   if (op == 0xf2) { m.target = me; }
   if (op == 0xf4) {
     m.caller = f.msg.caller;
@@ -574,7 +585,7 @@ Halt? createOp(Frame f, i32 op) {
     return null;
   }
   w.setNonce(me, w.nonce(me) + 1);
-  Message m = Message(me, addr, addr, value, initcode, g, false, f.msg.depth + 1, true);
+  Message m = Message(me, addr, addr, value, initcode, g, false, f.msg.depth + 1, true, false);
   Outcome o = processCreate(f.evm, m);
   f.gas += o.gasLeft;
   if (o.succeeded()) {

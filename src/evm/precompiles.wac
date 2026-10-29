@@ -14,15 +14,17 @@ import { blake2f, blake2fRounds } from "../precompiles/blake2f.wac";
 import { ecAdd, ecMul, ecPairing } from "../crypto/bn254.wac";
 import { U256 } from "../u256.wac";
 import { Outcome, Halt } from "./interp.wac";
+import { Spec } from "./spec.wac";
 
-export bool isPrecompile(U256 a) {
-  return a.fitsU64() && a.low() >= 1 && a.low() <= 0x0a;
+export bool isPrecompile(Spec spec, U256 a) {
+  return a.fitsU64() && a.low() >= 1 && a.low() <= spec.lastPrecompile;
 }
 
 /** The precompile addresses, which every transaction starts with warm (EIP-2929). */
-export U256[] precompileAddresses() {
-  U256[] out = [U256.ofU64(1), U256.ofU64(2), U256.ofU64(3), U256.ofU64(4), U256.ofU64(5), U256.ofU64(6),
-                U256.ofU64(7), U256.ofU64(8), U256.ofU64(9), U256.ofU64(10)];
+export U256[] precompileAddresses(Spec spec) {
+  i32 n = spec.lastPrecompile as! i32;
+  U256[] out = U256[].filled(n, U256.zero());
+  for (i32 i = 0; i < n; i++) { out[i] = U256.ofI32(i + 1); }
   return out;
 }
 

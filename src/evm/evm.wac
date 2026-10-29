@@ -13,6 +13,7 @@ import { World, Snapshot } from "../state/world.wac";
 import { Frame, Outcome, Halt, run } from "./interp.wac";
 import { OpTable } from "./table.wac";
 import { isPrecompile, runPrecompile } from "./precompiles.wac";
+import { Spec } from "./spec.wac";
 
 export static i32 MAX_DEPTH = 1024;
 /** EIP-170. */
@@ -44,6 +45,7 @@ export struct Evm {
   BlockEnv block;
   TxEnv tx;
   OpTable table;
+  Spec spec;
   /** Handed one line per step when set: depth, pc, opcode, gas and the top of the stack. For debugging. */
   fn<void(string)>? tracer;
 }
@@ -61,6 +63,11 @@ export struct Message {
   i32 depth;
   /** False for DELEGATECALL, whose value is only what CALLVALUE reports. */
   bool transfersValue;
+  /**
+   * EIP-7702: the code came through a delegation, which runs the delegate's code even when the delegate
+   * is a precompile's address — precompiles are not code, so delegating to one runs nothing.
+   */
+  bool noPrecompile;
 }
 
 /** Run a message call: the value moves, then the code (or the precompile) runs, and a failure undoes both. */
@@ -75,7 +82,7 @@ export Outcome processMessage(Evm evm, Message m) {
 }
 
 Outcome execute(Evm evm, Message m, u8[] code) {
-  if (isPrecompile(m.codeAddress)) { return runPrecompile(m.codeAddress, m.data, m.gas); }
+  if (!m.noPrecompile && isPrecompile(evm.spec, m.codeAddress)) { return runPrecompile(m.codeAddress, m.data, m.gas); }
   if (code.len() == 0) { return Outcome(Halt.Stop, m.gas); }
   return run(Frame.create(evm, m, code));
 }
@@ -149,3 +156,19 @@ export u8[] minimalBytes(u64 v) {
 
 /** All but one 64th — EIP-150's cap on the gas a call or creation may pass on. */
 export i64 allButOne64th(i64 g) { return g - g / 64; }
+
+/** EIP-7702's delegation designator: 0xef0100 and an address, exactly 23 bytes. */
+export U256? delegationOf(u8[] code) {
+  if (code.len() != 23 || code[0] != 0xEF || code[1] != 0x01 || code[2] != 0x00) { return null; }
+  return U256.fromBytes(code, 3, 20);
+}
+
+/** The designator that delegates to `addr`. */
+export u8[] delegationTo(U256 addr) {
+  u8[] out = u8[].filled(23, 0);
+  out[0] = 0xEF;
+  out[1] = 0x01;
+  u8[] a = addressBytes(addr);
+  for (i32 i = 0; i < 20; i++) { out[3 + i] = a[i]; }
+  return out;
+}
