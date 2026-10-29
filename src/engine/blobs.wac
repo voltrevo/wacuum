@@ -8,16 +8,16 @@
 // (EIP-7594), with 128 cell proofs per blob. The body is the transaction as a block holds it.
 //
 // What is checked: the shapes; that each commitment hashes to the versioned hash the transaction names, so
-// a sidecar can never be filed under a blob it is not; and, before Osaka, that each blob proof proves its
-// blob. Osaka's cell proofs are not checked yet — that needs the ceremony's G1 points, which this client
-// does not carry — so until then it trusts whoever submits an Osaka blob transaction to have sent cell
-// proofs that verify. A bad one makes the built block's blobs unavailable to the consensus layer.
+// a sidecar can never be filed under a blob it is not; and that the proofs prove the blobs — before Osaka
+// each blob's proof, from Osaka every cell's, the blob extended to its 128 cells and all of a transaction's
+// checked as one batch.
 
 import { crypto.sha256 } from "wac";
 import { Vec } from "core";
 import { rlp.Item, rlp.encode, rlp.decode, rlp.Decoded, rlp.bytesOf, rlp.itemsOf, rlp.isList } from "wac";
 import { U256 } from "../u256.wac";
 import { verifyBlobProof } from "../crypto/kzg.wac";
+import { verifyCellProofs, computeCells } from "../crypto/cells.wac";
 
 export static i32 BLOB_BYTES = 131072;
 export static i32 CELLS_PER_BLOB = 128;
@@ -89,11 +89,33 @@ export Unwrapped unwrap(u8[] raw, bool cellProofs) {
     if (!cellProofs && !verifyBlobProof(blob, c, ps[0])) { return refused("blob \{i}'s proof does not verify"); }
     out[i] = Sidecar(blob, c, ps);
   }
+  if (cellProofs && !cellsProve(out)) { return refused("the cell proofs do not verify"); }
   u8[] body = encode(parts[0]);
   u8[] canonical = u8[].filled(body.len() + 1, 0);
   canonical[0] = 0x03;
   for (i32 i = 0; i < body.len(); i++) { canonical[i + 1] = body[i]; }
   return Unwrapped(canonical, out, true, "");
+}
+
+/** Whether every blob's cell proofs prove the cells it extends to, checked as one batch. */
+export bool cellsProve(Sidecar[] scs) {
+  i32 n = scs.len() * CELLS_PER_BLOB;
+  u8[][] commitments = u8[][].defaulted(n);
+  i32[] indices = i32[].filled(n, 0);
+  u8[][] cells = u8[][].defaulted(n);
+  u8[][] proofs = u8[][].defaulted(n);
+  for (i32 b = 0; b < scs.len(); b++) {
+    u8[][]? cs = computeCells(scs[b].blob);
+    if (cs is null) { return false; }
+    for (i32 c = 0; c < CELLS_PER_BLOB; c++) {
+      i32 k = b * CELLS_PER_BLOB + c;
+      commitments[k] = scs[b].commitment;
+      indices[k] = c;
+      cells[k] = cs![c];
+      proofs[k] = scs[b].proofs[c];
+    }
+  }
+  return verifyCellProofs(commitments, indices, cells, proofs);
 }
 
 /** Whether `sidecars` are exactly the blobs `hashes` name, in order. */

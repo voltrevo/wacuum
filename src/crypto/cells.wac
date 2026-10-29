@@ -1,0 +1,356 @@
+// EIP-7594's cell proofs: `verify_cell_kzg_proof_batch` from the consensus specs' PeerDAS polynomial
+// commitments, for the sidecars Osaka's blob transactions carry.
+//
+// A blob's polynomial is extended to 8192 evaluations and cut into 128 cells of 64, each the evaluations on
+// one coset h·⟨ω₆₄⟩ of the 64th roots of unity, in bit-reversed order. A cell proof is a KZG proof that the
+// committed polynomial agrees there with the cell's interpolation polynomial I, of degree below 64:
+//
+//     e(C − [I(τ)]G1 + h⁶⁴·π, G2) = e(π, [τ⁶⁴]G2)
+//
+// Many are checked at once by a random linear combination with powers of a Fiat–Shamir challenge r, so a
+// whole transaction's cells cost two pairings. Committing to I needs the ceremony's first 64 monomial G1
+// points and [τ⁶⁴]G2, which are below; nothing else of the setup is.
+//
+// The scalar arithmetic is in a Montgomery field mod r; the G1 sums are a multiplication each, which is
+// the slow part, and a multi-scalar multiplication would be the thing to change if it matters.
+
+import { crypto.sha256 } from "wac";
+import { bls.G1, bls.G2, bls.Pair, bls.Fp12, bls.g1Infinity, bls.g1IsInfinity, bls.g1Add, bls.g1Mul, bls.g1Negate,
+         bls.g1FromBytes, bls.g1AffineX, bls.g1AffineY, bls.g2FromBytes, bls.g2Generator, bls.g2Negate, bls.g2AffineX,
+         bls.g2AffineY, bls.millerLoopMulti, bls.finalExponentiate, bls.fp12IsOne } from "wac";
+import { U256 } from "../u256.wac";
+import { hexToBytes } from "../hex.wac";
+import { Field } from "./field.wac";
+
+export static i32 CELL_ELEMENTS = 64;
+export static i32 CELLS = 128;
+
+/** [τ⁰]G1 … [τ⁶³]G1 from the KZG ceremony, compressed. */
+static string[] G1_MONOMIAL = [
+  "97f1d3a73197d7942695638c4fa9ac0fc3688c4f9774b905a14e3a3f171bac586c55e83ff97a1aeffb3af00adb22c6bb",
+  "ad3eb50121139aa34db1d545093ac9374ab7bca2c0f3bf28e27c8dcd8fc7cb42d25926fc0c97b336e9f0fb35e5a04c81",
+  "8029c8ce0d2dce761a7f29c2df2290850c85bdfaec2955626d7acc8864aeb01fe16c9e156863dc63b6c22553910e27c1",
+  "b1386c995d3101d10639e49b9e5d39b9a280dcf0f135c2e6c6928bb3ab8309a9da7178f33925768c324f11c3762cfdd5",
+  "9596d929610e6d2ed3502b1bb0f1ea010f6b6605c95d4859f5e53e09fa68dc71dfd5874905447b5ec6cd156a76d6b6e8",
+  "851e3c3d4b5b7cdbba25d72abf9812cf3d7c5a9dbdec42b6635e2add706cbeea18f985afe5247459f6c908620322f434",
+  "b10f4cf8ec6e02491bbe6d9084d88c16306fdaf399fef3cd1453f58a4f7633f80dc60b100f9236c3103eaf727468374f",
+  "ade11ec630127e04d17e70db0237d55f2ff2a2094881a483797e8cddb98b622245e1f608e5dcd1172b9870e733b4a32f",
+  "af58c8a2f58f904ce20db81005331bf2d251e227e7d1bef575d691bdca842e6233eb2e26c2e116a61a78594772b38d25",
+  "b3c1313c31ec82da5a7a09e9cf6656ca598c243345fe8d4828e520ade91787ffb8b9867db789b34ad67cef47b26ff86d",
+  "a8ed8a235355948e0b04be080b7b3e145293accefb4704d1da9050796b2f6870516c1ebf77ae6a65359edcfd016c0f36",
+  "80e792d5ba24b8058f6d7291a2ec5cb68aab1e16e96d793128e86815631baf42c56b6205c19e25ce9727bd1fd6f9defb",
+  "816288c5d726b094e3fdf95cb8882f442c4d9d1101b92c7938a7dfd49bc50636d73ea1b05f75eb731c908c8fd8dee717",
+  "ae009128d128ba2e1519bfa7a0c01ed494a7d461c3aba60f8a301701fed61fe4e31d6c79ce189542ae51df91e73ce1b3",
+  "96a866d60a9007d05825c332476a83e869e15b11d7257172a67690ea9bd3efea44bf9c8d42191454eb04fcf110b16396",
+  "8b250a2a06419adb9b611e89f7f8f2990aa301949b533ad3bf17c4a61ab5f5be0b1d5e2b571864d13f1bb75805c7795d",
+  "8450f49facf2e620fa45ee90e1801178842d927a2a25fc6ed7ba99a4eec7ae40eebfee41028eaa84f107f4a777694976",
+  "91049080cf659c0985a22d1366e59191bb89663f922e8168b9b7d85c8a73d74a6d9dceefd855d3d858b493670c750581",
+  "a1e167aeb2008087f3195926f1985c0a459d6ec57237255b1473a96de4e2c1cf766127c862c7dc853a6909e67cb06cf7",
+  "b667c0d4e26e20698b07567358625d5f003839c92de8088e12dbd74a6f6a3156b4ea8d252c9ad62af5f6c4fec1cf6cc7",
+  "8e4b5e304c0b1b161ae3e4b68b5e3ac66c42acd7c1ee2458044f6527c508a93995e50894d72d57c1350f91afe72775ff",
+  "8c642640aa7915421cdc21fd639f88a42052b1cfa358ff7702e60793a92b7b5926dae15a0c8f8f59cd3013f01c159ba3",
+  "a356f35e713cfc283056bf539de54a21731e61efb4c47319f20de4a4b723d76a33b65f4a67d298b9ec5c2a1579418657",
+  "93ce204146ce95f484dc79c27919a16c9e3fc14a9111c6c63d44491158d5838117d20851cc3227a5e8ba6ccf79e77f39",
+  "b585664cbb9a84b52f89114e1cf0cf1171bea78a136dc1404ac88a11210b2debc3b7a55e702da93ff629095c134a295e",
+  "b6dfd444ec7fdceb14c6328f26ca12c3f9fc4327d8d8c68948e92e7e61262b82d833a65a9e3af6353ffa832b6da25705",
+  "b4d4b8eb9ecfffe3f0d48fb4149c7b31aec1da7041ec03bd0750c52a2a7cbc3a7cfbf09d5bfdc56e3860826a62d0bb91",
+  "a4e248e3d61db52da9683fef188579c470d65e2df9064726847b1599fc774049ffdc6ef2ae578d5ed7874f1298ecdf69",
+  "a68a0fffc2e37d3183feb01b42234c0f4e510f9dc29d09c571e6da00fecad9da224cd0f31550070148667e226c4ca413",
+  "86adda2ffecb77236c18005051f31f9657a0d50fef2a1175dfda32e74d5d53df825c10f289eb0ad39df0c64fc9bc7729",
+  "998266d5c9c3764ed97d66fa9ed176af043999652bae19f0657c8328629d30af453230e3681c5a38e2f01e389ed8d825",
+  "a05261554d3c620af0c914cf27ab98f5d3593c33ab313c198e0c40d6c72022eb5943778cd4f73e9fe8383392a7004976",
+  "ad243fb3631bf90fedb9d679fd71fc0cf06bda028591ded2bd4c634ea7b3c2bd22eca2ab318fcdaa6c2cda1e63e1c57b",
+  "89b9859a04f903c95e97fb2951f01cc6418a2505eee0b5bc7266b4d33e01b69b9fe7dc56fa9ebb5856095be0925a422d",
+  "a68d118343a5bbfbbab95ff9bfe53aeb7fdbaf16db983e6f4456366df2aa01fbdb6ee9901cb102fc7d2bd099be2f1f3e",
+  "b49301f25d5a9dd2ec60ddb0b4b477291958487efea9e54dc0e4ef388f03b8bbadd13259d191f7a0b7513876767d8282",
+  "8b93df7fb4513f67749905fd43db78f7026589b704ebb9ea3255d0ad6415437799f40f02e07efccda1e6fd5e8cd0a721",
+  "ad88769ace96455da37c3c9019a9f523c694643be3f6b37b1e9dcc5053d1fe8e463abebdb1b3ef2f2fb801528a01c47c",
+  "80f0eb5dcbfaaf421bf59a8b9bd5245c4823c94510093e23e0b0534647fb5525a25ea3aeea0a927a1ee20c057f2c9234",
+  "b10ad82ea6a5aeabe345d00eb17910d6942b6862f7f3773c7d321194e67c9cced0b3310425662606634dcd7f8b976c04",
+  "82f6fd91f87822f6cc977808eeac77889f4a32fb0d618e784b2331263d0ffa820b3f70b069d32e0319c9e033ab75d3b4",
+  "9436d3dc6b5e25b1f695f8c6c1c553dab312ccace4dac3afddc141d3506467cd50cb04a49ea96ea7f5a8a7b0fc65ef37",
+  "8e0a9491651d52be8ebf4315fbbb410272f9a74b965d33b79ff1b9e1be3be59e43d9566773560e43280549c348e48f01",
+  "8809137e5d3a22400d6e645a9bd84e21c492371736c7e62c51cef50fee3aa7f2405724367a83fd051ff702d971167f67",
+  "b536a24f31a346de7f9863fc351fa602158404d2f94747eebe43abf1f21bf8f95a64146c02a4bec27b503f546789a388",
+  "b5cdf5a04fc12a0e0ef7545830061dff7fd8abea46e48fbe6235109e6c36ee6bffcb9529e2f3d0d701cf58bbfb6a4197",
+  "ab15377525753467d042b7931f66f862cbbb77464212c9aa72d4e5c04375ef55f619b3a446091c1ba1a3b5d9f05e538f",
+  "905a75b943ad017ff78ea6ddd1d28a45c7273ee1c2e5e3353685813793ead3370c09cabd903fcab9d8b1c6961372d486",
+  "8147df4324faddc02fb0896367a7647b719b6499a361aecfdd3a34296fa6768ad31c34f9e873fd1e683386c44651883e",
+  "ac91d08570dd91f89d2e01dca67cdc83b640e20f073ea9f0734759c92182bb66c5d645f15ebd91ed705b66486ed2088d",
+  "ac6295ef2513bbea7ef4cdcf37d280300c34e63c4b9704663d55891a61bf5c91b04cc1d202a3a0a7c4520c30edc277c7",
+  "b604be776a012095c0d4ebc77797dd8dec62a54c0559fb2185d7bac6b50d4e5fd471ac2d7f4523206d5d8178eabd9a87",
+  "80ead68def272ce3f57951145e71ed6dc26da98e5825ef439af577c0c5de766d4e39207f205d5d21db903d89f37bbb02",
+  "9950b4a830388c897158c7fe3921e2fe24beedc7c84e2024e8b92b9775f8f99593b54a86b8870ec5087734295ba06032",
+  "b89ba714adabf94e658a7d14ac8fc197376a416841c2a80e1a6dde4f438d5f747d1fb90b39e8ea435c59d6ecda13dea1",
+  "b0c78e7cc60bd05be46d48fbb0421a678c7f14b8d93730deb66fbe1647613b2c62b5075126d917047820c57fc3509cb9",
+  "a860c4acc5444e9ae987e8c93cb9a5f17d954d63c060cc616f724e26bc73d2c54cd36e0492d1fde173847278e55942ba",
+  "8fb8269c9d5c15428e8d45da1251e4c4a4b600d47da0caea29fef246854d8fb6acae86a8e6440d0c429d8dd9c2dfee0c",
+  "96c5d8eb6fd5c525b348ee4335d200139e437e4be83690af0f35b7f336a7cda8c6d2958647988b84da9f2dd7bbb7710b",
+  "a7f62141c4346cc14e9823dc38ac7d587b0427022afc1498d12ee2c43f6ac3a82167057e670dd524b74137f8c3ceb56d",
+  "956aac50d06b46a3e94397f163f593f5010d366aa2d816c2205c7d0f47f90cf0f36c169e964f9bcf698d49182d47d91f",
+  "b812899bcdc0e70d79ca729cb01104bf60e1357b9085a10f64f3ba9865d57e9abd0a505a502d4de07afb46f4d266be2f",
+  "abce02c7e1372e25d40944dc9ece2904a8f59c8854c5f2875fe63ace8ce37d97881f4f9ab4f7bad070ec8e0daee58d3f",
+  "8fb13c515b2d6abb4e14ed753fad5cc36c3631dfe21a23d0f603aad719423dd5423157eefcbd9a9c6074e155b79eb38d",
+];
+/** [τ⁶⁴]G2. */
+static string TAU64_G2 = "92dcc5a1c8c3e1b28b1524e3dd6dbecd63017c9201da9dbe077f1b82adc08c50169f56fc7b5a3b28ec6b89254de3e2fd12838a761053437883c3e01ba616670cea843754548ef84bcc397de2369adcca2ab54cd73c55dc68d87aec3fc2fe4f10";
+
+U256 modulus() { return U256.fromHex("73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001")!; }
+
+i32 reverseBits(i32 v, i32 bits) {
+  i32 out = 0;
+  for (i32 b = 0; b < bits; b++) { out = out | (((v >> b) & 1) << (bits - 1 - b)); }
+  return out;
+}
+
+u8[] be64(i32 v) {
+  u8[] out = u8[].filled(8, 0);
+  for (i32 i = 0; i < 4; i++) { out[7 - i] = ((v >> (8 * i)) & 0xff) as! u8; }
+  return out;
+}
+
+/** A scalar as `bls` takes one: eight 32-bit limbs, least significant first. */
+u32[] limbs(U256 v) {
+  u8[] b = v.toBytes();
+  u32[] k = u32[].filled(8, 0);
+  for (i32 i = 0; i < 8; i++) {
+    i32 o = 28 - 4 * i;
+    k[i] = ((b[o] as u32) << 24) | ((b[o + 1] as u32) << 16) | ((b[o + 2] as u32) << 8) | (b[o + 3] as u32);
+  }
+  return k;
+}
+
+/**
+ * Whether every `proofs[k]` proves `cells[k]` to be cell `indices[k]` of the blob `commitments[k]` commits to.
+ * False too for a malformed commitment, proof or cell, or a cell index past 127.
+ */
+export bool verifyCellProofs(u8[][] commitments, i32[] indices, u8[][] cells, u8[][] proofs) {
+  i32 n = cells.len();
+  if (commitments.len() != n || indices.len() != n || proofs.len() != n) { return false; }
+  if (n == 0) { return true; }
+  U256 r = modulus();
+  Field f = Field.create(r);
+
+  // The commitments, each once, and which one each cell is of.
+  u8[][] unique = u8[][].defaulted(0);
+  i32[] which = i32[].filled(n, 0);
+  for (i32 k = 0; k < n; k++) {
+    if (commitments[k].len() != 48 || cells[k].len() != 32 * CELL_ELEMENTS || proofs[k].len() != 48) { return false; }
+    if (indices[k] < 0 || indices[k] >= CELLS) { return false; }
+    i32 found = -1;
+    for (i32 u = 0; u < unique.len() && found < 0; u++) {
+      bool same = true;
+      for (i32 b = 0; b < 48 && same; b++) { same = unique[u][b] == commitments[k][b]; }
+      if (same) { found = u; }
+    }
+    if (found < 0) {
+      u8[][] grown = u8[][].defaulted(unique.len() + 1);
+      for (i32 u = 0; u < unique.len(); u++) { grown[u] = unique[u]; }
+      grown[unique.len()] = commitments[k];
+      found = unique.len();
+      unique = grown;
+    }
+    which[k] = found;
+  }
+
+  // The challenge: everything above, hashed.
+  i32 size = 16 + 24 + 48 * unique.len() + 16 * n + (32 * CELL_ELEMENTS + 48) * n;
+  u8[] t = u8[].filled(size, 0);
+  i32 at = 0;
+  u8[] domain = "RCKZGCBATCH__V1_".toBytes();
+  for (i32 i = 0; i < 16; i++) { t[at + i] = domain[i]; }
+  at += 16;
+  u8[][] counts = [be64(CELL_ELEMENTS), be64(unique.len()), be64(n)];
+  for (i32 c = 0; c < 3; c++) {
+    for (i32 i = 0; i < 8; i++) { t[at + i] = counts[c][i]; }
+    at += 8;
+  }
+  for (i32 u = 0; u < unique.len(); u++) {
+    for (i32 i = 0; i < 48; i++) { t[at + i] = unique[u][i]; }
+    at += 48;
+  }
+  for (i32 k = 0; k < n; k++) {
+    u8[] w = be64(which[k]);
+    for (i32 i = 0; i < 8; i++) { t[at + i] = w[i]; }
+    at += 8;
+  }
+  for (i32 k = 0; k < n; k++) {
+    u8[] w = be64(indices[k]);
+    for (i32 i = 0; i < 8; i++) { t[at + i] = w[i]; }
+    at += 8;
+  }
+  for (i32 k = 0; k < n; k++) {
+    for (i32 i = 0; i < cells[k].len(); i++) { t[at + i] = cells[k][i]; }
+    at += cells[k].len();
+  }
+  for (i32 k = 0; k < n; k++) {
+    for (i32 i = 0; i < 48; i++) { t[at + i] = proofs[k][i]; }
+    at += 48;
+  }
+  u64[] chal = f.fromU256(U256.fromBytes(sha256(t), 0, 32).mod(r));
+
+  // The 8192nd roots of unity, ω⁰…: each cell's coset shift is a power of ω, and ω¹²⁸ generates the 64th.
+  u64[] w8192 = f.pow(f.fromU256(U256.ofU64(7)), r.sub(U256.one()).div(U256.ofU64(8192)));
+  u64[] w64 = f.pow(w8192, U256.ofU64(128));
+  u64[] w64inv = f.inv(w64);
+
+  // Powers of r, and each cell's evaluations folded into its row, weighted by its power.
+  u64[][] rp = u64[][].defaulted(n);
+  rp[0] = f.one();
+  for (i32 k = 1; k < n; k++) { rp[k] = f.mul(rp[k - 1], chal); }
+  // Each row (cell index) used, and its folded evaluations; a row nobody sent is skipped.
+  bool[] used = bool[].filled(CELLS, false);
+  u64[][][] rows = u64[][][].filled(CELLS, u64[][].defaulted(0));
+  for (i32 k = 0; k < n; k++) {
+    i32 row = indices[k];
+    if (!used[row]) {
+      used[row] = true;
+      u64[][] zeros = u64[][].defaulted(CELL_ELEMENTS);
+      for (i32 j = 0; j < CELL_ELEMENTS; j++) { zeros[j] = f.zero(); }
+      rows[row] = zeros;
+    }
+    for (i32 j = 0; j < CELL_ELEMENTS; j++) {
+      U256 v = U256.fromBytes(cells[k], 32 * j, 32);
+      if (!v.lt(r)) { return false; }
+      u64[][] cur = rows[row];
+      cur[j] = f.add(cur[j], f.mul(f.fromU256(v), rp[k]));
+    }
+  }
+
+  // The aggregate interpolation polynomial: for each row used, the inverse DFT of its evaluations (which
+  // are in bit-reversed order) gives I(h·x), and dividing coefficient i by hⁱ gives I(x).
+  u64[] inv64 = f.inv(f.fromU256(U256.ofU64(64)));
+  u64[][] agg = u64[][].defaulted(CELL_ELEMENTS);
+  for (i32 i = 0; i < CELL_ELEMENTS; i++) { agg[i] = f.zero(); }
+  for (i32 row = 0; row < CELLS; row++) {
+    if (!used[row]) { continue; }
+    u64[][] natural = u64[][].defaulted(CELL_ELEMENTS);
+    u64[][] evals = rows[row];
+    for (i32 j = 0; j < CELL_ELEMENTS; j++) { natural[j] = evals[reverseBits(j, 6)]; }
+    u64[] hInv = f.inv(f.pow(w8192, U256.ofI32(reverseBits(row, 7))));
+    u64[] shift = f.one();
+    u64[] wk = f.one();
+    for (i32 i = 0; i < CELL_ELEMENTS; i++) {
+      // c_i = (1/64)·Σ_j v_j·ω₆₄^(−ij)
+      u64[] c = f.zero();
+      u64[] wij = f.one();
+      for (i32 j = 0; j < CELL_ELEMENTS; j++) {
+        c = f.add(c, f.mul(natural[j], wij));
+        wij = f.mul(wij, wk);
+      }
+      agg[i] = f.add(agg[i], f.mul(f.mul(c, inv64), shift));
+      shift = f.mul(shift, hInv);
+      wk = f.mul(wk, w64inv);
+    }
+  }
+
+  // The three G1 sums: commitments by their summed weights, minus the interpolation's commitment, plus
+  // each proof by its weight times its coset shift to the 64th; and the proofs by their weights alone.
+  G1 lhs = g1Infinity();
+  for (i32 u = 0; u < unique.len(); u++) {
+    u64[] weight = f.zero();
+    for (i32 k = 0; k < n; k++) {
+      if (which[k] == u) { weight = f.add(weight, rp[k]); }
+    }
+    G1? c = g1FromBytes(unique[u]);
+    if (c is null) { return false; }
+    lhs = g1Add(lhs, g1Mul(c!, limbs(f.toU256(weight))));
+  }
+  G1 interp = g1Infinity();
+  for (i32 i = 0; i < CELL_ELEMENTS; i++) {
+    G1 p = g1FromBytes(hexToBytes(G1_MONOMIAL[i])!)!;
+    interp = g1Add(interp, g1Mul(p, limbs(f.toU256(agg[i]))));
+  }
+  lhs = g1Add(lhs, g1Negate(interp));
+  G1 proofSum = g1Infinity();
+  for (i32 k = 0; k < n; k++) {
+    G1? p = g1FromBytes(proofs[k]);
+    if (p is null) { return false; }
+    u64[] hk64 = f.pow(w8192, U256.ofI32((reverseBits(indices[k], 7) * CELL_ELEMENTS) % 8192));
+    lhs = g1Add(lhs, g1Mul(p!, limbs(f.toU256(f.mul(rp[k], hk64)))));
+    proofSum = g1Add(proofSum, g1Mul(p!, limbs(f.toU256(rp[k]))));
+  }
+
+  // e(lhs, G2) · e(proofSum, −[τ⁶⁴]G2) = 1
+  G2 tau64 = g2FromBytes(hexToBytes(TAU64_G2)!)!;
+  G1[] g1s = [lhs, proofSum];
+  G2[] g2s = [g2Generator(), g2Negate(tau64)];
+  i32 m = 0;
+  for (i32 i = 0; i < 2; i++) {
+    if (!g1IsInfinity(g1s[i])) { m++; }
+  }
+  if (m == 0) { return true; }
+  Pair[] pairs = Pair[].defaulted(m);
+  i32 j = 0;
+  for (i32 i = 0; i < 2; i++) {
+    if (g1IsInfinity(g1s[i])) { continue; }
+    pairs[j] = Pair(g1AffineX(g1s[i])!, g1AffineY(g1s[i])!, g2AffineX(g2s[i])!, g2AffineY(g2s[i])!);
+    j++;
+  }
+  Fp12? e = finalExponentiate(millerLoopMulti(pairs));
+  return e is not null && fp12IsOne(e!);
+}
+
+/** An in-place radix-2 NTT of `a` (length a power of two) with `w` a primitive root of that order. */
+void ntt(Field f, u64[][] a, u64[] w) {
+  i32 n = a.len();
+  i32 bits = 0;
+  while ((1 << bits) < n) { bits++; }
+  for (i32 i = 0; i < n; i++) {
+    i32 j = reverseBits(i, bits);
+    if (j > i) {
+      u64[] tmp = a[i];
+      a[i] = a[j];
+      a[j] = tmp;
+    }
+  }
+  for (i32 len = 2; len <= n; len = len * 2) {
+    u64[] step = f.pow(w, U256.ofI32(n / len));
+    for (i32 start = 0; start < n; start += len) {
+      u64[] wk = f.one();
+      for (i32 k = 0; k < len / 2; k++) {
+        u64[] u = a[start + k];
+        u64[] v = f.mul(a[start + k + len / 2], wk);
+        a[start + k] = f.add(u, v);
+        a[start + k + len / 2] = f.sub(u, v);
+        wk = f.mul(wk, step);
+      }
+    }
+  }
+}
+
+/**
+ * A blob's 128 cells, each 64 elements of 32 bytes: its polynomial's evaluations on the 8192nd roots of
+ * unity, in bit-reversed order, cut in 64s. Null for a blob with an element not below r.
+ */
+export u8[][]? computeCells(u8[] blob) {
+  if (blob.len() != 131072) { return null; }
+  U256 r = modulus();
+  Field f = Field.create(r);
+  u64[] w8192 = f.pow(f.fromU256(U256.ofU64(7)), r.sub(U256.one()).div(U256.ofU64(8192)));
+  u64[] w4096 = f.square(w8192);
+  // The blob holds its polynomial's values at the 4096th roots in bit-reversed order; natural order first.
+  u64[][] a = u64[][].defaulted(8192);
+  for (i32 j = 0; j < 4096; j++) {
+    U256 v = U256.fromBytes(blob, 32 * reverseBits(j, 12), 32);
+    if (!v.lt(r)) { return null; }
+    a[j] = f.fromU256(v);
+  }
+  u64[][] half = u64[][].defaulted(4096);
+  for (i32 j = 0; j < 4096; j++) { half[j] = a[j]; }
+  // Coefficients, by the inverse transform: ω⁻¹, then a factor of 1/4096.
+  ntt(f, half, f.inv(w4096));
+  u64[] inv4096 = f.inv(f.fromU256(U256.ofU64(4096)));
+  for (i32 j = 0; j < 4096; j++) { a[j] = f.mul(half[j], inv4096); }
+  for (i32 j = 4096; j < 8192; j++) { a[j] = f.zero(); }
+  ntt(f, a, w8192);
+  u8[][] cells = u8[][].defaulted(CELLS);
+  for (i32 c = 0; c < CELLS; c++) {
+    u8[] cell = u8[].filled(32 * CELL_ELEMENTS, 0);
+    for (i32 j = 0; j < CELL_ELEMENTS; j++) {
+      f.toU256(a[reverseBits(64 * c + j, 13)]).writeBytes(cell, 32 * j);
+    }
+    cells[c] = cell;
+  }
+  return cells;
+}
