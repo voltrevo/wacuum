@@ -1,0 +1,109 @@
+// The interpreter on hand-written bytecode, with every gas figure worked out by hand beside it.
+
+import { Frame, Outcome, Halt, run } from "../src/evm/interp.wac";
+import { OpTable } from "../src/evm/table.wac";
+import { hexToBytes, bytesToHex } from "../src/hex.wac";
+import { Check } from "./check.wac";
+
+Outcome exec(string code, string calldata, i64 gas) {
+  return run(Frame.create(OpTable.cancun(), hexToBytes(code)!, hexToBytes(calldata)!, gas));
+}
+
+string kind(Outcome o) {
+  return match (o.halt) { Stop: "stop", Return: "return", Revert: "revert", Failure(why): "failure: " + why };
+}
+
+/** Run `code` with a million gas; check how it ended, what it returned and the gas it used. */
+void expect(Check t, string what, string code, string calldata, string wantKind, string wantOut, i64 wantUsed) {
+  Outcome o = exec(code, calldata, 1000000);
+  string k = kind(o);
+  if (k.indexOf(wantKind) != 0) { t.fail("\{what}: ended as \{k}, want \{wantKind}"); return; }
+  t.eqStr(bytesToHex(o.output()), wantOut, what + ": output");
+  i64 used = 1000000 - o.gasLeft;
+  if (used != wantUsed) { t.fail("\{what}: used \{used} gas, want \{wantUsed}"); }
+}
+
+static string ZERO31 = "00000000000000000000000000000000000000000000000000000000000000";
+
+export string test_arithmetic_and_return() {
+  Check t = Check.create();
+  // PUSH1 2, PUSH1 3, ADD, PUSH1 0, MSTORE, PUSH1 32, PUSH1 0, RETURN: seven 3-gas ops, one word of memory (3).
+  expect(t, "2 + 3", "600260030160005260206000f3", "", "return", "0x" + ZERO31 + "05", 24);
+  // EXP is 10 plus 50 per exponent byte: 2 ** 255 has a one-byte exponent.
+  expect(t, "2 ** 255", "60ff60020a60005260206000f3", "", "return",
+         "0x8000000000000000000000000000000000000000000000000000000000000000", 3 + 3 + 60 + 3 + 6 + 3 + 3);
+  return t.report();
+}
+
+export string test_a_loop_counts_down() {
+  Check t = Check.create();
+  // 0: PUSH1 10   2: JUMPDEST  3: PUSH1 1  5: SWAP1  6: SUB  7: DUP1  8: PUSH1 2  10: JUMPI
+  // Each of ten iterations is 1 + 3 + 3 + 3 + 3 + 3 + 10 = 26, plus the first push.
+  expect(t, "countdown", "600a5b6001900380600257", "", "stop", "0x", 3 + 26 * 10);
+  return t.report();
+}
+
+export string test_exceptional_halts_take_all_the_gas() {
+  Check t = Check.create();
+  expect(t, "underflow", "01", "", "failure: stack underflow", "0x", 1000000);
+  expect(t, "undefined opcode", "0c", "", "failure: invalid opcode", "0x", 1000000);
+  expect(t, "INVALID", "fe", "", "failure: invalid opcode", "0x", 1000000);
+  // The 0x5b at offset 1 is PUSH1's immediate, not an instruction.
+  expect(t, "jump into push data", "605b600156", "", "failure: bad jump", "0x", 1000000);
+  expect(t, "jump past the end", "60ff56", "", "failure: bad jump", "0x", 1000000);
+  Outcome o = exec("60016002", "", 5);
+  t.ok(kind(o).indexOf("failure: out of gas") == 0 && o.gasLeft == 0, "5 gas runs out on the second push");
+  // 1024 pushes fit; the 1025th overflows. PUSH0 then JUMPDEST/JUMP back: 0: PUSH0  1: JUMPDEST ... loop forever
+  // pushing — `5f5b5f600156` pushes until the stack is full.
+  expect(t, "overflow", "5b5f600056", "", "failure: stack overflow", "0x", 1000000);
+  return t.report();
+}
+
+export string test_revert_keeps_its_gas_and_data() {
+  Check t = Check.create();
+  // PUSH1 0xab, PUSH1 0, MSTORE8, PUSH1 1, PUSH1 0, REVERT
+  expect(t, "revert", "60ab60005360016000fd", "", "revert", "0xab", 3 + 3 + 3 + 3 + 3 + 3);
+  return t.report();
+}
+
+export string test_memory_is_paid_for_quadratically() {
+  Check t = Check.create();
+  // MSTORE at 0x10000 covers 2049 words: 3 * 2049 + 2049 * 2049 / 512 = 6147 + 8200.
+  expect(t, "far store", "60016201000052", "", "stop", "0x", 3 + 3 + 3 + 14347);
+  // A zero-length RETURN at an absurd offset touches no memory and is fine.
+  expect(t, "empty return anywhere", "60007ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff3",
+         "", "return", "0x", 6);
+  expect(t, "absurd offset", "60017ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff3",
+         "", "failure: out of gas", "0x", 1000000);
+  // MLOAD at 33 reads bytes 33..64, which reaches into a third word: MSIZE is 96, and memory cost 9.
+  expect(t, "msize", "6021515960005260206000f3", "", "return", "0x" + ZERO31 + "60",
+         3 + 3 + 9 + 2 + 3 + 3 + 3 + 3);
+  return t.report();
+}
+
+export string test_calldata_and_code() {
+  Check t = Check.create();
+  // CALLDATALOAD 1 of 0x11223344 reads 0x223344 then zeros.
+  expect(t, "calldataload", "60013560005260206000f3", "0x11223344", "return",
+         "0x2233440000000000000000000000000000000000000000000000000000000000", 3 + 3 + 3 + 6 + 3 + 3);
+  // CALLDATACOPY(0, 2, 4): two bytes of data, two of zeros; 3 + 3 per word + memory.
+  expect(t, "calldatacopy", "6004600260003760046000f3", "0x11223344", "return", "0x33440000",
+         3 + 3 + 3 + 3 + 3 + 3 + 3 + 3);
+  // CODECOPY of the whole code, then return it.
+  expect(t, "codecopy", "600c6000600039600c6000f3", "", "return",
+         "0x600c6000600039600c6000f3", 3 + 3 + 3 + 3 + 3 + 3 + 3 + 3);
+  expect(t, "calldatasize", "3660005260206000f3", "0x0102", "return", "0x" + ZERO31 + "02",
+         2 + 3 + 6 + 3 + 3);
+  return t.report();
+}
+
+export string test_keccak_and_mcopy() {
+  Check t = Check.create();
+  // KECCAK256 of nothing: 30 static, no words.
+  expect(t, "keccak of empty", "600060002060005260206000f3", "", "return",
+         "0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470", 3 + 3 + 30 + 3 + 6 + 3 + 3);
+  // MSTORE8 0x42 at 0, MCOPY(1, 0, 1), RETURN 2 bytes.
+  expect(t, "mcopy", "60426000536001600060015e60026000f3", "", "return", "0x4242",
+         3 + 3 + 6 + 3 + 3 + 3 + 6 + 3 + 3);
+  return t.report();
+}

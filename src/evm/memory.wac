@@ -1,0 +1,74 @@
+// The EVM's memory: a byte array that grows in 32-byte words and is paid for as it grows.
+//
+// Growth is priced by the yellow paper's C_mem, `3 * words + words * words / 512`, charged as the difference
+// between the new size's cost and the old one's. The quadratic term is what bounds memory: a million words
+// costs about two billion gas, so no transaction that pays for its memory can ask for more than a few
+// tens of megabytes, and `expansionCost` refuses anything past 2^32 bytes before it does any arithmetic
+// that could overflow.
+
+/** No real block has the gas to reach this; anything beyond it is out of gas by construction. */
+static i64 MAX_BYTES = 0x100000000;
+
+export struct Memory {
+  u8[] bytes;
+  /** Bytes in use, always a multiple of 32: what MSIZE answers. */
+  i64 size;
+
+  Memory create() { return Memory(u8[].filled(0, 0), 0); }
+
+  /**
+   * What growing to cover `[offset, offset + len)` costs, or -1 when the range cannot be paid for at all.
+   * Zero-length ranges never grow memory, whatever their offset — the yellow paper's rule, and the reason
+   * `RETURN(2^255, 0)` is legal.
+   */
+  i64 expansionCost(const this, i64 offset, i64 len) {
+    if (len == 0) { return 0; }
+    if (offset < 0 || len < 0 || offset > MAX_BYTES || len > MAX_BYTES) { return -1; }
+    i64 end = offset + len;
+    if (end <= this.size) { return 0; }
+    i64 words = (end + 31) / 32;
+    return wordsCost(words) - wordsCost(this.size / 32);
+  }
+
+  /** Grow to cover `[offset, offset + len)`. The caller has already paid. */
+  void expand(this, i64 offset, i64 len) {
+    if (len == 0) { return; }
+    i64 end = offset + len;
+    if (end <= this.size) { return; }
+    i64 newSize = (end + 31) / 32 * 32;
+    if (newSize > (this.bytes.len() as i64)) {
+      i64 cap = (this.bytes.len() as i64) * 2;
+      if (cap < newSize) { cap = newSize; }
+      u8[] grown = u8[].filled(cap as! i32, 0);
+      for (i32 i = 0; i < (this.size as! i32); i++) { grown[i] = this.bytes[i]; }
+      this.bytes = grown;
+    }
+    this.size = newSize;
+  }
+
+  /** `len` bytes from `offset`, which the caller has expanded to. */
+  u8[] read(const this, i64 offset, i64 len) {
+    i32 n = len as! i32;
+    u8[] out = u8[].filled(n, 0);
+    i32 at = offset as! i32;
+    for (i32 i = 0; i < n; i++) { out[i] = this.bytes[at + i]; }
+    return out;
+  }
+
+  /**
+   * Write `len` bytes of `src` from `srcOffset` to `offset`, with bytes past the end of `src` written as
+   * zeros — the copy opcodes' rule for reading off the end of calldata or code.
+   */
+  void write(this, i64 offset, const u8[] src, i64 srcOffset, i64 len) {
+    i32 n = len as! i32;
+    i32 at = offset as! i32;
+    for (i32 i = 0; i < n; i++) {
+      i64 from = srcOffset + (i as i64);
+      this.bytes[at + i] = from >= 0 && from < (src.len() as i64) ? src[from as! i32] : 0;
+    }
+  }
+}
+
+export i64 wordsCost(i64 words) {
+  return 3 * words + words * words / 512;
+}

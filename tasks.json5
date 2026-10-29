@@ -1,0 +1,6 @@
+{
+  // Every test, in wac.
+  test: "wac test test",
+  // Regenerate test/u256_vectors.wac — U256 against JavaScript's BigInt.
+  vectors: "node tools/u256-vectors.mjs",
+}

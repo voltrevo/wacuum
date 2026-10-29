@@ -1,0 +1,7 @@
+{
+  imports: {
+    // The rest of wac, as one dependency: `import { crypto.keccak256, rlp.encode } from "wac"`. A build reads
+    // only what a program reaches through it.
+    wac: { git: 'https://git.voltrevo.com/wac.git', ref: 'master' },
+  },
+}

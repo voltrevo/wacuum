@@ -1,0 +1,314 @@
+// The interpreter: one call frame's code, run until it halts.
+//
+// This is the part of the EVM that needs no world — arithmetic, memory, control flow, calldata and the
+// frame's own code. Accounts, storage, logs, calls and creation reach a world through a host, and arrive
+// with the state milestone; until then their opcodes are absent from `OpTable` and halt as INVALID.
+//
+// ## How a step is checked
+//
+// Every opcode passes one gate before its semantics run: defined, enough stack, room on the stack, static
+// gas. `OpTable` holds the numbers, so the dispatch below carries only what each opcode *does* and its
+// dynamic gas. Any failure is an exceptional halt, which in the EVM consumes all the frame's gas and
+// discards its output — `Failure` carries the reason only for whoever is debugging.
+
+import { crypto.keccak256 } from "wac";
+import { U256 } from "../u256.wac";
+import { Memory } from "./memory.wac";
+import { OpTable } from "./table.wac";
+
+export enum Halt {
+  Stop,
+  Return(u8[] data),
+  Revert(u8[] data),
+  Failure(string why),
+}
+
+export struct Outcome {
+  Halt halt;
+  /** What the frame hands back: zero after a failure, which consumes everything. */
+  i64 gasLeft;
+
+  bool succeeded(const this) {
+    return match (this.halt) { Stop: true, Return: true, Revert: false, Failure: false };
+  }
+
+  /** RETURN's or REVERT's bytes, and nothing otherwise. */
+  u8[] output(const this) {
+    return match (this.halt) { Stop: u8[].filled(0, 0), Return(d): d, Revert(d): d, Failure: u8[].filled(0, 0) };
+  }
+}
+
+export struct Frame {
+  OpTable table;
+  u8[] code;
+  bool[] jumpdests;
+  u8[] calldata;
+  /** The last call's output; nothing calls yet, so it is always empty. */
+  u8[] returndata;
+  U256?[] stack;
+  i32 sp;
+  Memory memory;
+  i32 pc;
+  i64 gas;
+
+  Frame create(OpTable table, u8[] code, u8[] calldata, i64 gas) {
+    return Frame(table, code, jumpdestsOf(code), calldata, u8[].filled(0, 0), U256?[].defaulted(1024), 0,
+                 Memory.create(), 0, gas);
+  }
+
+  void push(this, U256 v) {
+    this.stack[this.sp] = v;
+    this.sp++;
+  }
+  U256 pop(this) {
+    this.sp--;
+    return this.stack[this.sp]!;
+  }
+  /** The item `n` below the top, 0 being the top. */
+  U256 peek(this, i32 n) { return this.stack[this.sp - 1 - n]!.copy(); }
+
+  bool charge(this, i64 cost) {
+    if (cost < 0 || cost > this.gas) { return false; }
+    this.gas -= cost;
+    return true;
+  }
+
+  /** Pay for and grow memory over a range taken from the stack. False is out of gas. */
+  bool touch(this, U256 offset, U256 len) {
+    if (len.isZero()) { return true; }
+    i64 off = clampI64(offset);
+    i64 n = clampI64(len);
+    if (!this.charge(this.memory.expansionCost(off, n))) { return false; }
+    this.memory.expand(off, n);
+    return true;
+  }
+}
+
+/** A U256 as an i64 offset or length, with anything too big to be affordable clamped to the i64 maximum. */
+i64 clampI64(U256 v) {
+  if (!v.fitsU64() || v.low() > 0x7FFFFFFFFFFFFFFF) { return 0x7FFFFFFFFFFFFFFF; }
+  return v.low() as@ i64;
+}
+
+/**
+ * Where a jump may land: a JUMPDEST byte that is an instruction, not the inside of a PUSH's immediate.
+ * A 0x5b inside push data is just data, and jumping to it is exactly the attack this rules out.
+ */
+bool[] jumpdestsOf(const u8[] code) {
+  bool[] ok = bool[].filled(code.len(), false);
+  i32 pc = 0;
+  while (pc < code.len()) {
+    i32 op = code[pc] as i32;
+    if (op == 0x5b) { ok[pc] = true; }
+    pc += op >= 0x60 && op <= 0x7f ? op - 0x5f + 1 : 1;
+  }
+  return ok;
+}
+
+/** Words covering `len` bytes, for the per-word gas of the copy opcodes and KECCAK256. */
+i64 wordsOf(U256 len) {
+  i64 n = clampI64(len);
+  if (n > 0x7FFFFFFFFFFFFF00) { return 0x7FFFFFFFFFFFFFF; }
+  return (n + 31) / 32;
+}
+
+Outcome fail(Frame f, string why) {
+  return Outcome(Halt.Failure(why), 0);
+}
+
+/** Run a frame to its halt. */
+export Outcome run(Frame f) {
+  while (true) {
+    if (f.pc >= f.code.len()) { return Outcome(Halt.Stop, f.gas); }
+    i32 op = f.code[f.pc] as i32;
+    OpTable t = f.table;
+    if (!t.defined(op)) { return fail(f, "invalid opcode 0x\{hexByte(op)} at \{f.pc}"); }
+    if (f.sp < t.pops[op]) { return fail(f, "stack underflow in \{t.names[op]} at \{f.pc}"); }
+    if (f.sp - t.pops[op] + t.pushes[op] > 1024) { return fail(f, "stack overflow in \{t.names[op]} at \{f.pc}"); }
+    if (!f.charge(t.gas[op])) { return fail(f, "out of gas in \{t.names[op]} at \{f.pc}"); }
+    Halt? h = step(f, op);
+    if (h is not null) {
+      Halt halt = h!;
+      return match (halt) {
+        Failure: Outcome(halt, 0),
+        default: Outcome(halt, f.gas),
+      };
+    }
+  }
+}
+
+Halt oog(Frame f, i32 op) { return Halt.Failure("out of gas in \{f.table.names[op]} at \{f.pc}"); }
+
+U256 bool256(bool b) { return b ? U256.one() : U256.zero(); }
+
+/** Execute the opcode at `pc`, which has passed the gate. Null to carry on; a halt to stop. */
+Halt? step(Frame f, i32 op) {
+  // PUSH1..PUSH32, DUP and SWAP are ranges, not cases.
+  if (op >= 0x60 && op <= 0x7f) {
+    i32 n = op - 0x5f;
+    f.push(U256.fromBytes(f.code, f.pc + 1, n));
+    f.pc += n + 1;
+    return null;
+  }
+  if (op >= 0x80 && op <= 0x8f) {
+    f.push(f.peek(op - 0x80));
+    f.pc++;
+    return null;
+  }
+  if (op >= 0x90 && op <= 0x9f) {
+    i32 n = op - 0x8f;
+    i32 top = f.sp - 1;
+    U256? a = f.stack[top];
+    f.stack[top] = f.stack[top - n];
+    f.stack[top - n] = a;
+    f.pc++;
+    return null;
+  }
+
+  switch (op) {
+    case 0x00: { return Halt.Stop; }
+    case 0x01: { U256 a = f.pop(); f.push(a.add(f.pop())); }
+    case 0x02: { U256 a = f.pop(); f.push(a.mul(f.pop())); }
+    case 0x03: { U256 a = f.pop(); f.push(a.sub(f.pop())); }
+    case 0x04: { U256 a = f.pop(); f.push(a.div(f.pop())); }
+    case 0x05: { U256 a = f.pop(); f.push(a.sdiv(f.pop())); }
+    case 0x06: { U256 a = f.pop(); f.push(a.mod(f.pop())); }
+    case 0x07: { U256 a = f.pop(); f.push(a.smod(f.pop())); }
+    case 0x08: { U256 a = f.pop(); U256 b = f.pop(); f.push(a.addmod(b, f.pop())); }
+    case 0x09: { U256 a = f.pop(); U256 b = f.pop(); f.push(a.mulmod(b, f.pop())); }
+    case 0x0a: {
+      U256 a = f.pop();
+      U256 e = f.pop();
+      // EIP-160: 50 per byte of exponent.
+      if (!f.charge(50 * (e.byteLen() as i64))) { return oog(f, op); }
+      f.push(a.exp(e));
+    }
+    case 0x0b: { U256 b = f.pop(); f.push(f.pop().signextend(b)); }
+    case 0x10: { U256 a = f.pop(); f.push(bool256(a.lt(f.pop()))); }
+    case 0x11: { U256 a = f.pop(); f.push(bool256(a.gt(f.pop()))); }
+    case 0x12: { U256 a = f.pop(); f.push(bool256(a.compareSigned(f.pop()) < 0)); }
+    case 0x13: { U256 a = f.pop(); f.push(bool256(a.compareSigned(f.pop()) > 0)); }
+    case 0x14: { U256 a = f.pop(); f.push(bool256(a.eq(f.pop()))); }
+    case 0x15: { f.push(bool256(f.pop().isZero())); }
+    case 0x16: { U256 a = f.pop(); f.push(a.and(f.pop())); }
+    case 0x17: { U256 a = f.pop(); f.push(a.or(f.pop())); }
+    case 0x18: { U256 a = f.pop(); f.push(a.xor(f.pop())); }
+    case 0x19: { f.push(f.pop().inverted()); }
+    case 0x1a: { U256 i = f.pop(); f.push(f.pop().byteAt(i)); }
+    case 0x1b: { U256 s = f.pop(); f.push(f.pop().shl(s.shiftAmount())); }
+    case 0x1c: { U256 s = f.pop(); f.push(f.pop().shr(s.shiftAmount())); }
+    case 0x1d: { U256 s = f.pop(); f.push(f.pop().sar(s.shiftAmount())); }
+    case 0x20: {
+      U256 off = f.pop();
+      U256 len = f.pop();
+      if (!f.charge(6 * wordsOf(len)) || !f.touch(off, len)) { return oog(f, op); }
+      u8[] data = len.isZero() ? u8[].filled(0, 0) : f.memory.read(clampI64(off), clampI64(len));
+      f.push(U256.fromBytes(keccak256(data), 0, 32));
+    }
+    case 0x35: {
+      U256 off = f.pop();
+      f.push(off.fitsU64() && off.low() < 0x7FFFFFFF ? U256.fromBytes(f.calldata, off.low() as! i32, 32) : U256.zero());
+    }
+    case 0x36: { f.push(U256.ofI32(f.calldata.len())); }
+    case 0x37: { Halt? h = copyOp(f, op, f.calldata); if (h is not null) { return h; } }
+    case 0x38: { f.push(U256.ofI32(f.code.len())); }
+    case 0x39: { Halt? h = copyOp(f, op, f.code); if (h is not null) { return h; } }
+    case 0x3d: { f.push(U256.ofI32(f.returndata.len())); }
+    case 0x3e: {
+      U256 dest = f.peek(0);
+      U256 src = f.peek(1);
+      U256 len = f.peek(2);
+      // EIP-211: unlike the other copies, reading past the end of the return data is an exceptional halt.
+      U256 end = src.add(len);
+      if (end.lt(src) || end.gt(U256.ofI32(f.returndata.len()))) {
+        return Halt.Failure("RETURNDATACOPY past the end of the return data at \{f.pc}");
+      }
+      Halt? h = copyOp(f, op, f.returndata);
+      if (h is not null) { return h; }
+    }
+    case 0x50: { f.pop(); }
+    case 0x51: {
+      U256 off = f.pop();
+      U256 thirtyTwo = U256.ofU64(32);
+      if (!f.touch(off, thirtyTwo)) { return oog(f, op); }
+      f.push(U256.fromBytes(f.memory.read(clampI64(off), 32), 0, 32));
+    }
+    case 0x52: {
+      U256 off = f.pop();
+      U256 v = f.pop();
+      if (!f.touch(off, U256.ofU64(32))) { return oog(f, op); }
+      f.memory.write(clampI64(off), v.toBytes(), 0, 32);
+    }
+    case 0x53: {
+      U256 off = f.pop();
+      U256 v = f.pop();
+      if (!f.touch(off, U256.one())) { return oog(f, op); }
+      f.memory.bytes[clampI64(off) as! i32] = v.low() as@ u8;
+    }
+    case 0x56: {
+      U256 dest = f.pop();
+      if (!validJump(f, dest)) { return Halt.Failure("bad jump destination \{dest.toHex()} at \{f.pc}"); }
+      f.pc = dest.low() as! i32;
+      return null;
+    }
+    case 0x57: {
+      U256 dest = f.pop();
+      U256 cond = f.pop();
+      if (!cond.isZero()) {
+        if (!validJump(f, dest)) { return Halt.Failure("bad jump destination \{dest.toHex()} at \{f.pc}"); }
+        f.pc = dest.low() as! i32;
+        return null;
+      }
+    }
+    case 0x58: { f.push(U256.ofI32(f.pc)); }
+    case 0x59: { f.push(U256.ofU64(f.memory.size as! u64)); }
+    case 0x5a: { f.push(U256.ofU64(f.gas as! u64)); }
+    case 0x5b: { }
+    case 0x5e: {
+      // MCOPY (EIP-5656): memory is grown to cover both ranges, and the copy behaves as if through a buffer.
+      U256 dest = f.pop();
+      U256 src = f.pop();
+      U256 len = f.pop();
+      if (!f.charge(3 * wordsOf(len)) || !f.touch(src, len) || !f.touch(dest, len)) { return oog(f, op); }
+      if (!len.isZero()) {
+        u8[] buf = f.memory.read(clampI64(src), clampI64(len));
+        f.memory.write(clampI64(dest), buf, 0, clampI64(len));
+      }
+    }
+    case 0x5f: { f.push(U256.zero()); }
+    case 0xf3: {
+      U256 off = f.pop();
+      U256 len = f.pop();
+      if (!f.touch(off, len)) { return oog(f, op); }
+      return Halt.Return(len.isZero() ? u8[].filled(0, 0) : f.memory.read(clampI64(off), clampI64(len)));
+    }
+    case 0xfd: {
+      U256 off = f.pop();
+      U256 len = f.pop();
+      if (!f.touch(off, len)) { return oog(f, op); }
+      return Halt.Revert(len.isZero() ? u8[].filled(0, 0) : f.memory.read(clampI64(off), clampI64(len)));
+    }
+    default: { return Halt.Failure("opcode 0x\{hexByte(op)} is in the table but not dispatched"); }
+  }
+  f.pc++;
+  return null;
+}
+
+bool validJump(Frame f, U256 dest) {
+  return dest.fitsU64() && dest.low() < (f.code.len() as@ u32) as u64 && f.jumpdests[dest.low() as! i32];
+}
+
+/** CALLDATACOPY, CODECOPY and RETURNDATACOPY: `dest`, `src`, `len` from the stack, 3 gas a word. */
+Halt? copyOp(Frame f, i32 op, const u8[] from) {
+  U256 dest = f.pop();
+  U256 src = f.pop();
+  U256 len = f.pop();
+  if (!f.charge(3 * wordsOf(len)) || !f.touch(dest, len)) { return oog(f, op); }
+  if (!len.isZero()) { f.memory.write(clampI64(dest), from, clampI64(src), clampI64(len)); }
+  return null;
+}
+
+string hexByte(i32 b) {
+  string d = "0123456789abcdef";
+  return d.slice(b >> 4, (b >> 4) + 1) + d.slice(b & 15, (b & 15) + 1);
+}

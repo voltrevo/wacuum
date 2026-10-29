@@ -1,0 +1,34 @@
+// Hex text and bytes, the way Ethereum writes them: `0x`-prefixed, two digits a byte.
+
+/** The bytes `s` spells, with or without `0x`. Null for an odd length or a non-hex digit. */
+export u8[]? hexToBytes(string s) {
+  i32 start = s.len() >= 2 && s.slice(0, 2) == "0x" ? 2 : 0;
+  if ((s.len() - start) % 2 != 0) { return null; }
+  u8[] t = s.toBytes();
+  u8[] out = u8[].filled((s.len() - start) / 2, 0);
+  for (i32 i = 0; i < out.len(); i++) {
+    i32 hi = digit(t[start + 2 * i]);
+    i32 lo = digit(t[start + 2 * i + 1]);
+    if (hi < 0 || lo < 0) { return null; }
+    out[i] = (hi * 16 + lo) as@ u8;
+  }
+  return out;
+}
+
+/** `0x` and two lower-case digits a byte. */
+export string bytesToHex(const u8[] b) {
+  string d = "0123456789abcdef";
+  string out = "0x";
+  for (i32 i = 0; i < b.len(); i++) {
+    i32 v = b[i] as i32;
+    out += d.slice(v >> 4, (v >> 4) + 1) + d.slice(v & 15, (v & 15) + 1);
+  }
+  return out;
+}
+
+i32 digit(u8 c) {
+  if (c >= 48 && c <= 57) { return (c as i32) - 48; }
+  if (c >= 97 && c <= 102) { return (c as i32) - 87; }
+  if (c >= 65 && c <= 70) { return (c as i32) - 55; }
+  return -1;
+}

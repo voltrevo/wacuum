@@ -1,0 +1,38 @@
+// Assertions for this repository's tests.
+//
+// A test is an exported `test*` function returning a string: empty is a pass and anything else is what
+// failed. Failures accumulate rather than trap, so one run reports every disagreement — wac's own
+// `wactest` has the same shape, and is not reachable from outside the wac repository.
+
+import { U256 } from "../src/u256.wac";
+
+export struct Check {
+  i32 failed;
+  string messages;
+
+  Check create() { return Check(0, ""); }
+
+  void fail(this, string what) {
+    this.failed++;
+    if (this.failed > 8) { return; }
+    if (this.messages.len() > 0) { this.messages += "; "; }
+    this.messages += what;
+  }
+
+  void ok(this, bool cond, string what) {
+    if (!cond) { this.fail(what); }
+  }
+
+  void eqU256(this, U256 got, U256 want, string what) {
+    if (got.ne(want)) { this.fail("\{what}: got \{got.toHex()}, want \{want.toHex()}"); }
+  }
+
+  void eqStr(this, string got, string want, string what) {
+    if (got != want) { this.fail("\{what}: got \"\{got}\", want \"\{want}\""); }
+  }
+
+  string report(this) {
+    if (this.failed > 8) { return this.messages + " … and more: \{this.failed} failures in all"; }
+    return this.messages;
+  }
+}

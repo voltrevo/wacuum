@@ -1,0 +1,66 @@
+// U256 against BigInt: every EVM arithmetic operation, over every pair of edge values and random operands.
+// `tools/u256-vectors.mjs` writes the cases; this runs them.
+
+import { U256 } from "../src/u256.wac";
+import { Check } from "./check.wac";
+import { VECTORS } from "./u256_vectors.wac";
+
+U256 bool256(bool b) { return b ? U256.one() : U256.zero(); }
+
+/** The operation `op` over EVM stack operands, `a` on top. */
+U256? apply(string op, U256 a, U256 b, U256 c) {
+  if (op == "add") { return a.add(b); }
+  if (op == "sub") { return a.sub(b); }
+  if (op == "mul") { return a.mul(b); }
+  if (op == "div") { return a.div(b); }
+  if (op == "mod") { return a.mod(b); }
+  if (op == "sdiv") { return a.sdiv(b); }
+  if (op == "smod") { return a.smod(b); }
+  if (op == "addmod") { return a.addmod(b, c); }
+  if (op == "mulmod") { return a.mulmod(b, c); }
+  if (op == "exp") { return a.exp(b); }
+  if (op == "signextend") { return b.signextend(a); }
+  if (op == "lt") { return bool256(a.lt(b)); }
+  if (op == "gt") { return bool256(a.gt(b)); }
+  if (op == "slt") { return bool256(a.compareSigned(b) < 0); }
+  if (op == "sgt") { return bool256(a.compareSigned(b) > 0); }
+  if (op == "eq") { return bool256(a.eq(b)); }
+  if (op == "and") { return a.and(b); }
+  if (op == "or") { return a.or(b); }
+  if (op == "xor") { return a.xor(b); }
+  if (op == "not") { return a.inverted(); }
+  if (op == "byte") { return b.byteAt(a); }
+  if (op == "shl") { return b.shl(a.shiftAmount()); }
+  if (op == "shr") { return b.shr(a.shiftAmount()); }
+  if (op == "sar") { return b.sar(a.shiftAmount()); }
+  return null;
+}
+
+export string test_every_operation_agrees_with_bigint() {
+  Check t = Check.create();
+  for (i32 i = 0; i + 5 <= VECTORS.len(); i += 5) {
+    string op = VECTORS[i];
+    U256 a = U256.fromHex(VECTORS[i + 1])!;
+    U256 b = U256.fromHex(VECTORS[i + 2])!;
+    U256 c = U256.fromHex(VECTORS[i + 3])!;
+    U256 want = U256.fromHex(VECTORS[i + 4])!;
+    U256? got = apply(op, a, b, c);
+    if (got is null) { t.fail("no such op \{op}"); continue; }
+    t.eqU256(got!, want, "\{op}(\{VECTORS[i + 1]}, \{VECTORS[i + 2]}, \{VECTORS[i + 3]})");
+  }
+  return t.report();
+}
+
+export string test_bytes_and_text_round_trip() {
+  Check t = Check.create();
+  U256 x = U256.fromHex("0x0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20")!;
+  u8[] b = x.toBytes();
+  t.ok(b.len() == 32 && b[0] == 1 && b[31] == 32, "toBytes is big-endian");
+  t.eqU256(U256.fromBytes(b, 0, 32), x, "fromBytes inverts toBytes");
+  t.eqU256(U256.fromBytes(b, 30, 4), U256.ofU64(0x1f200000), "bytes past the end read as zero");
+  t.eqStr(U256.zero().toHex(), "0x0", "zero in hex");
+  t.eqStr(U256.max().toDecimal(), "115792089237316195423570985008687907853269984665640564039457584007913129639935", "max in decimal");
+  t.ok(U256.fromHex("0x") is null && U256.fromHex("0xg") is null, "bad hex is refused");
+  t.ok(U256.ofU64(0x0100).byteLen() == 2 && U256.zero().byteLen() == 0, "byteLen");
+  return t.report();
+}
