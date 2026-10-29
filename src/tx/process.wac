@@ -15,7 +15,7 @@ import { Evm, BlockEnv, TxEnv, Message, processMessage, processCreate, createAdd
 import { Outcome, Halt } from "../evm/interp.wac";
 import { OpTable } from "../evm/table.wac";
 import { precompileAddresses } from "../evm/precompiles.wac";
-import { Spec } from "../evm/spec.wac";
+import { Spec, TX_GAS_LIMIT_CAP, MAX_BLOBS_PER_TX } from "../evm/spec.wac";
 import { ecrecover, secpN } from "../precompiles/ecrecover.wac";
 import { u256Bytes } from "../state/root.wac";
 import { crypto.keccak256 } from "wac";
@@ -130,6 +130,7 @@ export Processed processTransaction(Spec spec, World w, BlockEnv block, Transact
   if (!tx.nonce.fitsU64() || tx.nonce.low() == 0xFFFFFFFFFFFFFFFF) { return invalid("nonce too high"); }
   if (tx.to is null && tx.data.len() > MAX_INITCODE_SIZE) { return invalid("init code too large"); }
   if (gasLimit > blockGasLeft) { return invalid("gas limit exceeds the block's"); }
+  if (spec.isOsaka && gasLimit > TX_GAS_LIMIT_CAP) { return invalid("gas limit above EIP-7825's cap"); }
 
   U256 baseFee = block.baseFee;
   U256 price;
@@ -154,6 +155,7 @@ export Processed processTransaction(Spec spec, World w, BlockEnv block, Transact
   if (tx.txType == 3) {
     if (tx.to is null) { return invalid("a blob transaction cannot create"); }
     if (tx.blobHashes.len() == 0) { return invalid("a blob transaction without blobs"); }
+    if (spec.isOsaka && tx.blobHashes.len() > MAX_BLOBS_PER_TX) { return invalid("more blobs than EIP-7594 allows a transaction"); }
     for (i32 i = 0; i < tx.blobHashes.len(); i++) {
       if (tx.blobHashes[i].byteAt(U256.zero()).low() != 0x01) { return invalid("blob hash with the wrong version"); }
     }
@@ -189,7 +191,7 @@ export Processed processTransaction(Spec spec, World w, BlockEnv block, Transact
   }
   w.warmAddress(sender);
 
-  Evm evm = Evm(w, block, TxEnv(sender, price, tx.blobHashes), OpTable.cancun(), spec, tracer);
+  Evm evm = Evm(w, block, TxEnv(sender, price, tx.blobHashes), spec.table, spec, tracer);
   i64 gas = gasLimit - intrinsic;
   Outcome o;
   if (tx.to is null) {

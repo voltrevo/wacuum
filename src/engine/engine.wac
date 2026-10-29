@@ -28,7 +28,7 @@ import { addressBytes, Evm, BlockEnv, TxEnv, Message, processMessage } from "../
 import { Outcome } from "../evm/interp.wac";
 import { OpTable } from "../evm/table.wac";
 import { blobGasPrice } from "../tx/process.wac";
-import { Spec } from "../evm/spec.wac";
+import { Spec, ChainConfig } from "../evm/spec.wac";
 import { Header, Block, Withdrawal, applyBlock, headerItem, nextBaseFee, nextExcessBlobGas, EMPTY_OMMERS, requestsHashOf,
          indexedRoot } from "../chain/block.wac";
 import { decodeTransaction, DecodedTx } from "../tx/decode.wac";
@@ -51,7 +51,8 @@ export struct Answer {
 }
 
 export struct Engine {
-  Spec spec;
+  /** The chain's forks: each payload runs under the one its timestamp has reached. */
+  ChainConfig config;
   U256 chainId;
   Map<U256, Node> blocks;
   /** Block number to hash along the canonical chain, for BLOCKHASH. */
@@ -66,8 +67,8 @@ export struct Engine {
   u64 nextPayloadId;
 
   /** An engine whose chain starts at `genesis`, with `world` its state. */
-  Engine create(Spec spec, U256 chainId, Header genesis, World world) {
-    Engine e = Engine(spec, chainId, Map.create(hashU256, eqU256), Map.create(hashU256, eqU256), genesis.hash, genesis.hash,
+  Engine create(ChainConfig config, Header genesis, World world) {
+    Engine e = Engine(config, config.chainId, Map.create(hashU256, eqU256), Map.create(hashU256, eqU256), genesis.hash, genesis.hash,
                       genesis.hash, Vec.create(), Map.create(hashU256, eqU256), 1);
     e.blocks.set(genesis.hash, Node(genesis, world));
     e.canonical.set(genesis.number, genesis.hash);
@@ -178,7 +179,8 @@ export struct Engine {
       }
       h.requestsHash = requestsHashOf(byType);
     }
-    h.hash = U256.fromBytes(keccak256(encode(headerItem(this.spec, h))), 0, 32);
+    Spec spec = this.config.specAt(h.timestamp);
+    h.hash = U256.fromBytes(keccak256(encode(headerItem(spec, h))), 0, 32);
     if (!h.hash.eq(claimed)) { return this.invalidNoAncestor("block hash \{claimed.toHex()} is not the payload's, \{h.hash.toHex()}"); }
 
     // EIP-4844: the blob hashes the consensus layer expects must be exactly the transactions', in order.
@@ -195,7 +197,7 @@ export struct Engine {
     if (parent is null) { return status("SYNCING", "", ""); }
     World w = parent!.world.clone();
     Block b = Block(h, txs.toArray(), false, withdrawals);
-    string err = applyBlock(this.spec, w, b, parent!.header, this.chainId, this.ancestorHashes(parent!.header));
+    string err = applyBlock(spec, w, b, parent!.header, this.chainId, this.ancestorHashes(parent!.header));
     if (err != "") { return this.invalid(h, err); }
     this.blocks.set(h.hash, Node(h, w));
     return status("VALID", h.hash.toHex(), "");
@@ -250,7 +252,7 @@ export struct Engine {
       Attributes attrs = Attributes(hexU256(at.member("timestamp")), hexU256(at.member("prevRandao")),
                                     hexU256(at.member("suggestedFeeRecipient")), withdrawalsFrom(at.member("withdrawals")),
                                     hexU256(at.member("parentBeaconBlockRoot")));
-      Built built = buildBlock(this.spec, this.blocks.get(head)!.world.clone(), parent, attrs, this.mempool.toArray(),
+      Built built = buildBlock(this.config.specAt(attrs.timestamp), this.blocks.get(head)!.world.clone(), parent, attrs, this.mempool.toArray(),
                                this.chainId, this.ancestorHashes(parent));
       U256 id = U256.ofU64(this.nextPayloadId);
       this.nextPayloadId++;
@@ -367,15 +369,16 @@ export struct Engine {
     if (ps.len() < 1 || ps.get(0).object() is null) { return Answer.error(-32602, "no call object"); }
     JsonValue c = ps.get(0);
     Header h = this.blocks.get(this.head)!.header;
+    Spec spec = this.config.specAt(h.timestamp.add(U256.ofU64(12)));
     World w = this.headState().clone();
     BlockEnv env = BlockEnv(h.coinbase, h.number.add(U256.one()), h.timestamp.add(U256.ofU64(12)), h.gasLimit,
-                            h.prevRandao, nextBaseFee(h), blobGasPrice(this.spec, nextExcessBlobGas(this.spec, h)), this.chainId,
+                            h.prevRandao, nextBaseFee(h), blobGasPrice(spec, nextExcessBlobGas(spec, h)), this.chainId,
                             this.ancestorHashes(h));
     U256 from = hexU256(c.member("from"));
     U256 to = hexU256(c.member("to"));
     u8[] data = c.member("input") is not null ? hexBytes(c.member("input")) : hexBytes(c.member("data"));
     U256 gas = c.member("gas") is not null ? hexU256(c.member("gas")) : h.gasLimit;
-    Evm evm = Evm(w, env, TxEnv(from, U256.zero(), U256[].filled(0, U256.zero())), OpTable.cancun(), this.spec, null);
+    Evm evm = Evm(w, env, TxEnv(from, U256.zero(), U256[].filled(0, U256.zero())), spec.table, spec, null);
     w.warmAddress(from);
     w.warmAddress(to);
     Message m = Message(from, to, to, hexU256(c.member("value")), data, gas.low() as@ i64, false, 0, true, false);

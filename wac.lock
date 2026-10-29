@@ -1,1 +1,1 @@
-{ "imports": { "wac": { "git": "https://git.voltrevo.com/wac.git", "ref": "master", "commit": "a473e07b04b84e63cd4918e57cc866ec553d0247" } } }
+{ "imports": { "wac": { "git": "https://git.voltrevo.com/wac.git", "ref": "master", "commit": "49e5268e362d84358c62b93932e3c20c56546e1d" } } }

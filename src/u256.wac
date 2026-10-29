@@ -268,6 +268,19 @@ export const struct U256 {
     return result;
   }
 
+  /** How many leading zero bits: 256 for zero — CLZ (EIP-7939). */
+  i32 leadingZeros(this) {
+    for (i32 i = 3; i >= 0; i--) {
+      u64 w = this.word(i);
+      if (w != 0) {
+        i32 n = 0;
+        while ((w >> 63) == 0) { w = w << 1; n++; }
+        return (3 - i) * 64 + n;
+      }
+    }
+    return 256;
+  }
+
   /** How many bytes the value needs — EXP's gas is priced on the exponent's. */
   i32 byteLen(this) {
     for (i32 i = 3; i >= 0; i--) {

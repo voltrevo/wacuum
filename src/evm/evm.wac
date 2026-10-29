@@ -82,7 +82,7 @@ export Outcome processMessage(Evm evm, Message m) {
 }
 
 Outcome execute(Evm evm, Message m, u8[] code) {
-  if (!m.noPrecompile && isPrecompile(evm.spec, m.codeAddress)) { return runPrecompile(m.codeAddress, m.data, m.gas); }
+  if (!m.noPrecompile && isPrecompile(evm.spec, m.codeAddress)) { return runPrecompile(evm.spec, m.codeAddress, m.data, m.gas); }
   if (code.len() == 0) { return Outcome(Halt.Stop, m.gas); }
   return run(Frame.create(evm, m, code));
 }

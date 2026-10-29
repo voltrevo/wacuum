@@ -15,15 +15,17 @@ export u8[]? hexToBytes(string s) {
   return out;
 }
 
-/** `0x` and two lower-case digits a byte. */
+/** `0x` and two lower-case digits a byte. Built in one array: appending to a string per byte is quadratic. */
 export string bytesToHex(const u8[] b) {
-  string d = "0123456789abcdef";
-  string out = "0x";
+  u8[] d = "0123456789abcdef".toBytes();
+  u8[] out = u8[].filled(2 + 2 * b.len(), 0);
+  out[0] = 48;
+  out[1] = 120;
   for (i32 i = 0; i < b.len(); i++) {
-    i32 v = b[i] as i32;
-    out += d.slice(v >> 4, (v >> 4) + 1) + d.slice(v & 15, (v & 15) + 1);
+    out[2 + 2 * i] = d[(b[i] >> 4) as i32];
+    out[3 + 2 * i] = d[(b[i] & 15) as i32];
   }
-  return out;
+  return string.fromBytes(out);
 }
 
 i32 digit(u8 c) {

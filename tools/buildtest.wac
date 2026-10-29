@@ -17,11 +17,11 @@ import { U256 } from "../src/u256.wac";
 import { bytesToHex } from "../src/hex.wac";
 import { World } from "../src/state/world.wac";
 import { stateRoot } from "../src/state/root.wac";
-import { Spec } from "../src/evm/spec.wac";
+import { Spec, ChainConfig } from "../src/evm/spec.wac";
 import { Header } from "../src/chain/block.wac";
 import { Engine, Answer } from "../src/engine/engine.wac";
 import { headerItem } from "../src/chain/block.wac";
-import { num, bytes, worldFrom } from "./fixture.wac";
+import { num, bytes, worldFrom, configOf } from "./fixture.wac";
 
 struct Tally {
   i32 passed;
@@ -47,13 +47,11 @@ string statusOf(Answer a) {
   return a.result!.member("status")?.text() ?? "?";
 }
 
-string runTest(Spec spec, JsonValue test) {
+string runTest(ChainConfig chain, JsonValue test) {
   World w = worldFrom(test.member("pre")!);
-  JsonValue? config = test.member("config");
-  U256 chainId = config is null ? U256.one() : num(config!.member("chainid"));
-  if (chainId.isZero()) { chainId = U256.one(); }
   Header genesis = genesisOf(test.member("genesisBlockHeader")!);
-  Engine e = Engine.create(spec, chainId, genesis, w);
+  Spec spec = chain.specAt(genesis.timestamp);
+  Engine e = Engine.create(chain, genesis, w);
 
   JsonArray payloads = test.member("engineNewPayloads")!.array()!;
   for (i32 i = 0; i < payloads.len(); i++) {
@@ -160,9 +158,9 @@ export async i32 main(Sys sys) {
               JsonValue test = tests.at(i).value;
               if (tally.filter != "" && name.indexOf(tally.filter) < 0) { continue; }
               if ((test.member("network")!.text() ?? "") != tally.fork) { continue; }
-              Spec? spec = Spec.byName(tally.fork);
-              if (spec is null) { continue; }
-              string why = runTest(spec!, test);
+              ChainConfig? chain = configOf(test);
+              if (chain is null) { continue; }
+              string why = runTest(chain!, test);
               if (why == "") {
                 tally.passed++;
               } else {

@@ -12,7 +12,7 @@ export Evm newEvm() {
   BlockEnv b = BlockEnv(U256.ofU64(0xc0ffee), U256.ofU64(1), U256.ofU64(1000), U256.ofU64(30000000), U256.zero(),
                         U256.ofU64(7), U256.ofU64(1), U256.ofU64(1), Map.create(hashU256, eqU256));
   TxEnv t = TxEnv(U256.ofU64(0xaaaa), U256.ofU64(10), U256[].filled(0, U256.zero()));
-  return Evm(World.create(), b, t, OpTable.cancun(), Spec.cancun(), null);
+  return Evm(World.create(), b, t, Spec.osaka().table, Spec.osaka(), null);
 }
 
 /** Run `code` as the account 0x1000, called by 0xaaaa with `data`. */

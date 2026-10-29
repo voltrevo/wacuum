@@ -11,7 +11,8 @@ export struct OpTable {
   i32[] pushes;
   string[] names;
 
-  OpTable cancun() {
+  /** The table for Cancun and Prague, or with `osaka` Osaka's, which adds CLZ. */
+  OpTable forFork(bool osaka) {
     OpTable t = OpTable(i64[].filled(256, -1), i32[].filled(256, 0), i32[].filled(256, 0), string[].defaulted(256));
     t.def(0x00, "STOP", 0, 0, 0);
     t.def(0x01, "ADD", 3, 2, 1);
@@ -39,6 +40,7 @@ export struct OpTable {
     t.def(0x1b, "SHL", 3, 2, 1);
     t.def(0x1c, "SHR", 3, 2, 1);
     t.def(0x1d, "SAR", 3, 2, 1);
+    if (osaka) { t.def(0x1e, "CLZ", 5, 1, 1); }
     t.def(0x20, "KECCAK256", 30, 2, 1);
     // The account-reading opcodes cost nothing statically: EIP-2929 prices them warm or cold, at dispatch.
     t.def(0x30, "ADDRESS", 2, 0, 1);

@@ -17,7 +17,7 @@ import { trieRoot } from "../trie/trie.wac";
 import { BlockEnv, TxEnv, Evm, Message, processMessage, addressBytes } from "../evm/evm.wac";
 import { Outcome } from "../evm/interp.wac";
 import { OpTable } from "../evm/table.wac";
-import { Spec } from "../evm/spec.wac";
+import { Spec, MAX_RLP_BLOCK_SIZE } from "../evm/spec.wac";
 import { precompileAddresses } from "../evm/precompiles.wac";
 import { Transaction, Processed, processTransaction, blobGasPrice, GAS_PER_BLOB } from "../tx/process.wac";
 import { DecodedTx, decodeTransaction } from "../tx/decode.wac";
@@ -155,6 +155,20 @@ export Header? headerOf(Spec spec, Item it, string[] why) {
   return h;
 }
 
+/** A header item's timestamp, its twelfth field: what decides which fork the block is under. */
+export U256 timestampOf(Item header) {
+  if (!isList(header) || itemsOf(header).len() < 12 || isList(itemsOf(header)[11])) { return U256.zero(); }
+  u8[] b = bytesOf(itemsOf(header)[11]);
+  return b.len() > 32 ? U256.zero() : U256.fromBytes(b, 0, b.len());
+}
+
+/** The timestamp of a block from its RLP, zero when it does not get that far — the full decode will say why. */
+export U256 blockTimestamp(u8[] rlpBytes) {
+  Decoded d = decode(rlpBytes);
+  if (!d.ok || !isList(d.item) || itemsOf(d.item).len() < 1) { return U256.zero(); }
+  return timestampOf(itemsOf(d.item)[0]);
+}
+
 /** A block from its RLP: header, transactions, ommers and withdrawals. */
 export BlockDecode decodeBlock(Spec spec, u8[] rlpBytes) {
   Decoded d = decode(rlpBytes);
@@ -227,7 +241,18 @@ export U256 nextBaseFee(Header parent) {
 export U256 nextExcessBlobGas(Spec spec, Header parent) {
   U256 total = parent.excessBlobGas.add(parent.blobGasUsed);
   U256 target = U256.ofU64(spec.targetBlobGasPerBlock as! u64);
-  return total.lt(target) ? U256.zero() : total.sub(target);
+  if (total.lt(target)) { return U256.zero(); }
+  // EIP-7918: while blobs cost less than the execution gas a blob's worth of base fee would, the excess
+  // only grows — by the share of the used blob gas above the target — so the price cannot fall further.
+  if (spec.isOsaka) {
+    U256 execCost = U256.ofU64(8192).mul(parent.baseFee);
+    U256 blobCost = U256.ofU64(131072).mul(blobGasPrice(spec, parent.excessBlobGas));
+    if (execCost.gt(blobCost)) {
+      U256 max = U256.ofU64(spec.maxBlobGasPerBlock as! u64);
+      return parent.excessBlobGas.add(parent.blobGasUsed.mul(max.sub(target)).div(max));
+    }
+  }
+  return total.sub(target);
 }
 
 /** The header's own rules and its relation to its parent's. "" when it may follow it. */
@@ -268,7 +293,7 @@ export static string DEPOSIT_EVENT = "0x649bbc62d0e31342afea4e5cd82d4049e7e1ee91
  */
 Outcome systemCall(Spec spec, World w, BlockEnv env, U256 target, u8[] data) {
   U256 sys = U256.fromHex(SYSTEM_ADDRESS)!;
-  Evm evm = Evm(w, env, TxEnv(sys, U256.zero(), U256[].filled(0, U256.zero())), OpTable.cancun(), spec, null);
+  Evm evm = Evm(w, env, TxEnv(sys, U256.zero(), U256[].filled(0, U256.zero())), spec.table, spec, null);
   w.warmAddress(sys);
   w.warmAddress(target);
   U256[] pre = precompileAddresses(spec);
@@ -351,6 +376,7 @@ export string applyBlock(Spec spec, World w, Block b, Header parent, U256 chainI
   string bad = checkHeader(spec, h, parent);
   if (bad != "") { return bad; }
   if (b.hasOmmers) { return "a block with ommers after the merge"; }
+  if (spec.isOsaka && blockSize(spec, b) > MAX_RLP_BLOCK_SIZE) { return "a block over EIP-7934's size limit"; }
 
   BlockEnv env = BlockEnv(h.coinbase, h.number, h.timestamp, h.gasLimit, h.prevRandao, h.baseFee,
                           blobGasPrice(spec, h.excessBlobGas), chainId, hashes);
@@ -486,6 +512,20 @@ export Body executeBody(Spec spec, World w, BlockEnv env, Header h, Item[] txs, 
   return Body("", included.toArray(), used, blobUsed, fees, blockBloom, U256.fromBytes(indexedRoot(txRaw.toArray()), 0, 32),
               U256.fromBytes(indexedRoot(receipts.toArray()), 0, 32), U256.fromBytes(indexedRoot(wsRaw), 0, 32),
               U256.fromBytes(stateRoot(w), 0, 32), requests, requestsHash);
+}
+
+/** The length of the block's RLP: header, transactions, no ommers, withdrawals. */
+i32 blockSize(Spec spec, Block b) {
+  Item[] ws = Item[].filled(b.withdrawals.len(), Item.Bytes(u8[].filled(0, 0)));
+  for (i32 i = 0; i < ws.len(); i++) {
+    Withdrawal wd = b.withdrawals[i];
+    Item[] fields = [Item.Bytes(u256Bytes(wd.index)), Item.Bytes(u256Bytes(wd.validator)), Item.Bytes(addressBytes(wd.address)),
+                     Item.Bytes(u256Bytes(wd.amount))];
+    ws[i] = Item.List(fields);
+  }
+  Item[] parts = [headerItem(spec, b.header), Item.List(b.txs), Item.List(Item[].filled(0, Item.Bytes(u8[].filled(0, 0)))),
+                  Item.List(ws)];
+  return encode(Item.List(parts)).len();
 }
 
 /** EIP-7685: sha256 over the sha256 of each non-empty request list, its type byte first. */

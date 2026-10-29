@@ -12,19 +12,25 @@ import { ripemd160 } from "../precompiles/ripemd160.wac";
 import { modexp, modexpGas } from "../precompiles/modexp.wac";
 import { blake2f, blake2fRounds } from "../precompiles/blake2f.wac";
 import { ecAdd, ecMul, ecPairing } from "../crypto/bn254.wac";
+import { crypto.p256VerifyDigest } from "wac";
 import { U256 } from "../u256.wac";
 import { Outcome, Halt } from "./interp.wac";
 import { Spec } from "./spec.wac";
 
 export bool isPrecompile(Spec spec, U256 a) {
-  return a.fitsU64() && a.low() >= 1 && a.low() <= spec.lastPrecompile;
+  if (!a.fitsU64()) { return false; }
+  return (a.low() >= 1 && a.low() <= spec.lastPrecompile) || (spec.isOsaka && a.low() == P256VERIFY);
 }
+
+/** EIP-7951's address: the first precompile outside the range the others fill. */
+static u64 P256VERIFY = 0x100;
 
 /** The precompile addresses, which every transaction starts with warm (EIP-2929). */
 export U256[] precompileAddresses(Spec spec) {
   i32 n = spec.lastPrecompile as! i32;
-  U256[] out = U256[].filled(n, U256.zero());
+  U256[] out = U256[].filled(spec.isOsaka ? n + 1 : n, U256.zero());
   for (i32 i = 0; i < n; i++) { out[i] = U256.ofI32(i + 1); }
+  if (spec.isOsaka) { out[n] = U256.ofU64(P256VERIFY); }
   return out;
 }
 
@@ -35,7 +41,7 @@ Outcome charged(i64 gas, i64 cost, u8[] output) {
   return Outcome(Halt.Return(output), gas - cost);
 }
 
-export Outcome runPrecompile(U256 addr, u8[] input, i64 gas) {
+export Outcome runPrecompile(Spec spec, U256 addr, u8[] input, i64 gas) {
   i64 w = words(input.len());
   switch (addr.low() as! i32) {
     case 0x01: {
@@ -52,7 +58,7 @@ export Outcome runPrecompile(U256 addr, u8[] input, i64 gas) {
     }
     case 0x04: { return charged(gas, 15 + 3 * w, input); }
     case 0x05: {
-      i64 cost = modexpGas(input);
+      i64 cost = modexpGas(input, spec.isOsaka);
       if (cost < 0 || cost > gas) { return outOfGas(); }
       return Outcome(Halt.Return(modexp(input)), gas - cost);
     }
@@ -68,6 +74,11 @@ export Outcome runPrecompile(U256 addr, u8[] input, i64 gas) {
       if (rounds > gas) { return outOfGas(); }
       return Outcome(Halt.Return(blake2f(input)), gas - rounds);
     }
+    case 0x100: {
+      // EIP-7951: a bad signature, key or length is an empty answer, not a failure — the gas is paid either way.
+      if (gas < 6900) { return outOfGas(); }
+      return Outcome(Halt.Return(p256verify(input)), gas - 6900);
+    }
     default: { return Outcome(Halt.Failure("precompile 0x\{addr.low() as! i32} is not implemented"), 0); }
   }
 }
@@ -79,4 +90,25 @@ Outcome checked(i64 gas, i64 cost, u8[]? output) {
   if (cost > gas) { return outOfGas(); }
   if (output is null) { return Outcome(Halt.Failure("precompile refused its input"), 0); }
   return Outcome(Halt.Return(output!), gas - cost);
+}
+
+/**
+ * P256VERIFY (EIP-7951): 160 bytes — the digest, r, s and the key's x and y — and 32 bytes ending in 1 when
+ * the signature verifies. wac's verifier applies the EIP's rules itself: r and s in [1, n), the key on the
+ * curve and not at infinity.
+ */
+u8[] p256verify(u8[] input) {
+  u8[] none = u8[].filled(0, 0);
+  if (input.len() != 160) { return none; }
+  u8[] digest = u8[].filled(32, 0);
+  u8[] sig = u8[].filled(64, 0);
+  u8[] key = u8[].filled(65, 0);
+  key[0] = 0x04;
+  for (i32 i = 0; i < 32; i++) { digest[i] = input[i]; }
+  for (i32 i = 0; i < 64; i++) { sig[i] = input[32 + i]; }
+  for (i32 i = 0; i < 64; i++) { key[1 + i] = input[96 + i]; }
+  if (!p256VerifyDigest(key, digest, sig)) { return none; }
+  u8[] out = u8[].filled(32, 0);
+  out[31] = 1;
+  return out;
 }

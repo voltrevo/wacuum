@@ -10,13 +10,16 @@ import { U256 } from "../u256.wac";
 import { mulFull, modLimbs, sigLimbs } from "../limbs.wac";
 
 /** What MODEXP costs for this input, or -1 when no amount of gas could pay for it. */
-export i64 modexpGas(u8[] input) {
+export i64 modexpGas(u8[] input, bool osaka) {
   U256 bl = U256.fromBytes(input, 0, 32);
   U256 el = U256.fromBytes(input, 32, 32);
   U256 ml = U256.fromBytes(input, 64, 32);
   // Anything past 2^32 bytes is unpayable however it is priced; keeping the arithmetic small keeps it exact.
   U256 limit = U256.ofU64(0x100000000);
   if (bl.gt(limit) || ml.gt(limit)) { return -1; }
+  // EIP-7823: from Osaka each length is at most 1024 bytes, and anything longer fails outright.
+  U256 bound = U256.ofU64(1024);
+  if (osaka && (bl.gt(bound) || el.gt(bound) || ml.gt(bound))) { return -1; }
   i64 b = bl.low() as@ i64;
   i64 m = ml.low() as@ i64;
   i64 maxLen = b > m ? b : m;
@@ -24,9 +27,11 @@ export i64 modexpGas(u8[] input) {
   // words^2 overflows past 2^31 words; that much is unpayable too.
   if (words > 0x7FFFFFFF) { return -1; }
   i64 complexity = words * words;
+  // EIP-7883 doubles the quadratic term and puts a floor of 16 under it.
+  if (osaka) { complexity = maxLen <= 32 ? 16 : 2 * words * words; }
   // No base and no modulus cost the minimum whatever the exponent claims, since the product is zero —
   // and the exponent's length is then never read, so it may be anything.
-  if (complexity == 0) { return 200; }
+  if (complexity == 0) { return osaka ? 500 : 200; }
   if (el.gt(limit)) { return -1; }
   i64 e = el.low() as@ i64;
 
@@ -38,12 +43,14 @@ export i64 modexpGas(u8[] input) {
   if (e <= 32) {
     iterations = bits == 0 ? 0 : bits - 1;
   } else {
-    iterations = 8 * (e - 32) + (bits == 0 ? 0 : bits - 1);
+    iterations = (osaka ? 16 : 8) * (e - 32) + (bits == 0 ? 0 : bits - 1);
   }
   if (iterations < 1) { iterations = 1; }
   if (complexity > 0 && iterations > 0x7FFFFFFFFFFFFFFF / complexity) { return -1; }
-  i64 gas = complexity * iterations / 3;
-  return gas < 200 ? 200 : gas;
+  // EIP-7883 drops the division by three and raises the floor from 200 to 500.
+  i64 gas = osaka ? complexity * iterations : complexity * iterations / 3;
+  i64 floor = osaka ? 500 : 200;
+  return gas < floor ? floor : gas;
 }
 
 i64 headBits(U256 v) {

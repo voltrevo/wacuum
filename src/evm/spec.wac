@@ -2,27 +2,89 @@
 // `Spec` rather than comparing fork names, so a fork is a constructor here and a handful of `if`s at the
 // places its EIPs touch.
 
+import { OpTable } from "./table.wac";
+import { U256 } from "../u256.wac";
+
 export struct Spec {
   string name;
   /** EIP-7702 delegation and EIP-7623's calldata floor, which arrive together. */
   bool isPrague;
+  /**
+   * Osaka's execution changes: CLZ (EIP-7939), P256VERIFY at 0x100 (EIP-7951), MODEXP's bounds and price
+   * (EIP-7823, EIP-7883), the transaction gas cap (EIP-7825), the blob base fee's floor (EIP-7918), the
+   * block size limit (EIP-7934) and the per-transaction blob cap (EIP-7594).
+   */
+  bool isOsaka;
   i64 maxBlobGasPerBlock;
   /** EIP-4844's target, which the excess is measured against: half the maximum in Cancun, two thirds in Prague. */
   i64 targetBlobGasPerBlock;
   u64 blobBaseFeeUpdateFraction;
-  /** The precompiles are 0x01 up to this address. */
+  /** The precompiles are 0x01 up to this address (and, from Osaka, P256VERIFY at 0x100). */
   u64 lastPrecompile;
+  /** Each opcode's stack effect and static gas for this fork, built once. */
+  OpTable table;
 
   /** Cancun: six blobs a block and ten precompiles. */
-  Spec cancun() { return Spec("Cancun", false, 786432, 393216, 3338477, 0x0a); }
+  Spec cancun() { return Spec("Cancun", false, false, 786432, 393216, 3338477, 0x0a, OpTable.forFork(false)); }
 
   /** Prague: EIP-7691's nine blobs and new fraction, and EIP-2537's seven BLS12-381 precompiles. */
-  Spec prague() { return Spec("Prague", true, 1179648, 786432, 5007716, 0x11); }
+  Spec prague() { return Spec("Prague", true, false, 1179648, 786432, 5007716, 0x11, OpTable.forFork(false)); }
+
+  /** Osaka: Prague's blob schedule, and the changes `isOsaka` lists. */
+  Spec osaka() { return Spec("Osaka", true, true, 1179648, 786432, 5007716, 0x11, OpTable.forFork(true)); }
 
   /** The spec a fixture names, or null for a fork this client does not run. */
   Spec? byName(string name) {
     if (name == "Cancun") { return Spec.cancun(); }
     if (name == "Prague") { return Spec.prague(); }
-    return null;
+    if (name == "Osaka") { return Spec.osaka(); }
+    return bpo(name);
   }
+}
+
+/** EIP-7825: from Osaka no transaction may ask for more gas than this. */
+export static i64 TX_GAS_LIMIT_CAP = 16777216;
+/** EIP-7594: from Osaka no transaction may carry more blobs than this. */
+export static i32 MAX_BLOBS_PER_TX = 6;
+/** EIP-7934: from Osaka a block's RLP may be no larger than 10 MiB less a 2 MiB margin. */
+export static i32 MAX_RLP_BLOCK_SIZE = 8388608;
+
+/** A fork and the timestamp it activates at. */
+export struct ForkAt {
+  Spec spec;
+  U256 time;
+}
+
+/**
+ * A chain's forks in activation order: each block runs under the last one whose time it has reached. A
+ * chain that starts on one fork and never changes has one entry at time zero.
+ */
+export struct ChainConfig {
+  U256 chainId;
+  ForkAt[] forks;
+
+  ChainConfig single(Spec s, U256 chainId) { return ChainConfig(chainId, [ForkAt(s, U256.zero())]); }
+
+  Spec specAt(this, U256 timestamp) {
+    Spec s = this.forks[0].spec;
+    for (i32 i = 1; i < this.forks.len(); i++) {
+      if (this.forks[i].time.le(timestamp)) { s = this.forks[i].spec; }
+    }
+    return s;
+  }
+}
+
+/** A blob schedule entry applied to a fork: target and maximum in blobs, and the update fraction. */
+export Spec withBlobs(Spec s, string name, u64 target, u64 max, u64 fraction) {
+  return Spec(name, s.isPrague, s.isOsaka, (max * 131072) as@ i64, (target * 131072) as@ i64, fraction, s.lastPrecompile, s.table);
+}
+
+/** BPO1 to BPO5 (EIP-7892): Osaka's rules, and only the blob schedule changed — which the caller supplies. */
+export Spec? bpo(string name) {
+  if (name == "BPO1" || name == "BPO2" || name == "BPO3" || name == "BPO4" || name == "BPO5") {
+    Spec o = Spec.osaka();
+    return withBlobs(o, name, (o.targetBlobGasPerBlock / 131072) as@ u64, (o.maxBlobGasPerBlock / 131072) as@ u64,
+                     o.blobBaseFeeUpdateFraction);
+  }
+  return null;
 }

@@ -237,6 +237,7 @@ Halt? step(Frame f, i32 op) {
     case 0x1b: { U256 s = f.pop(); f.push(f.pop().shl(s.shiftAmount())); }
     case 0x1c: { U256 s = f.pop(); f.push(f.pop().shr(s.shiftAmount())); }
     case 0x1d: { U256 s = f.pop(); f.push(f.pop().sar(s.shiftAmount())); }
+    case 0x1e: { f.push(U256.ofI32(f.pop().leadingZeros())); }
     case 0x20: {
       U256 off = f.pop();
       U256 len = f.pop();

@@ -75,8 +75,8 @@ export async i32 main(Sys sys) {
   }
   Genesis gen = g!;
   gen.header.hash = U256.fromBytes(keccak256(encode(headerItem(gen.spec, gen.header))), 0, 32);
-  Engine e = Engine.create(gen.spec, gen.chainId, gen.header, gen.world);
-  sys.log("wacuum: \{gen.spec.name}, chain \{gen.chainId.toDecimal()}, genesis \{gen.header.hash.toHex()}");
+  Engine e = Engine.create(gen.config, gen.header, gen.world);
+  sys.log("wacuum: \{gen.spec.name}, chain \{gen.config.chainId.toDecimal()}, genesis \{gen.header.hash.toHex()}");
 
   match (await sys.net().listen(addr, port)) {
     Err(err): { sys.warn("wacuum: cannot listen on \{addr}:\{port}: \{err}"); return 1; }

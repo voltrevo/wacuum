@@ -7,6 +7,7 @@ import { json.JsonValue, json.JsonObject } from "wac";
 import { U256 } from "../src/u256.wac";
 import { hexToBytes, bytesToHex } from "../src/hex.wac";
 import { World, Account, hashU256, eqU256 } from "../src/state/world.wac";
+import { Spec, ChainConfig, ForkAt, withBlobs } from "../src/evm/spec.wac";
 
 export U256 num(JsonValue? v) {
   if (v is null) { return U256.zero(); }
@@ -84,3 +85,39 @@ export void diffState(Sys sys, World w, JsonValue? want) {
   }
 }
 
+
+/** A fork as a fixture names it, with the fixture's blob schedule for it applied when it has one. */
+Spec? forkOf(string name, JsonValue? schedule) {
+  Spec? s = Spec.byName(name);
+  if (s is null) { return null; }
+  JsonValue? b = schedule?.member(name);
+  if (b is null) { return s; }
+  return withBlobs(s!, name, num(b!.member("target")).low(), num(b!.member("max")).low(), num(b!.member("baseFeeUpdateFraction")).low());
+}
+
+/**
+ * The chain a fixture's network describes: one fork from genesis, or `XToYAtTime15k` — fork X, then Y
+ * from timestamp 15,000. Null for a network this client does not run.
+ */
+export ChainConfig? configOf(JsonValue test) {
+  string network = test.member("network")?.text() ?? "";
+  JsonValue? config = test.member("config");
+  U256 chainId = config is null ? U256.one() : num(config!.member("chainid"));
+  if (chainId.isZero()) { chainId = U256.one(); }
+  JsonValue? schedule = config?.member("blobSchedule");
+  i32 to = network.indexOf("To");
+  i32 at = network.indexOf("AtTime");
+  if (to < 0 || at < 0) {
+    Spec? s = forkOf(network, schedule);
+    return s is null ? null : ChainConfig.single(s!, chainId);
+  }
+  Spec? a = forkOf(network.slice(0, to), schedule);
+  Spec? b = forkOf(network.slice(to + 2, at), schedule);
+  string time = network.slice(at + 6, network.len());
+  if (a is null || b is null || time.indexOf("k") != time.len() - 1) { return null; }
+  U256 thousands = U256.fromHex("0x0")!;
+  u8[] d = time.slice(0, time.len() - 1).toBytes();
+  for (i32 i = 0; i < d.len(); i++) { thousands = thousands.mul(U256.ofU64(10)).add(U256.ofU64((d[i] - 48) as u64)); }
+  ForkAt[] forks = [ForkAt(a!, U256.zero()), ForkAt(b!, thousands.mul(U256.ofU64(1000)))];
+  return ChainConfig(chainId, forks);
+}

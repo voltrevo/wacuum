@@ -17,9 +17,9 @@ import { U256 } from "../src/u256.wac";
 import { bytesToHex } from "../src/hex.wac";
 import { World, hashU256, eqU256 } from "../src/state/world.wac";
 import { stateRoot } from "../src/state/root.wac";
-import { Spec } from "../src/evm/spec.wac";
-import { Header, Block, BlockDecode, headerOf, decodeBlock, applyBlock } from "../src/chain/block.wac";
-import { num, bytes, worldFrom, diffState } from "./fixture.wac";
+import { Spec, ChainConfig } from "../src/evm/spec.wac";
+import { Header, Block, BlockDecode, headerOf, decodeBlock, applyBlock, blockTimestamp, timestampOf } from "../src/chain/block.wac";
+import { num, bytes, worldFrom, diffState, configOf } from "./fixture.wac";
 
 struct Tally {
   i32 passed;
@@ -30,16 +30,14 @@ struct Tally {
 }
 
 /** One test; "" when it passes, otherwise why not. */
-string runTest(Sys sys, Tally tally, Spec spec, JsonValue test) {
+string runTest(Sys sys, Tally tally, ChainConfig chain, JsonValue test) {
   World w = worldFrom(test.member("pre")!);
-  JsonValue? config = test.member("config");
-  U256 chainId = config is null ? U256.one() : num(config!.member("chainid"));
-  if (chainId.isZero()) { chainId = U256.one(); }
+  U256 chainId = chain.chainId;
 
   Decoded g = decode(bytes(test.member("genesisRLP")));
   if (!g.ok || !isList(g.item)) { return "genesis RLP does not decode"; }
   string[] why = [""];
-  Header? genesis = headerOf(spec, itemsOf(g.item)[0], why);
+  Header? genesis = headerOf(chain.specAt(timestampOf(itemsOf(g.item)[0])), itemsOf(g.item)[0], why);
   if (genesis is null) { return "genesis header: " + why[0]; }
   if (!U256.fromBytes(stateRoot(w), 0, 32).eq(genesis!.stateRoot)) { return "the pre-state does not hash to the genesis state root"; }
 
@@ -50,7 +48,10 @@ string runTest(Sys sys, Tally tally, Spec spec, JsonValue test) {
   for (i32 i = 0; i < blocks.len(); i++) {
     JsonValue b = blocks.get(i);
     bool expectInvalid = b.member("expectException") is not null;
-    BlockDecode d = decodeBlock(spec, bytes(b.member("rlp")));
+    // A block's fork is its timestamp's, so the timestamp is read before the header is decoded for real.
+    u8[] raw = bytes(b.member("rlp"));
+    Spec spec = chain.specAt(blockTimestamp(raw));
+    BlockDecode d = decodeBlock(spec, raw);
     string err = d.error;
     World next = w;
     if (err == "") {
@@ -96,9 +97,9 @@ export async i32 main(Sys sys) {
               JsonValue test = tests.at(i).value;
               if (tally.filter != "" && name.indexOf(tally.filter) < 0) { continue; }
               if ((test.member("network")!.text() ?? "") != tally.fork) { continue; }
-              Spec? spec = Spec.byName(tally.fork);
-              if (spec is null) { continue; }
-              string why = runTest(sys, tally, spec!, test);
+              ChainConfig? chain = configOf(test);
+              if (chain is null) { continue; }
+              string why = runTest(sys, tally, chain!, test);
               if (why == "") {
                 tally.passed++;
               } else {

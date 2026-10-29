@@ -6,11 +6,12 @@
 // is the header import would demand. The consensus client sends it back through `engine_newPayload`, which
 // checks that from scratch.
 
-import { Map } from "core";
+import { Map, Vec } from "core";
 import { crypto.keccak256 } from "wac";
 import { rlp.Item, rlp.encode } from "wac";
 import { U256 } from "../u256.wac";
-import { World } from "../state/world.wac";
+import { World, hashU256, eqU256 } from "../state/world.wac";
+import { decodeTransaction, DecodedTx } from "../tx/decode.wac";
 import { BlockEnv } from "../evm/evm.wac";
 import { Spec } from "../evm/spec.wac";
 import { blobGasPrice } from "../tx/process.wac";
@@ -31,9 +32,7 @@ export struct Built {
 
 /**
  * A block on `parent` from `candidates`, run on `w` — the parent's state, which this changes. The gas
- * limit stays the parent's. A candidate that does not fit, or is not valid on this state, is left out;
- * the candidates are tried until a pass includes nothing new, so a transaction that arrived before the
- * one whose nonce it follows still gets in.
+ * limit stays the parent's. A candidate that does not fit, or is not valid on this state, is left out.
  */
 export Built buildBlock(Spec spec, World w, Header parent, Attributes a, Item[] candidates, U256 chainId, Map<U256, U256> hashes) {
   Header h = Header(parent.hash, U256.fromHex(EMPTY_OMMERS)!, a.feeRecipient, U256.zero(), U256.zero(), U256.zero(),
@@ -42,9 +41,7 @@ export Built buildBlock(Spec spec, World w, Header parent, Attributes a, Item[] 
                     U256.zero(), nextExcessBlobGas(spec, parent), a.parentBeaconBlockRoot, U256.zero(), U256.zero());
   BlockEnv env = BlockEnv(h.coinbase, h.number, h.timestamp, h.gasLimit, h.prevRandao, h.baseFee,
                           blobGasPrice(spec, h.excessBlobGas), chainId, hashes);
-  // Order the candidates by repeated passes on a scratch copy, then run the chosen order for real: the
-  // scratch runs would otherwise leave their system calls and transactions applied twice.
-  Item[] order = orderCandidates(spec, w, env, h, candidates, a.withdrawals);
+  Item[] order = orderCandidates(candidates, chainId);
   Body body = executeBody(spec, w, env, h, order, a.withdrawals, true);
   h.gasUsed = U256.ofU64(body.gasUsed as! u64);
   h.blobGasUsed = U256.ofU64(body.blobGasUsed as! u64);
@@ -58,36 +55,43 @@ export Built buildBlock(Spec spec, World w, Header parent, Attributes a, Item[] 
   return Built(Block(h, body.included, false, a.withdrawals), body);
 }
 
-/** The candidates in an order that includes as many as will go: whatever each pass took, then the rest again. */
-Item[] orderCandidates(Spec spec, World w, BlockEnv env, Header h, Item[] candidates, Withdrawal[] withdrawals) {
-  Item[] chosen = Item[].filled(0, Item.Bytes(u8[].filled(0, 0)));
-  Item[] left = candidates;
-  while (left.len() > 0) {
-    Item[] attempt = concat(chosen, left);
-    Body b = executeBody(spec, w.clone(), env, h, attempt, withdrawals, true);
-    if (b.included.len() == chosen.len()) { break; }
-    chosen = b.included;
-    // What did not get in this time may now follow something that did.
-    Item[] rest = Item[].filled(0, Item.Bytes(u8[].filled(0, 0)));
-    for (i32 i = 0; i < left.len(); i++) {
-      if (!contains(chosen, left[i])) { rest = concat(rest, [left[i]]); }
+/**
+ * The candidates grouped by sender, in the order each sender first appeared, and each sender's sorted by
+ * nonce — so a transaction that arrived before the one whose nonce it follows still gets in. One pass of
+ * `executeBody` over that order then includes everything that can be.
+ */
+Item[] orderCandidates(Item[] candidates, U256 chainId) {
+  Vec<U256> senders = Vec.create();
+  Map<U256, Vec<i32>> bySender = Map.create(hashU256, eqU256);
+  U256[] nonces = U256[].filled(candidates.len(), U256.zero());
+  for (i32 i = 0; i < candidates.len(); i++) {
+    DecodedTx d = decodeTransaction(candidates[i], chainId);
+    if (d.error != "") { continue; }
+    nonces[i] = d.tx.nonce;
+    Vec<i32>? group = bySender.get(d.tx.sender);
+    if (group is null) {
+      Vec<i32> fresh = Vec.create();
+      bySender.set(d.tx.sender, fresh);
+      senders.push(d.tx.sender);
+      group = fresh;
     }
-    if (rest.len() == left.len()) { break; }
-    left = rest;
+    group!.push(i);
   }
-  return chosen;
-}
-
-Item[] concat(Item[] a, Item[] b) {
-  Item[] out = Item[].filled(a.len() + b.len(), Item.Bytes(u8[].filled(0, 0)));
-  for (i32 i = 0; i < a.len(); i++) { out[i] = a[i]; }
-  for (i32 i = 0; i < b.len(); i++) { out[a.len() + i] = b[i]; }
-  return out;
-}
-
-bool contains(Item[] xs, Item x) {
-  for (i32 i = 0; i < xs.len(); i++) {
-    if (xs[i] is x) { return true; }
+  Vec<Item> out = Vec.create();
+  U256[] order = senders.toArray();
+  for (i32 s = 0; s < order.len(); s++) {
+    i32[] idx = bySender.get(order[s])!.toArray();
+    // Insertion sort by nonce: a sender's pending transactions are few.
+    for (i32 a = 1; a < idx.len(); a++) {
+      i32 v = idx[a];
+      i32 b = a - 1;
+      while (b >= 0 && nonces[idx[b]].gt(nonces[v])) {
+        idx[b + 1] = idx[b];
+        b--;
+      }
+      idx[b + 1] = v;
+    }
+    for (i32 k = 0; k < idx.len(); k++) { out.push(candidates[idx[k]]); }
   }
-  return false;
+  return out.toArray();
 }

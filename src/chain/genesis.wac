@@ -11,12 +11,14 @@ import { hexToBytes } from "../hex.wac";
 import { World, Account } from "../state/world.wac";
 import { stateRoot } from "../state/root.wac";
 import { emptyRoot } from "../trie/trie.wac";
-import { Spec } from "../evm/spec.wac";
+import { Vec } from "core";
+import { Spec, ChainConfig, ForkAt, withBlobs } from "../evm/spec.wac";
 import { Header, EMPTY_OMMERS } from "./block.wac";
 
 export struct Genesis {
+  ChainConfig config;
+  /** The fork the genesis block itself is under, which decides its header's shape. */
   Spec spec;
-  U256 chainId;
   Header header;
   World world;
 }
@@ -59,18 +61,32 @@ export Genesis? genesisFrom(JsonValue g, string[] why) {
   }
   U256 chainId = field(config!, "chainId", U256.one());
   U256 timestamp = field(g, "timestamp", U256.zero());
-  // The fork at genesis decides the header's shape. Forks scheduled later are not followed yet.
-  JsonValue? prague = config!.member("pragueTime");
-  JsonValue? cancun = config!.member("cancunTime");
-  Spec spec;
-  if (prague is not null && field(config!, "pragueTime", U256.max()).le(timestamp)) {
-    spec = Spec.prague();
-  } else if (cancun is not null && field(config!, "cancunTime", U256.max()).le(timestamp)) {
-    spec = Spec.cancun();
-  } else {
-    why[0] = "the chain is not on Cancun or Prague at genesis";
+  // Each fork from Cancun on, at the time the config gives it; a fork with no time is not scheduled.
+  string[] names = ["Cancun", "Prague", "Osaka", "BPO1", "BPO2", "BPO3", "BPO4", "BPO5"];
+  string[] keys = ["cancunTime", "pragueTime", "osakaTime", "bpo1Time", "bpo2Time", "bpo3Time", "bpo4Time", "bpo5Time"];
+  string[] schedule = ["cancun", "prague", "osaka", "bpo1", "bpo2", "bpo3", "bpo4", "bpo5"];
+  Vec<ForkAt> forks = Vec.create();
+  for (i32 i = 0; i < names.len(); i++) {
+    JsonValue? t = config!.member(keys[i]);
+    if (t is null || t!.isNull()) { continue; }
+    Spec s = Spec.byName(names[i])!;
+    JsonValue? b = config!.member("blobSchedule")?.member(schedule[i]);
+    if (b is not null) {
+      s = withBlobs(s, names[i], field(b!, "target", U256.zero()).low(), field(b!, "max", U256.zero()).low(),
+                    field(b!, "baseFeeUpdateFraction", U256.zero()).low());
+    }
+    forks.push(ForkAt(s, field(config!, keys[i], U256.zero())));
+  }
+  if (forks.len() == 0) {
+    why[0] = "the config schedules none of Cancun, Prague and Osaka";
     return null;
   }
+  ChainConfig chain = ChainConfig(chainId, forks.toArray());
+  if (chain.forks[0].time.gt(timestamp)) {
+    why[0] = "the chain is not on Cancun or later at genesis";
+    return null;
+  }
+  Spec spec = chain.specAt(timestamp);
 
   World w = World.create();
   JsonValue? alloc = g.member("alloc");
@@ -107,5 +123,5 @@ export Genesis? genesisFrom(JsonValue g, string[] why) {
                     field(g, "excessBlobGas", U256.zero()), U256.zero(),
                     // EIP-7685's hash of no requests at all: sha256 of nothing.
                     U256.fromBytes(sha256(u8[].filled(0, 0)), 0, 32), U256.zero());
-  return Genesis(spec, chainId, h, w);
+  return Genesis(chain, spec, h, w);
 }
