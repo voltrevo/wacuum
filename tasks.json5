@@ -14,5 +14,5 @@
   // Block building, rebuilding every engine fixture's payloads from the mempool.
   buildtests: "sh tools/buildtests.sh",
   // The node, as one executable file.
-  build: "wac app --allow-read --allow-net cmd/wacuum.wac -o dist/wacuum",
+  build: "wac app --allow-read --allow-write --allow-net cmd/wacuum.wac -o dist/wacuum",
 }

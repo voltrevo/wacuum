@@ -18,7 +18,7 @@
 import { Map, Vec } from "core";
 import { crypto.keccak256, crypto.sha256 } from "wac";
 import { json.JsonValue, json.JsonObject, json.JsonArray } from "wac";
-import { rlp.Item, rlp.encode, rlp.decode, rlp.Decoded } from "wac";
+import { rlp.Item, rlp.encode, rlp.decode, rlp.Decoded, rlp.bytesOf, rlp.itemsOf, rlp.isList } from "wac";
 import { U256 } from "../u256.wac";
 import { hexToBytes, bytesToHex } from "../hex.wac";
 import { World, ChangeSet, hashU256, eqU256 } from "../state/world.wac";
@@ -29,7 +29,7 @@ import { Outcome } from "../evm/interp.wac";
 import { OpTable } from "../evm/table.wac";
 import { blobGasPrice } from "../tx/process.wac";
 import { Spec, ChainConfig } from "../evm/spec.wac";
-import { Header, Block, Withdrawal, applyBlock, headerItem, nextBaseFee, nextExcessBlobGas, EMPTY_OMMERS, requestsHashOf,
+import { Header, Block, Withdrawal, applyBlock, encodeBlock, decodeBlock, BlockDecode, blockTimestamp, headerItem, nextBaseFee, nextExcessBlobGas, EMPTY_OMMERS, requestsHashOf,
          indexedRoot } from "../chain/block.wac";
 import { decodeTransaction, DecodedTx } from "../tx/decode.wac";
 import { Attributes, Built, buildBlock } from "../chain/build.wac";
@@ -43,6 +43,17 @@ import { Sidecar, Unwrapped, unwrap, sidecarsFit, CELLS_PER_BLOB } from "./blobs
 struct Node {
   Header header;
   ChangeSet? changes;
+}
+
+/** The log's two kinds of record, each `rlp([kind, ...])`: a block's RLP, and a fork choice's three hashes. */
+static u8 RECORD_BLOCK = 1;
+static u8 RECORD_CHOICE = 2;
+
+/** What replaying a log came to: how many bytes of it were whole records, and how many blocks. */
+export struct Replayed {
+  i32 good;
+  i32 blocks;
+  string error;
 }
 
 /** A JSON-RPC answer: a result, or an error with its code. */
@@ -84,11 +95,18 @@ export struct Engine {
    * set it, and their payloads' blobs bundles are then short of those blobs.
    */
   bool sidecarsOptional;
+  /** The finalized block `forgetBelowFinalized` last pruned for. */
+  U256 forgottenAt;
+  /**
+   * What this engine has done that a restart must redo, as records for the node to append to its log
+   * before it answers: each block imported, and each fork choice. `replay` reads them back.
+   */
+  Vec<u8[]> records;
 
   /** An engine whose chain starts at `genesis`, with `world` its state. */
   Engine create(ChainConfig config, Header genesis, World world) {
     Engine e = Engine(config, config.chainId, Map.create(hashU256, eqU256), Map.create(hashU256, eqU256), genesis.hash, genesis.hash,
-                      genesis.hash, Vec.create(), Map.create(hashU256, eqU256), 1, world, genesis.hash, Map.create(hashU256, eqU256), false);
+                      genesis.hash, Vec.create(), Map.create(hashU256, eqU256), 1, world, genesis.hash, Map.create(hashU256, eqU256), false, U256.zero(), Vec.create());
     e.blocks.set(genesis.hash, Node(genesis, null));
     e.canonical.set(genesis.number, genesis.hash);
     return e;
@@ -214,12 +232,17 @@ export struct Engine {
       if (!same) { return this.invalidNoAncestor("the versioned hashes do not match the transactions'"); }
     }
 
+    return this.importBlock(spec, Block(h, txs.toArray(), false, withdrawals));
+  }
+
+  /** Execute a block on its parent's state and keep it: VALID, INVALID, or SYNCING without the parent. */
+  Answer importBlock(this, Spec spec, Block b) {
+    Header h = b.header;
     if (this.blocks.has(h.hash)) { return status("VALID", h.hash.toHex(), ""); }
     Node? parent = this.blocks.get(h.parentHash);
     if (parent is null) { return status("SYNCING", "", ""); }
     // A parent this client has but cannot reach the state of is on a fork that finality has ruled out.
     if (!this.moveTo(h.parentHash)) { return status("SYNCING", "", ""); }
-    Block b = Block(h, txs.toArray(), false, withdrawals);
     this.world.record();
     string err = applyBlock(spec, this.world, b, parent!.header, this.chainId, this.ancestorHashes(parent!.header));
     ChangeSet cs = this.world.seal();
@@ -229,6 +252,7 @@ export struct Engine {
     }
     this.blocks.set(h.hash, Node(h, cs));
     this.at = h.hash;
+    this.records.push(encode(Item.List([Item.Bytes([RECORD_BLOCK]), Item.Bytes(encodeBlock(spec, b))])));
     return status("VALID", h.hash.toHex(), "");
   }
 
@@ -292,22 +316,9 @@ export struct Engine {
     if (ps.len() < 1 || ps.get(0).object() is null) { return Answer.error(-32602, "no forkchoice state"); }
     JsonValue fc = ps.get(0);
     U256 head = hexU256(fc.member("headBlockHash"));
-    if (!this.blocks.has(head)) { return Answer.ok(forkchoiceResult(status("SYNCING", "", "").result!)); }
-    this.head = head;
-    this.safe = hexU256(fc.member("safeBlockHash"));
-    this.finalized = hexU256(fc.member("finalizedBlockHash"));
-    // Walk back from the new head, rewriting the canonical number-to-hash map until it agrees.
-    Header cur = this.blocks.get(head)!.header;
-    while (true) {
-      U256? known = this.canonical.get(cur.number);
-      if (known is not null && known!.eq(cur.hash)) { break; }
-      this.canonical.set(cur.number, cur.hash);
-      Node? p = this.blocks.get(cur.parentHash);
-      if (p is null) { break; }
-      cur = p!.header;
+    if (!this.choose(head, hexU256(fc.member("safeBlockHash")), hexU256(fc.member("finalizedBlockHash")))) {
+      return Answer.ok(forkchoiceResult(status("SYNCING", "", "").result!));
     }
-    this.prune();
-    this.forgetBelowFinalized();
     JsonValue payloadId = JsonValue.Null;
     if (ps.len() >= 2 && ps.get(1).object() is not null) {
       JsonValue at = ps.get(1);
@@ -338,13 +349,43 @@ export struct Engine {
     return Answer.ok(JsonValue.Object(o));
   }
 
+  /** The bookkeeping of a fork choice: false, changing nothing, when the head is not a block this has. */
+  bool choose(this, U256 head, U256 safe, U256 finalized) {
+    if (!this.blocks.has(head)) { return false; }
+    if (!(head.eq(this.head) && safe.eq(this.safe) && finalized.eq(this.finalized))) {
+      this.records.push(encode(Item.List([Item.Bytes([RECORD_CHOICE]), Item.Bytes(head.toBytes()), Item.Bytes(safe.toBytes()),
+                                          Item.Bytes(finalized.toBytes())])));
+    }
+    this.head = head;
+    this.safe = safe;
+    this.finalized = finalized;
+    // Walk back from the new head, rewriting the canonical number-to-hash map until it agrees.
+    Header cur = this.blocks.get(head)!.header;
+    while (true) {
+      U256? known = this.canonical.get(cur.number);
+      if (known is not null && known!.eq(cur.hash)) { break; }
+      this.canonical.set(cur.number, cur.hash);
+      Node? p = this.blocks.get(cur.parentHash);
+      if (p is null) { break; }
+      cur = p!.header;
+    }
+    this.prune();
+    this.forgetBelowFinalized();
+    return true;
+  }
+
   /**
    * Nothing at or below the finalized block can be reorganised away, so the change sets of the canonical
-   * blocks there are dropped, and so are the blocks of forks that branch off below it.
+   * blocks there are dropped, and so are the blocks of forks that branch off below it. Canonical blocks more
+   * than 256 below it go too: BLOCKHASH reaches 256 back from a head that is never below the finalized
+   * block, and nothing else looks further. This runs when finality moves, so the blocks held stay about the
+   * unfinalized ones and 256 more.
    */
   void forgetBelowFinalized(this) {
+    if (this.finalized.eq(this.forgottenAt)) { return; }
     Node? f = this.blocks.get(this.finalized);
     if (f is null) { return; }
+    this.forgottenAt = this.finalized;
     this.moveTo(this.head);
     U256 fin = f!.header.number;
     U256[] hashes = this.blocks.keys();
@@ -352,7 +393,8 @@ export struct Engine {
       Node n = this.blocks.get(hashes[i])!;
       if (n.header.number.gt(fin)) { continue; }
       U256? c = this.canonical.get(n.header.number);
-      if (c is not null && c!.eq(hashes[i])) {
+      bool canonical = c is not null && c!.eq(hashes[i]);
+      if (canonical && n.header.number.add(U256.ofU64(256)).gt(fin)) {
         n.changes = null;
       } else if (!hashes[i].eq(this.at)) {
         this.blocks.remove(hashes[i]);
@@ -574,11 +616,70 @@ export struct Engine {
     return Answer.ok(JsonValue.Array(out));
   }
 
+  /**
+   * Redo a log of `records`, written by an earlier run on the same genesis. A record cut short — the
+   * process stopped while appending it — ends the replay there, and `good` says how much of the log to
+   * keep. A record that is whole and does not apply is an error: the log is not this chain's.
+   */
+  Replayed replay(this, u8[] log) {
+    i32 at = 0;
+    i32 blocks = 0;
+    while (at < log.len()) {
+      i32 n = rlpLength(log, at);
+      if (n < 0) { break; }
+      u8[] rec = u8[].filled(n, 0);
+      for (i32 i = 0; i < n; i++) { rec[i] = log[at + i]; }
+      Decoded d = decode(rec);
+      if (!d.ok || !isList(d.item) || itemsOf(d.item).len() < 2) { return Replayed(at, blocks, "record at byte \{at} is malformed"); }
+      Item[] f = itemsOf(d.item);
+      u8[] kind = bytesOf(f[0]);
+      if (kind.len() == 1 && kind[0] == RECORD_BLOCK) {
+        u8[] raw = bytesOf(f[1]);
+        Spec spec = this.config.specAt(blockTimestamp(raw));
+        BlockDecode bd = decodeBlock(spec, raw);
+        if (bd.block is null) { return Replayed(at, blocks, "block at byte \{at}: \{bd.error}"); }
+        Answer a = this.importBlock(spec, bd.block!);
+        string st = a.result!.member("status")!.text()!;
+        if (st != "VALID") { return Replayed(at, blocks, "block at byte \{at} is \{st} on replay"); }
+        blocks++;
+      } else if (kind.len() == 1 && kind[0] == RECORD_CHOICE && f.len() == 4) {
+        U256 head = U256.fromBytes(bytesOf(f[1]), 0, 32);
+        if (!this.choose(head, U256.fromBytes(bytesOf(f[2]), 0, 32), U256.fromBytes(bytesOf(f[3]), 0, 32))) {
+          return Replayed(at, blocks, "fork choice at byte \{at} names a block the log has not");
+        }
+      } else {
+        return Replayed(at, blocks, "record at byte \{at} is of no kind this knows");
+      }
+      at += n;
+    }
+    // What was replayed is already in the log.
+    this.records = Vec.create();
+    return Replayed(at, blocks, "");
+  }
+
   /** The state at the head of the chain. */
   World headState(this) {
     this.moveTo(this.head);
     return this.world;
   }
+}
+
+/** The length of the RLP item starting at `at`, header included, or −1 if `b` ends before it does. */
+i32 rlpLength(u8[] b, i32 at) {
+  if (at >= b.len()) { return -1; }
+  i32 p = b[at] as i32;
+  i64 n = 0;
+  if (p < 0x80) { n = 1; }
+  else if (p < 0xb8) { n = 1 + (p - 0x80) as i64; }
+  else if (p < 0xc0 || (p >= 0xf8)) {
+    i32 ll = p < 0xc0 ? p - 0xb7 : p - 0xf7;
+    if (at + ll >= b.len()) { return -1; }
+    i64 len = 0;
+    for (i32 i = 0; i < ll; i++) { len = len * 256 + (b[at + 1 + i] as i64); }
+    n = 1 + (ll as i64) + len;
+  } else { n = 1 + (p - 0xc0) as i64; }
+  if ((at as i64) + n > (b.len() as i64)) { return -1; }
+  return n as! i32;
 }
 
 // ── JSON helpers ─────────────────────────────────────────────────────────────────

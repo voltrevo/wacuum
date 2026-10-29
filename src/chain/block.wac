@@ -514,8 +514,11 @@ export Body executeBody(Spec spec, World w, BlockEnv env, Header h, Item[] txs, 
               U256.fromBytes(stateRoot(w), 0, 32), requests, requestsHash);
 }
 
-/** The length of the block's RLP: header, transactions, no ommers, withdrawals. */
-i32 blockSize(Spec spec, Block b) {
+/** The length of the block's RLP. */
+i32 blockSize(Spec spec, Block b) { return encodeBlock(spec, b).len(); }
+
+/** The block's RLP: header, transactions, no ommers, withdrawals — what `decodeBlock` reads back. */
+export u8[] encodeBlock(Spec spec, Block b) {
   Item[] ws = Item[].filled(b.withdrawals.len(), Item.Bytes(u8[].filled(0, 0)));
   for (i32 i = 0; i < ws.len(); i++) {
     Withdrawal wd = b.withdrawals[i];
@@ -525,7 +528,7 @@ i32 blockSize(Spec spec, Block b) {
   }
   Item[] parts = [headerItem(spec, b.header), Item.List(b.txs), Item.List(Item[].filled(0, Item.Bytes(u8[].filled(0, 0)))),
                   Item.List(ws)];
-  return encode(Item.List(parts)).len();
+  return encode(Item.List(parts));
 }
 
 /** EIP-7685: sha256 over the sha256 of each non-empty request list, its type byte first. */

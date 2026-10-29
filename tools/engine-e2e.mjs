@@ -1,6 +1,7 @@
 // Drive a running wacuum over HTTP the way a consensus client would, from one engine fixture: write the
 // fixture's pre-state as a geth genesis.json, start `wacuum` on it, then send each payload with a fresh
-// HS256 JWT and check every answer — and that a request without a token is refused.
+// HS256 JWT and check every answer — and that a request without a token is refused. Then stop it, start it
+// again on the same data directory, and check the state it replayed against the fixture's post-state.
 //
 //     WAC=path/to/native/wac node tools/engine-e2e.mjs FIXTURE.json [TEST-NAME-SUBSTRING]
 //
@@ -19,7 +20,8 @@ const g = t.genesisBlockHeader;
 const fork = t.network;
 const dir = mkdtempSync(join(tmpdir(), "wacuum-e2e-"));
 const genesis = {
-  config: { chainId: parseInt(t.config.chainid, 16), cancunTime: 0, ...(fork === "Prague" ? { pragueTime: 0 } : {}) },
+  config: { chainId: parseInt(t.config.chainid, 16), cancunTime: 0, ...(fork !== "Cancun" ? { pragueTime: 0 } : {}),
+            ...(fork === "Osaka" ? { osakaTime: 0 } : {}) },
   alloc: t.pre, coinbase: g.coinbase, difficulty: g.difficulty, extraData: g.extraData, gasLimit: g.gasLimit,
   nonce: g.nonce, mixHash: g.mixHash, timestamp: g.timestamp, parentHash: g.parentHash, number: g.number,
   baseFeePerGas: g.baseFeePerGas, excessBlobGas: g.excessBlobGas, blobGasUsed: g.blobGasUsed,
@@ -29,13 +31,18 @@ writeFileSync(join(dir, "genesis.json"), JSON.stringify(genesis));
 writeFileSync(join(dir, "jwt.hex"), secret.toString("hex") + "\n");
 const port = 18551 + Math.floor(Math.random() * 1000);
 
-const node = spawn(process.env.WAC ?? "wac", ["run", "--allow-read", "--allow-net", "cmd/wacuum.wac", "--",
-  "--genesis", join(dir, "genesis.json"), "--jwt-secret", join(dir, "jwt.hex"), "--port", String(port)]);
-let out = "";
-node.stdout.on("data", (d) => { out += d; process.stdout.write("  wacuum| " + d); });
-node.stderr.on("data", (d) => process.stdout.write("  wacuum! " + d));
+let node, out;
 const until = async (f) => { for (let i = 0; i < 600 && !f(); i++) await new Promise((r) => setTimeout(r, 100)); };
-await until(() => out.includes("Engine API on"));
+const start = async () => {
+  out = "";
+  node = spawn(process.env.WAC ?? "wac", ["run", "--allow-read", "--allow-write", "--allow-net", "cmd/wacuum.wac", "--",
+    "--genesis", join(dir, "genesis.json"), "--jwt-secret", join(dir, "jwt.hex"), "--datadir", join(dir, "data"),
+    "--port", String(port)]);
+  node.stdout.on("data", (d) => { out += d; process.stdout.write("  wacuum| " + d); });
+  node.stderr.on("data", (d) => process.stdout.write("  wacuum! " + d));
+  await until(() => out.includes("Engine API on"));
+};
+await start();
 if (!out.includes(`genesis ${g.hash}`)) { console.log(`FAIL genesis hash: want ${g.hash}`); node.kill(); process.exit(1); }
 
 const b64 = (o) => Buffer.from(JSON.stringify(o)).toString("base64url");
@@ -68,6 +75,12 @@ for (const [i, p] of t.engineNewPayloads.entries()) {
     check(f.body.result?.payloadStatus?.status === "VALID", `forkchoice to payload ${i + 1}`);
   }
 }
+// Stop it, and start it again on what it wrote: everything below is answered from the replayed log.
+const exited = new Promise((r) => node.on("exit", r));
+node.kill();
+await exited;
+await start();
+check(out.includes("replayed"), "the restarted node replayed its log");
 const last = t.engineNewPayloads.filter((p) => !p.validationError && !p.errorCode).at(-1);
 const n = (await rpc("eth_blockNumber", [])).body.result;
 check(!last || n === last.params[0].blockNumber, `eth_blockNumber is ${n}`);

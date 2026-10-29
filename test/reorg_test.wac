@@ -4,7 +4,7 @@
 
 import { json.JsonValue, json.JsonObject, json.JsonArray } from "wac";
 import { U256 } from "../src/u256.wac";
-import { Engine, Answer } from "../src/engine/engine.wac";
+import { Engine, Answer, Replayed } from "../src/engine/engine.wac";
 import { engineFor, str, one } from "./chainkit.wac";
 import { Check } from "./check.wac";
 
@@ -103,5 +103,30 @@ export string test_the_world_follows_the_head_across_forks() {
   t.eqU256(balanceAt(e, a3, TO), U256.ofI32(2), "A3 is where it was");
   U256 a4 = extend(t, e, a3, 48, "0x00000000000000000000000000000000000000aa");
   t.ok(!a4.isZero(), "and A goes on");
+
+  // Everything above, replayed from its records into a fresh engine, ends in the same place.
+  i32 total = 0;
+  for (i32 i = 0; i < e.records.len(); i++) { total += e.records.get(i).len(); }
+  u8[] log = u8[].filled(total, 0);
+  i32 at = 0;
+  for (i32 i = 0; i < e.records.len(); i++) {
+    u8[] r = e.records.get(i);
+    for (i32 k = 0; k < r.len(); k++) { log[at + k] = r[k]; }
+    at += r.len();
+  }
+  Engine again = engineFor("\"cancunTime\": 0, \"pragueTime\": 0")!;
+  Replayed rp = again.replay(log);
+  t.eqStr(rp.error, "", "the log replays");
+  t.ok(rp.blocks == 6 && rp.good == log.len(), "all six blocks, all of the log");
+  t.eqU256(again.head, e.head, "to the same head");
+  t.eqU256(again.finalized, e.finalized, "with the same finalized block");
+  t.eqU256(balanceAt(again, a4, TO), U256.ofI32(2), "and the same state");
+
+  // A record cut short is where replay stops, with what came before it kept.
+  Engine cut = engineFor("\"cancunTime\": 0, \"pragueTime\": 0")!;
+  u8[] torn = u8[].filled(log.len() - 5, 0);
+  for (i32 i = 0; i < torn.len(); i++) { torn[i] = log[i]; }
+  Replayed rc = cut.replay(torn);
+  t.ok(rc.error == "" && rc.good < torn.len() && rc.good > 0, "a torn tail is left off");
   return t.report();
 }

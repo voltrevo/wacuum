@@ -1,34 +1,44 @@
 // wacuum: the execution client, serving the Engine API to a consensus client.
 //
-//     wac run --allow-read --allow-net cmd/wacuum.wac -- --genesis genesis.json --jwt-secret jwt.hex [--port 8551]
+//     wac run --allow-read --allow-write --allow-net cmd/wacuum.wac -- --genesis genesis.json --jwt-secret jwt.hex \
+//         [--datadir DIR] [--port 8551]
 //
 // It starts from a geth-format genesis, listens on 127.0.0.1 (the Engine API is for a consensus client on
-// the same machine, and is not meant to face a network), and executes whatever payloads it is sent. State
-// lives in memory and is gone when the process stops: persistence is the next step.
+// the same machine, and is not meant to face a network), and executes whatever payloads it is sent.
+//
+// With `--datadir`, it keeps `chain.log` there: every block it imports and every fork choice, appended
+// before the answer that reports it goes out, so a block this node has called VALID is one it still has
+// after a restart. Starting, it replays the log onto the genesis. That re-executes the chain, which is
+// simple and slow to start for a long one; a state snapshot to start from is the obvious next step. The
+// append is a write the operating system has taken, not one it has flushed to the disk, so a crash of the
+// process loses nothing and a crash of the machine may lose the last few records.
 
-import { Sys } from "std";
+import { Sys, Output } from "std";
+import { Vec } from "core";
 import { json.parse } from "wac";
 import { rlp.encode } from "wac";
 import { crypto.keccak256 } from "wac";
 import { U256 } from "../src/u256.wac";
 import { hexToBytes } from "../src/hex.wac";
 import { Genesis, genesisFrom } from "../src/chain/genesis.wac";
-import { Engine } from "../src/engine/engine.wac";
+import { Engine, Replayed } from "../src/engine/engine.wac";
 import { headerItem } from "../src/chain/block.wac";
 import { HttpRequest, headersEnd, parseHead, answerHttp } from "../src/engine/rpc.wac";
 
-string usage() { return "usage: wacuum --genesis FILE --jwt-secret FILE [--addr 127.0.0.1] [--port 8551]"; }
+string usage() { return "usage: wacuum --genesis FILE --jwt-secret FILE [--datadir DIR] [--addr 127.0.0.1] [--port 8551]"; }
 
 export async i32 main(Sys sys) {
   string[] args = sys.args();
   string genesisPath = "";
   string secretPath = "";
   string addr = "127.0.0.1";
+  string datadir = "";
   i32 port = 8551;
   for (i32 i = 0; i + 1 < args.len(); i += 2) {
     if (args[i] == "--genesis") { genesisPath = args[i + 1]; }
     else if (args[i] == "--jwt-secret") { secretPath = args[i + 1]; }
     else if (args[i] == "--addr") { addr = args[i + 1]; }
+    else if (args[i] == "--datadir") { datadir = args[i + 1]; }
     else if (args[i] == "--port") {
       i32 n = 0;
       u8[] d = args[i + 1].toBytes();
@@ -77,6 +87,44 @@ export async i32 main(Sys sys) {
   gen.header.hash = U256.fromBytes(keccak256(encode(headerItem(gen.spec, gen.header))), 0, 32);
   Engine e = Engine.create(gen.config, gen.header, gen.world);
   sys.log("wacuum: \{gen.spec.name}, chain \{gen.config.chainId.toDecimal()}, genesis \{gen.header.hash.toHex()}");
+
+  Output? log = null;
+  if (datadir != "") {
+    string path = datadir + "/chain.log";
+    await sys.files().mkdir(datadir, true);
+    bool exists = false;
+    match (await sys.files().stat(path)) {
+      Ok(st): { exists = st.exists; }
+      Err(e): {}
+    }
+    if (exists) {
+      match (await sys.readFile(path)) {
+        Err(e): { sys.warn("wacuum: \{path}: \{e}"); return 1; }
+        Ok(bytes): {
+          Replayed r = e.replay(bytes);
+          if (r.error != "") {
+            sys.warn("wacuum: \{path} does not replay on this genesis: \{r.error}");
+            return 1;
+          }
+          if (r.good < bytes.len()) {
+            // The last record was cut short when the process stopped; the log goes on from before it.
+            u8[] keep = u8[].filled(r.good, 0);
+            for (i32 i = 0; i < keep.len(); i++) { keep[i] = bytes[i]; }
+            match (await sys.writeFile(path, keep)) {
+              Err(err): { sys.warn("wacuum: \{path}: \{err}"); return 1; }
+              Ok(_): {}
+            }
+            sys.warn("wacuum: dropped \{bytes.len() - r.good} bytes of a record cut short at the end of \{path}");
+          }
+          sys.log("wacuum: replayed \{r.blocks} blocks from \{path}; head \{e.head.toHex()}");
+        }
+      }
+    }
+    match (await sys.files().openAppend(path)) {
+      Err(err): { sys.warn("wacuum: \{path}: \{err}"); return 1; }
+      Ok(out): { log = out; }
+    }
+  }
 
   match (await sys.net().listen(addr, port)) {
     Err(err): { sys.warn("wacuum: cannot listen on \{addr}:\{port}: \{err}"); return 1; }
@@ -127,7 +175,18 @@ export async i32 main(Sys sys) {
               for (i32 i = 0; i < body.len(); i++) { body[i] = buf[end + i]; }
               rq.body = body;
               i64 now = (await sys.clock().nowMillis()).orElse(0 as i64) / 1000;
-              await sock.send(answerHttp(e, rq, secret, now));
+              u8[] answer = answerHttp(e, rq, secret, now);
+              // What the answer reports goes to the log first.
+              for (i32 i = 0; i < e.records.len(); i++) {
+                if (log is not null) {
+                  match (await log!.write(e.records.get(i))) {
+                    Err(err): { sys.warn("wacuum: the chain log cannot be written: \{err}"); return 1; }
+                    Ok(_): {}
+                  }
+                }
+              }
+              e.records = Vec.create();
+              await sock.send(answer);
             }
             sock.close();
           }
