@@ -54,8 +54,8 @@ nonce whose bytes are not a palindrome, and ethers' `getCreateAddress` showed it
 - `fn` is a keyword (it spells function types), so a local cannot be called `fn`.
 - A method call's result is not an lvalue: `m.get(k)!.balance = v` does not parse. Bind it first.
 - Only some of wac's packages are reachable from a project: `lib.wac` decides. `bls` and `bignum` are not.
-- `const` is enforced even on a `const struct`, where the spec says it means nothing; `U256` avoids `const`
-  entirely. See `docs/wac-asks.md`.
+- A `const` reference never becomes a plain one, `const struct` included: write `const W x` or `(const W) x`.
+  `U256` sidesteps it by taking a plain `this` everywhere. (This was once filed as a wac bug; it is not.)
 - **A diagnostic can be a cascade.** One run reported `unknown type 'bool'` for a `bool[]` that is fine, and
   it went away when the other errors in the file were fixed. Reproduce alone before believing a strange one.
 - A shift amount may be any integer type, so `x << (bit % 64)` needs no cast. `i32` to `u64` has no

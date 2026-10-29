@@ -32,22 +32,16 @@ method was registered under is the declaring file's. `convertsToText` solved the
 
 **What it costs here:** `U256` has named methods (`a.add(b)`), not operators.
 
-## A `const` reference to a `const struct` cannot become a plain one
+## Not a bug: a `const` reference to a `const struct` stays `const`
 
-`spec/2-types/17-const.md`, "A const struct": *no reference to one was ever writable — `const` or not*. The
-checker accepts `return this;` from a `const this` method, but refuses the same conversion everywhere else:
+This was listed here as a checker gap, and it is not one. The sentence in `spec/2-types/17-const.md` that
+says no reference to a `const struct` "was ever writable — `const` or not" describes the situation; it is
+not a rule that lets `const` be dropped, and `§wac-const-no-launder-t584c4n` (a const reference never
+becomes a plain one) applies to every type. `return this;` from a `const this` method is accepted by the
+accessor exception, `§wac-deep-const-accessor-w3kf8nq`, which makes the result const at the call site.
 
-```wac
-export const struct W {
-  u64 v;
-  W a(const this) { W n = this; return n; }                // error: a const W cannot become a W
-  W b(const this, const W rhs) { return rhs; }             // error: a const W cannot be returned as a W
-  W c(const this) { return this.v > 0 ? this : W(0); }     // error: a const W cannot be returned as a W
-}
-```
-
-**What it costs here:** `U256`'s methods take a plain `this`, and nothing in this repository writes
-`const U256`. The type is immutable either way.
+Written the way the language means it: `const W n = this;`, or `(const W) n` to rebind, and `const W` as
+the return type. `U256` still takes a plain `this` everywhere, which is simpler and costs nothing.
 
 ## `bls` and `bignum` are not reachable from outside the repository
 
