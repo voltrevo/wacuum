@@ -181,7 +181,11 @@ export struct Engine {
       U256 a = hexU256(arg(ps!, 0));
       if (method == "eth_getBalance") { return Answer.ok(str(w!.balance(a).toHex())); }
       if (method == "eth_getCode") { return Answer.ok(str(bytesToHex(w!.code(a)))); }
-      return Answer.ok(str(U256.ofU64(w!.nonce(a)).toHex()));
+      u64 nonce = w!.nonce(a);
+      // "pending" counts the sender's transactions waiting in the mempool, as a wallet choosing its next
+      // nonce needs.
+      if ((arg(ps!, 1)?.text() ?? "") == "pending") { nonce = this.pendingNonce(a, nonce); }
+      return Answer.ok(str(U256.ofU64(nonce).toHex()));
     }
     if (method == "eth_getStorageAt") {
       World? w = this.stateAt(arg(ps!, 2));
@@ -989,6 +993,22 @@ export struct Engine {
     }
     if (this.syncTarget is not null && this.blocks.has(this.syncTarget!)) { this.syncTarget = null; }
     return n;
+  }
+
+  /** The nonce after `from`'s run of mempool transactions starting at `nonce`. */
+  u64 pendingNonce(this, U256 from, u64 nonce) {
+    bool moved = true;
+    while (moved) {
+      moved = false;
+      for (i32 i = 0; i < this.mempool.len(); i++) {
+        DecodedTx d = decodeTransaction(this.mempool.get(i), this.chainId);
+        if (d.error == "" && d.tx.sender.eq(from) && d.tx.nonce.eq(U256.ofU64(nonce))) {
+          nonce++;
+          moved = true;
+        }
+      }
+    }
+    return nonce;
   }
 
   /** Whether this client has the block, executed. */
