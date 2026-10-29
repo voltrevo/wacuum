@@ -20,6 +20,12 @@ export u8[] u256Bytes(U256 v) {
 
 /** The root of an account's storage trie: keccak256 of each slot's key, RLP of each value. */
 export u8[] storageRoot(Account a) {
+  if (a.storageRoot is not null) { return a.storageRoot!; }
+  a.storageRoot = computeStorageRoot(a);
+  return a.storageRoot!;
+}
+
+u8[] computeStorageRoot(Account a) {
   U256[] keys = a.storage.keys();
   u8[][] ks = u8[][].defaulted(keys.len());
   u8[][] vs = u8[][].defaulted(keys.len());

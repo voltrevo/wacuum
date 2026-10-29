@@ -49,8 +49,13 @@ export struct Account {
   U256 codeHash;
   /** Nonzero slots only: writing zero removes the entry, so iterating gives exactly what the trie holds. */
   Map<U256, U256> storage;
+  /**
+   * The storage trie's root, once computed, until a slot is written. Every write to `storage` goes through
+   * this file and clears it, so a block's state root rehashes only the storage that block changed.
+   */
+  u8[]? storageRoot;
 
-  Account empty() { return Account(0, U256.zero(), u8[].filled(0, 0), emptyCodeHash(), slotMap()); }
+  Account empty() { return Account(0, U256.zero(), u8[].filled(0, 0), emptyCodeHash(), slotMap(), null); }
 
   /** EIP-161's "empty": no nonce, no balance, no code. Such an account is deleted when touched. */
   bool isEmpty(this) { return this.nonce == 0 && this.balance.isZero() && this.code.len() == 0; }
@@ -246,6 +251,7 @@ export struct World {
     if (!o!.has(key)) { o!.set(key, prev); }
     this.journal.push(Change.Storage(addr, key, prev));
     putSlot(a.storage, key, v);
+    a.storageRoot = null;
   }
 
   void setTransient(this, U256 addr, U256 key, U256 v) {
@@ -313,7 +319,7 @@ export struct World {
       Map<U256, U256> st = slotMap();
       U256[] keys = a.storage.keys();
       for (i32 k = 0; k < keys.len(); k++) { st.set(keys[k], a.storage.get(keys[k])!); }
-      c.accounts.set(addrs[i], Account(a.nonce, a.balance, a.code, a.codeHash, st));
+      c.accounts.set(addrs[i], Account(a.nonce, a.balance, a.code, a.codeHash, st, a.storageRoot));
     }
     return c;
   }
@@ -334,7 +340,11 @@ export struct World {
           a.code = prev;
           a.codeHash = prevHash;
         }
-        Storage(addr, key, prev): { putSlot(this.accounts.get(addr)!.storage, key, prev); }
+        Storage(addr, key, prev): {
+          Account a = this.accounts.get(addr)!;
+          putSlot(a.storage, key, prev);
+          a.storageRoot = null;
+        }
         Transient(addr, key, prev): { putSlot(this.transient.get(addr)!, key, prev); }
         WarmAddress(addr): { this.warmAddresses.remove(addr); }
         WarmSlot(addr, key): { this.warmSlots.get(addr)!.remove(key); }
@@ -469,6 +479,7 @@ export struct World {
       Map<U256, U256> m = slots.get(holders[i])!;
       U256[] keys = m.keys();
       for (i32 k = 0; k < keys.len(); k++) { putSlot(a!.storage, keys[k], m.get(keys[k])!); }
+      a!.storageRoot = null;
     }
   }
 }
