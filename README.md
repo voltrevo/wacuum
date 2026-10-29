@@ -45,7 +45,7 @@ git clone https://git.voltrevo.com/wac.git ~/src/wac
 ```
 
 ```bash
-cd ~/src/wac && git checkout a473e07b04b84e63cd4918e57cc866ec553d0247 && ./bootstrap.sh --host nodejs
+cd ~/src/wac && git checkout 49e5268e362d84358c62b93932e3c20c56546e1d && ./bootstrap.sh --host nodejs
 ```
 
 Then, in this repository:

@@ -43,18 +43,12 @@ accessor exception, `§wac-deep-const-accessor-w3kf8nq`, which makes the result 
 Written the way the language means it: `const W n = this;`, or `(const W) n` to rebind, and `const W` as
 the return type. `U256` still takes a plain `this` everywhere, which is simpler and costs nothing.
 
-## `bls` and `bignum` are not reachable from outside the repository
+## Done: `bls` and `bignum` are reachable from outside the repository
 
-A project depending on wac gets `lib.wac`, and `lib.wac` exports neither `packages/bls` nor
-`packages/bignum`; neither has a `wac.json5` of its own, so no `subdir` mapping reaches them either.
-
-**What it costs here:** KZG point evaluation (precompile 0x0a, EIP-4844) needs BLS12-381 pairings, which
-`bls` has, so it is not implemented: 65 of the Cancun state tests. Prague's seven BLS12-381 precompiles
-(EIP-2537) will want the same package, with G1 and G2 addition and multi-scalar multiplication besides.
-MODEXP went without `bignum` because `src/limbs.wac` already had the division it needed.
-
-The fix is two lines in `lib.wac`, `export * as bls from …` and `export * as bignum from …`, if their
-public names are what they should be for a consumer.
+`lib.wac` exported neither, so KZG point evaluation and EIP-2537's seven precompiles could not be written.
+Both are exported since wac `96f6bd34d`, and `src/precompiles/bls.wac` is built on `bls`: every point
+evaluation and EIP-2537 state test passes. The one thing `bls` lacked for the EVM, the map from Fp to G1
+(its SSWU and 11-isogeny), is written there.
 
 ## On the JavaScript hosts, a program is given no network, whatever it is granted
 

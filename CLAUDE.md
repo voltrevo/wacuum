@@ -12,7 +12,7 @@ README's table, top to bottom, and each row is "done" when the matching `ethereu
 ## Working agreements
 
 - **wac is pinned to one commit**, in `wac.lock`, and the `wac` command should be built from it. Change both
-  together. Today it is `a473e07`, the head of `git.voltrevo.com/wac.git` when this started.
+  together. Today it is `49e5268e`.
 - **When wac gets in the way, write it down in `docs/wac-asks.md`** with a reproduction, and work around it
   here. Fixing the compiler is ordinary work in the wac repository, but it is a different repository with
   other people's work in it.
@@ -53,7 +53,7 @@ nonce whose bytes are not a palindrome, and ethers' `getCreateAddress` showed it
 - No `string.replace`, no `string.startsWith` (use `indexOf(x) == 0`).
 - `fn` is a keyword (it spells function types), so a local cannot be called `fn`.
 - A method call's result is not an lvalue: `m.get(k)!.balance = v` does not parse. Bind it first.
-- Only some of wac's packages are reachable from a project: `lib.wac` decides. `bls` and `bignum` are not.
+- Only some of wac's packages are reachable from a project: `lib.wac` decides. `bls` and `bignum` are, since `96f6bd34d`.
 - A `const` reference never becomes a plain one, `const struct` included: write `const W x` or `(const W) x`.
   `U256` sidesteps it by taking a plain `this` everywhere. (This was once filed as a wac bug; it is not.)
 - **A diagnostic can be a cascade.** One run reported `unknown type 'bool'` for a `bool[]` that is fine, and

@@ -1,0 +1,414 @@
+// The BLS12-381 precompiles: EIP-2537's seven (0x0b to 0x11, from Prague) and EIP-4844's point
+// evaluation (0x0a, from Cancun), all on wac's `bls` package.
+//
+// `bls` was written to verify consensus signatures, so it has the curves, the pairing and the G2
+// hash-to-curve, and lacks two things the EVM asks for: EIP-2537's 64-byte uncompressed encoding,
+// and the map from Fp to G1, whose SSWU and 11-isogeny are here. Each function returns null for an
+// input the EIP calls an error, which the caller turns into a failure that consumes all the gas.
+
+import { bls.G1, bls.G2, bls.Fp2, bls.Fp12, bls.Pair, bls.g1Infinity, bls.g1IsInfinity, bls.g1Generator, bls.g1Negate,
+         bls.g1Add, bls.g1Mul, bls.g1IsOnCurve, bls.g1InSubgroup, bls.g1AffineX, bls.g1AffineY, bls.g1FromBytes,
+         bls.g2Infinity, bls.g2IsInfinity, bls.g2Generator, bls.g2Negate, bls.g2Add, bls.g2Mul, bls.g2IsOnCurve,
+         bls.g2InSubgroup, bls.g2AffineX, bls.g2AffineY, bls.g2FromBytes, bls.mapToCurveG2, bls.clearCofactorG2,
+         bls.fpZero, bls.fpOne, bls.fpIsZero, bls.fpAdd, bls.fpMul, bls.fpSquare, bls.fpNeg, bls.fpInvert,
+         bls.fpSqrt, bls.fpSgn0, bls.fpFromBytes, bls.fpToBytes, bls.millerLoopMulti, bls.finalExponentiate,
+         bls.fp12IsOne } from "wac";
+import { crypto.sha256 } from "wac";
+import { hexToBytes } from "../hex.wac";
+
+// ── EIP-2537's encodings ─────────────────────────────────────────────────────────────────────────
+//
+// A field element is 64 bytes, big-endian, whose top 16 must be zero and whose value must be below p;
+// a point is x then y, and all zeros is infinity, since (0, 0) is on neither curve.
+
+u32[]? fpAt(u8[] b, i32 at) {
+  for (i32 i = 0; i < 16; i++) {
+    if (b[at + i] != 0) { return null; }
+  }
+  u8[] v = u8[].filled(48, 0);
+  for (i32 i = 0; i < 48; i++) { v[i] = b[at + 16 + i]; }
+  return fpFromBytes(v);
+}
+
+/** Fp2 is c0 then c1. */
+Fp2? fp2At(u8[] b, i32 at) {
+  u32[]? c0 = fpAt(b, at);
+  u32[]? c1 = fpAt(b, at + 64);
+  if (c0 is null || c1 is null) { return null; }
+  return Fp2(c0!, c1!);
+}
+
+bool zeros(u8[] b, i32 at, i32 n) {
+  for (i32 i = 0; i < n; i++) {
+    if (b[at + i] != 0) { return false; }
+  }
+  return true;
+}
+
+/** A G1 point on the curve, or null. The subgroup is the caller's to check, because G1ADD does not. */
+G1? g1At(u8[] b, i32 at) {
+  if (zeros(b, at, 128)) { return g1Infinity(); }
+  u32[]? x = fpAt(b, at);
+  u32[]? y = fpAt(b, at + 64);
+  if (x is null || y is null) { return null; }
+  G1 p = G1(x!, y!, fpOne());
+  return g1IsOnCurve(p) ? p : null;
+}
+
+G2? g2At(u8[] b, i32 at) {
+  if (zeros(b, at, 256)) { return g2Infinity(); }
+  Fp2? x = fp2At(b, at);
+  Fp2? y = fp2At(b, at + 128);
+  if (x is null || y is null) { return null; }
+  G2 p = G2(x!, y!, Fp2(fpOne(), fpZero()));
+  return g2IsOnCurve(p) ? p : null;
+}
+
+void putFp(u8[] out, i32 at, u32[] v) {
+  u8[] b = fpToBytes(v);
+  for (i32 i = 0; i < 48; i++) { out[at + 16 + i] = b[i]; }
+}
+
+u8[] g1Bytes(G1 p) {
+  u8[] out = u8[].filled(128, 0);
+  if (g1IsInfinity(p)) { return out; }
+  putFp(out, 0, g1AffineX(p)!);
+  putFp(out, 64, g1AffineY(p)!);
+  return out;
+}
+
+u8[] g2Bytes(G2 p) {
+  u8[] out = u8[].filled(256, 0);
+  if (g2IsInfinity(p)) { return out; }
+  Fp2 x = g2AffineX(p)!;
+  Fp2 y = g2AffineY(p)!;
+  putFp(out, 0, x.c0);
+  putFp(out, 64, x.c1);
+  putFp(out, 128, y.c0);
+  putFp(out, 192, y.c1);
+  return out;
+}
+
+/** A 32-byte big-endian scalar as `bls` takes one: 32-bit limbs, least significant first. Not reduced. */
+u32[] scalarAt(u8[] b, i32 at) {
+  u32[] k = u32[].filled(8, 0);
+  for (i32 i = 0; i < 8; i++) {
+    i32 o = at + 28 - 4 * i;
+    k[i] = ((b[o] as u32) << 24) | ((b[o + 1] as u32) << 16) | ((b[o + 2] as u32) << 8) | (b[o + 3] as u32);
+  }
+  return k;
+}
+
+bool scalarIsZero(u32[] k) {
+  for (i32 i = 0; i < k.len(); i++) {
+    if (k[i] != 0) { return false; }
+  }
+  return true;
+}
+
+// ── The seven operations ─────────────────────────────────────────────────────────────────────────
+
+export u8[]? g1AddOp(u8[] input) {
+  if (input.len() != 256) { return null; }
+  G1? a = g1At(input, 0);
+  G1? b = g1At(input, 128);
+  if (a is null || b is null) { return null; }
+  return g1Bytes(g1Add(a!, b!));
+}
+
+export u8[]? g2AddOp(u8[] input) {
+  if (input.len() != 512) { return null; }
+  G2? a = g2At(input, 0);
+  G2? b = g2At(input, 256);
+  if (a is null || b is null) { return null; }
+  return g2Bytes(g2Add(a!, b!));
+}
+
+// The MSMs are a sum of single multiplications. The gas schedule prices them as if Pippenger's
+// algorithm ran, which is cheaper per point at large k, so this is slower than the price assumes;
+// it is correct, and Pippenger is a speed-up for later.
+
+export u8[]? g1MsmOp(u8[] input) {
+  if (input.len() == 0 || input.len() % 160 != 0) { return null; }
+  G1 acc = g1Infinity();
+  for (i32 at = 0; at < input.len(); at += 160) {
+    G1? p = g1At(input, at);
+    if (p is null || !g1InSubgroup(p!)) { return null; }
+    u32[] k = scalarAt(input, at + 128);
+    if (g1IsInfinity(p!) || scalarIsZero(k)) { continue; }
+    acc = g1Add(acc, g1Mul(p!, k));
+  }
+  return g1Bytes(acc);
+}
+
+export u8[]? g2MsmOp(u8[] input) {
+  if (input.len() == 0 || input.len() % 288 != 0) { return null; }
+  G2 acc = g2Infinity();
+  for (i32 at = 0; at < input.len(); at += 288) {
+    G2? p = g2At(input, at);
+    if (p is null || !g2InSubgroup(p!)) { return null; }
+    u32[] k = scalarAt(input, at + 256);
+    if (g2IsInfinity(p!) || scalarIsZero(k)) { continue; }
+    acc = g2Add(acc, g2Mul(p!, k));
+  }
+  return g2Bytes(acc);
+}
+
+/** Whether the product of the pairings of `g1s[i]` with `g2s[i]` is one; a pair with infinity in it is one. */
+bool pairingIsOne(G1[] g1s, G2[] g2s) {
+  i32 n = 0;
+  for (i32 i = 0; i < g1s.len(); i++) {
+    if (!g1IsInfinity(g1s[i]) && !g2IsInfinity(g2s[i])) { n++; }
+  }
+  if (n == 0) { return true; }
+  Pair[] pairs = Pair[].defaulted(n);
+  i32 j = 0;
+  for (i32 i = 0; i < g1s.len(); i++) {
+    if (g1IsInfinity(g1s[i]) || g2IsInfinity(g2s[i])) { continue; }
+    pairs[j] = Pair(g1AffineX(g1s[i])!, g1AffineY(g1s[i])!, g2AffineX(g2s[i])!, g2AffineY(g2s[i])!);
+    j++;
+  }
+  Fp12? f = finalExponentiate(millerLoopMulti(pairs));
+  return f is not null && fp12IsOne(f!);
+}
+
+export u8[]? pairingOp(u8[] input) {
+  if (input.len() == 0 || input.len() % 384 != 0) { return null; }
+  i32 n = input.len() / 384;
+  G1[] g1s = G1[].defaulted(n);
+  G2[] g2s = G2[].defaulted(n);
+  for (i32 i = 0; i < n; i++) {
+    G1? p = g1At(input, 384 * i);
+    G2? q = g2At(input, 384 * i + 128);
+    if (p is null || q is null || !g1InSubgroup(p!) || !g2InSubgroup(q!)) { return null; }
+    g1s[i] = p!;
+    g2s[i] = q!;
+  }
+  u8[] out = u8[].filled(32, 0);
+  if (pairingIsOne(g1s, g2s)) { out[31] = 1; }
+  return out;
+}
+
+export u8[]? mapFpToG1Op(u8[] input) {
+  if (input.len() != 64) { return null; }
+  u32[]? u = fpAt(input, 0);
+  if (u is null) { return null; }
+  return g1Bytes(clearCofactorG1(mapToCurveG1(u!)));
+}
+
+export u8[]? mapFp2ToG2Op(u8[] input) {
+  if (input.len() != 128) { return null; }
+  Fp2? u = fp2At(input, 0);
+  if (u is null) { return null; }
+  return g2Bytes(clearCofactorG2(mapToCurveG2(u!)));
+}
+
+// ── Gas ──────────────────────────────────────────────────────────────────────────────────────────
+
+/** EIP-2537's MSM discounts, per mille, for k = 1 to 128; beyond that the last one holds. */
+static i64[] G1_DISCOUNT = [1000, 949, 848, 797, 764, 750, 738, 728, 719, 712, 705, 698, 692, 687, 682, 677, 673,
+  669, 665, 661, 658, 654, 651, 648, 645, 642, 640, 637, 635, 632, 630, 627, 625, 623, 621, 619, 617, 615, 613, 611,
+  609, 608, 606, 604, 603, 601, 599, 598, 596, 595, 593, 592, 591, 589, 588, 586, 585, 584, 582, 581, 580, 579, 577,
+  576, 575, 574, 573, 572, 570, 569, 568, 567, 566, 565, 564, 563, 562, 561, 560, 559, 558, 557, 556, 555, 554, 553,
+  552, 551, 550, 549, 548, 547, 547, 546, 545, 544, 543, 542, 541, 540, 540, 539, 538, 537, 536, 536, 535, 534, 533,
+  532, 532, 531, 530, 529, 528, 528, 527, 526, 525, 525, 524, 523, 522, 522, 521, 520, 520, 519];
+static i64[] G2_DISCOUNT = [1000, 1000, 923, 884, 855, 832, 812, 796, 782, 770, 759, 749, 740, 732, 724, 717, 711,
+  704, 699, 693, 688, 683, 679, 674, 670, 666, 663, 659, 655, 652, 649, 646, 643, 640, 637, 634, 632, 629, 627, 624,
+  622, 620, 618, 615, 613, 611, 609, 607, 606, 604, 602, 600, 598, 597, 595, 593, 592, 590, 589, 587, 586, 584, 583,
+  582, 580, 579, 578, 576, 575, 574, 573, 571, 570, 569, 568, 567, 566, 565, 563, 562, 561, 560, 559, 558, 557, 556,
+  555, 554, 553, 552, 552, 551, 550, 549, 548, 547, 546, 545, 545, 544, 543, 542, 541, 541, 540, 539, 538, 537, 537,
+  536, 535, 535, 534, 533, 532, 532, 531, 530, 530, 529, 528, 528, 527, 526, 526, 525, 524, 524];
+
+/** An MSM's price: floor(len / per) pairs, each a multiplication at the discount for that many. */
+export i64 msmGas(i32 len, bool g2) {
+  i64 k = (len / (g2 ? 288 : 160)) as i64;
+  if (k == 0) { return 0; }
+  const i64[] table = g2 ? G2_DISCOUNT : G1_DISCOUNT;
+  i64 discount = k > 128 ? table[127] : table[(k - 1) as! i32];
+  return k * (g2 ? 22500 : 12000) * discount / 1000;
+}
+
+export i64 pairingGas(i32 len) { return 32600 * ((len / 384) as i64) + 37700; }
+
+// ── Fp to G1: RFC 9380's simplified SWU onto an 11-isogenous curve, then the isogeny ─────────────
+//
+// The real curve has A = 0, which simplified SWU cannot use, so the map lands on E' (whose A' and B'
+// are below) and an 11-isogeny carries the point to E. The constants are RFC 9380 §8.8.1 and appendix
+// E.2, coefficients in ascending powers; @noble/curves has the same table.
+
+u32[] fpHex(string h) {
+  u8[] b = hexToBytes(h)!;
+  u8[] v = u8[].filled(48, 0);
+  for (i32 i = 0; i < b.len(); i++) { v[48 - b.len() + i] = b[i]; }
+  return fpFromBytes(v)!;
+}
+
+u32[] fpSmall(i32 n) {
+  u8[] v = u8[].filled(48, 0);
+  v[47] = n as@ u8;
+  return fpFromBytes(v)!;
+}
+
+u32[] inv0(u32[] a) { return fpInvert(a) ?? fpZero(); }
+
+static string SWU_A = "144698a3b8e9433d693a02c96d4982b0ea985383ee66a8d8e8981aefd881ac98936f8da0e0f97f5cf428082d584c1d";
+static string SWU_B = "12e2908d11688030018b12e8753eee3b2016c1f0f24f4070a0b9c14fcef35ef55a23215a316ceaa5d1cc48e98e172be0";
+
+static string[] X_NUM = [
+  "11a05f2b1e833340b809101dd99815856b303e88a2d7005ff2627b56cdb4e2c85610c2d5f2e62d6eaeac1662734649b7",
+  "17294ed3e943ab2f0588bab22147a81c7c17e75b2f6a8417f565e33c70d1e86b4838f2a6f318c356e834eef1b3cb83bb",
+  "0d54005db97678ec1d1048c5d10a9a1bce032473295983e56878e501ec68e25c958c3e3d2a09729fe0179f9dac9edcb0",
+  "1778e7166fcc6db74e0609d307e55412d7f5e4656a8dbf25f1b33289f1b330835336e25ce3107193c5b388641d9b6861",
+  "0e99726a3199f4436642b4b3e4118e5499db995a1257fb3f086eeb65982fac18985a286f301e77c451154ce9ac8895d9",
+  "1630c3250d7313ff01d1201bf7a74ab5db3cb17dd952799b9ed3ab9097e68f90a0870d2dcae73d19cd13c1c66f652983",
+  "0d6ed6553fe44d296a3726c38ae652bfb11586264f0f8ce19008e218f9c86b2a8da25128c1052ecaddd7f225a139ed84",
+  "17b81e7701abdbe2e8743884d1117e53356de5ab275b4db1a682c62ef0f2753339b7c8f8c8f475af9ccb5618e3f0c88e",
+  "080d3cf1f9a78fc47b90b33563be990dc43b756ce79f5574a2c596c928c5d1de4fa295f296b74e956d71986a8497e317",
+  "169b1f8e1bcfa7c42e0c37515d138f22dd2ecb803a0c5c99676314baf4bb1b7fa3190b2edc0327797f241067be390c9e",
+  "10321da079ce07e272d8ec09d2565b0dfa7dccdde6787f96d50af36003b14866f69b771f8c285decca67df3f1605fb7b",
+  "06e08c248e260e70bd1e962381edee3d31d79d7e22c837bc23c0bf1bc24c6b68c24b1b80b64d391fa9c8ba2e8ba2d229"];
+static string[] X_DEN = [
+  "08ca8d548cff19ae18b2e62f4bd3fa6f01d5ef4ba35b48ba9c9588617fc8ac62b558d681be343df8993cf9fa40d21b1c",
+  "12561a5deb559c4348b4711298e536367041e8ca0cf0800c0126c2588c48bf5713daa8846cb026e9e5c8276ec82b3bff",
+  "0b2962fe57a3225e8137e629bff2991f6f89416f5a718cd1fca64e00b11aceacd6a3d0967c94fedcfcc239ba5cb83e19",
+  "03425581a58ae2fec83aafef7c40eb545b08243f16b1655154cca8abc28d6fd04976d5243eecf5c4130de8938dc62cd8",
+  "13a8e162022914a80a6f1d5f43e7a07dffdfc759a12062bb8d6b44e833b306da9bd29ba81f35781d539d395b3532a21e",
+  "0e7355f8e4e667b955390f7f0506c6e9395735e9ce9cad4d0a43bcef24b8982f7400d24bc4228f11c02df9a29f6304a5",
+  "0772caacf16936190f3e0c63e0596721570f5799af53a1894e2e073062aede9cea73b3538f0de06cec2574496ee84a3a",
+  "14a7ac2a9d64a8b230b3f5b074cf01996e7f63c21bca68a81996e1cdf9822c580fa5b9489d11e2d311f7d99bbdcc5a5e",
+  "0a10ecf6ada54f825e920b3dafc7a3cce07f8d1d7161366b74100da67f39883503826692abba43704776ec3a79a1d641",
+  "095fc13ab9e92ad4476d6e3eb3a56680f682b4ee96f7d03776df533978f31c1593174e4b4b7865002d6384d168ecdd0a",
+  "01"];
+static string[] Y_NUM = [
+  "090d97c81ba24ee0259d1f094980dcfa11ad138e48a869522b52af6c956543d3cd0c7aee9b3ba3c2be9845719707bb33",
+  "134996a104ee5811d51036d776fb46831223e96c254f383d0f906343eb67ad34d6c56711962fa8bfe097e75a2e41c696",
+  "00cc786baa966e66f4a384c86a3b49942552e2d658a31ce2c344be4b91400da7d26d521628b00523b8dfe240c72de1f6",
+  "01f86376e8981c217898751ad8746757d42aa7b90eeb791c09e4a3ec03251cf9de405aba9ec61deca6355c77b0e5f4cb",
+  "08cc03fdefe0ff135caf4fe2a21529c4195536fbe3ce50b879833fd221351adc2ee7f8dc099040a841b6daecf2e8fedb",
+  "16603fca40634b6a2211e11db8f0a6a074a7d0d4afadb7bd76505c3d3ad5544e203f6326c95a807299b23ab13633a5f0",
+  "04ab0b9bcfac1bbcb2c977d027796b3ce75bb8ca2be184cb5231413c4d634f3747a87ac2460f415ec961f8855fe9d6f2",
+  "0987c8d5333ab86fde9926bd2ca6c674170a05bfe3bdd81ffd038da6c26c842642f64550fedfe935a15e4ca31870fb29",
+  "09fc4018bd96684be88c9e221e4da1bb8f3abd16679dc26c1e8b6e6a1f20cabe69d65201c78607a360370e577bdba587",
+  "0e1bba7a1186bdb5223abde7ada14a23c42a0ca7915af6fe06985e7ed1e4d43b9b3f7055dd4eba6f2bafaaebca731c30",
+  "19713e47937cd1be0dfd0b8f1d43fb93cd2fcbcb6caf493fd1183e416389e61031bf3a5cce3fbafce813711ad011c132",
+  "18b46a908f36f6deb918c143fed2edcc523559b8aaf0c2462e6bfe7f911f643249d9cdf41b44d606ce07c8a4d0074d8e",
+  "0b182cac101b9399d155096004f53f447aa7b12a3426b08ec02710e807b4633f06c851c1919211f20d4c04f00b971ef8",
+  "0245a394ad1eca9b72fc00ae7be315dc757b3b080d4c158013e6632d3c40659cc6cf90ad1c232a6442d9d3f5db980133",
+  "05c129645e44cf1102a159f748c4a3fc5e673d81d7e86568d9ab0f5d396a7ce46ba1049b6579afb7866b1e715475224b",
+  "15e6be4e990f03ce4ea50b3b42df2eb5cb181d8f84965a3957add4fa95af01b2b665027efec01c7704b456be69c8b604"];
+static string[] Y_DEN = [
+  "16112c4c3a9c98b252181140fad0eae9601a6de578980be6eec3232b5be72e7a07f3688ef60c206d01479253b03663c1",
+  "1962d75c2381201e1a0cbd6c43c348b885c84ff731c4d59ca4a10356f453e01f78a4260763529e3532f6102c2e49a03d",
+  "058df3306640da276faaae7d6e8eb15778c4855551ae7f310c35a5dd279cd2eca6757cd636f96f891e2538b53dbf67f2",
+  "16b7d288798e5395f20d23bf89edb4d1d115c5dbddbcd30e123da489e726af41727364f2c28297ada8d26d98445f5416",
+  "0be0e079545f43e4b00cc912f8228ddcc6d19c9f0f69bbb0542eda0fc9dec916a20b15dc0fd2ededda39142311a5001d",
+  "08d9e5297186db2d9fb266eaac783182b70152c65550d881c5ecd87b6f0f5a6449f38db9dfa9cce202c6477faaf9b7ac",
+  "166007c08a99db2fc3ba8734ace9824b5eecfdfa8d0cf8ef5dd365bc400a0051d5fa9c01a58b1fb93d1a1399126a775c",
+  "16a3ef08be3ea7ea03bcddfabba6ff6ee5a4375efa1f4fd7feb34fd206357132b920f5b00801dee460ee415a15812ed9",
+  "1866c8ed336c61231a1be54fd1d74cc4f9fb0ce4c6af5920abc5750c4bf39b4852cfe2f7bb9248836b233d9d55535d4a",
+  "167a55cda70a6e1cea820597d94a84903216f763e13d87bb5308592e7ea7d4fbc7385ea3d529b35e346ef48bb8913f55",
+  "04d2f259eea405bd48f010a01ad2911d9c6dd039bb61a6290e591b36e636a5c871a5c29f4f83060400f8b49cba8f6aa8",
+  "0accbb67481d033ff5852c1e48c50c477f94ff8aefce42d28c0f9a88cea7913516f968986f7ebbea9684b529e2561092",
+  "0ad6b9514c767fe3c3613144b45f1496543346d98adf02267d5ceef9a00d9b8693000763e3b90ac11e99b138573345cc",
+  "02660400eb2e4f3b628bdd0d53cd76f2bf565b94e72927c1cb748df27942480e420517bd8714cc80d1fadc1326ed06f7",
+  "0e0fa1d816ddc03e6b24255e0d7819c171c40f65e273b853324efcd6356caa205ca2f570f13497804415473a1d634b8f",
+  "01"];
+
+/** The polynomial with coefficients `k` (ascending) at `x`, by Horner. */
+u32[] poly(const string[] k, u32[] x) {
+  u32[] acc = fpHex(k[k.len() - 1]);
+  for (i32 i = k.len() - 2; i >= 0; i--) { acc = fpAdd(fpMul(acc, x), fpHex(k[i])); }
+  return acc;
+}
+
+/** RFC 9380 §6.6.2, step for step: the same shape as `bls`'s G2 map, in Fp. */
+G1 mapToCurveG1(u32[] u) {
+  u32[] a = fpHex(SWU_A);
+  u32[] b = fpHex(SWU_B);
+  u32[] z = fpSmall(11);
+  u32[] tv1 = fpMul(z, fpSquare(u));                   // Z·u²
+  u32[] tv2 = fpSquare(tv1);                           // Z²·u⁴
+  u32[] x1 = inv0(fpAdd(tv1, tv2));
+  // When Z²u⁴ + Zu² is zero, x1 = B/(Z·A), which is (−1/Z)·(−B/A).
+  x1 = fpIsZero(x1) ? fpNeg(inv0(z)) : fpAdd(x1, fpOne());
+  x1 = fpMul(x1, fpNeg(fpMul(b, inv0(a))));
+  u32[] gx1 = fpAdd(fpMul(fpAdd(fpSquare(x1), a), x1), b);
+  u32[] x2 = fpMul(tv1, x1);
+  u32[] gx2 = fpMul(gx1, fpMul(tv1, tv2));
+  u32[] x = x1;
+  u32[]? y = fpSqrt(gx1);
+  if (y is null) {
+    x = x2;
+    y = fpSqrt(gx2);
+  }
+  u32[] yy = y!;
+  if (fpSgn0(yy) != fpSgn0(u)) { yy = fpNeg(yy); }
+
+  // The 11-isogeny back to E. A vanishing denominator is RFC 9380's exceptional case, the identity.
+  u32[]? xd = fpInvert(poly(X_DEN, x));
+  u32[]? yd = fpInvert(poly(Y_DEN, x));
+  if (xd is null || yd is null) { return g1Infinity(); }
+  return G1(fpMul(poly(X_NUM, x), xd!), fpMul(fpMul(yy, poly(Y_NUM, x)), yd!), fpOne());
+}
+
+/** h_eff = 1 − x = 0xd201000000010001, as RFC 9380 §8.8.1 clears G1's cofactor. */
+G1 clearCofactorG1(G1 p) {
+  u32[] h = u32[].filled(2, 0);
+  h[0] = 0x00010001;
+  h[1] = 0xd2010000;
+  return g1Mul(p, h);
+}
+
+// ── Point evaluation (EIP-4844) ──────────────────────────────────────────────────────────────────
+
+/** BLS_MODULUS, r, big-endian: z and y must be below it, and the precompile returns it. */
+static string BLS_MODULUS = "73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001";
+
+/** [τ]G2 from the KZG ceremony's setup: the one G2 point beyond the generator that verification needs. */
+static string TAU_G2 = "b5bfd7dd8cdeb128843bc287230af38926187075cbfbefa81009a2ce615ac53d2914e5870cb452d2afaaab24f3499f72185cbfee53492714734429b7b38608e23926c911cceceac9a36851477ba4c60b087041de621000edc98edada20c1def2";
+
+bool belowModulus(u8[] b, i32 at) {
+  u8[] r = hexToBytes(BLS_MODULUS)!;
+  for (i32 i = 0; i < 32; i++) {
+    if (b[at + i] != r[i]) { return b[at + i] < r[i]; }
+  }
+  return false;
+}
+
+/**
+ * 192 bytes: a versioned hash, z, y, a commitment and a proof. The output is FIELD_ELEMENTS_PER_BLOB and
+ * BLS_MODULUS as two 32-byte words, when the proof shows the committed polynomial is y at z.
+ */
+export u8[]? pointEvaluation(u8[] input) {
+  if (input.len() != 192) { return null; }
+  u8[] commitment = u8[].filled(48, 0);
+  u8[] proof = u8[].filled(48, 0);
+  for (i32 i = 0; i < 48; i++) {
+    commitment[i] = input[96 + i];
+    proof[i] = input[144 + i];
+  }
+  // The versioned hash is 0x01 then the commitment's sha256 after its first byte.
+  u8[] h = sha256(commitment);
+  if (input[0] != 0x01) { return null; }
+  for (i32 i = 1; i < 32; i++) {
+    if (input[i] != h[i]) { return null; }
+  }
+  if (!belowModulus(input, 32) || !belowModulus(input, 64)) { return null; }
+  G1? c = g1FromBytes(commitment);
+  G1? pi = g1FromBytes(proof);
+  if (c is null || pi is null) { return null; }
+
+  // e(C − [y]G1, −G2) · e(π, [τ]G2 − [z]G2) = 1.
+  u32[] z = scalarAt(input, 32);
+  u32[] y = scalarAt(input, 64);
+  G2 tau = g2FromBytes(hexToBytes(TAU_G2)!)!;
+  G1[] g1s = [g1Add(c!, g1Negate(g1Mul(g1Generator(), y))), pi!];
+  G2[] g2s = [g2Negate(g2Generator()), g2Add(tau, g2Negate(g2Mul(g2Generator(), z)))];
+  if (!pairingIsOne(g1s, g2s)) { return null; }
+
+  u8[] out = u8[].filled(64, 0);
+  out[30] = 0x10;                                       // 4096
+  u8[] r = hexToBytes(BLS_MODULUS)!;
+  for (i32 i = 0; i < 32; i++) { out[32 + i] = r[i]; }
+  return out;
+}

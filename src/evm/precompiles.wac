@@ -1,10 +1,8 @@
-// The precompiled contracts: addresses 0x01 to 0x0a in Cancun, whose "code" is a native function. KZG point
-// evaluation (0x0a) is the one missing: it needs BLS12-381 pairings, which wac's `bls` package has but does
-// not export to a project outside the wac repository — see docs/wac-asks.md.
+// The precompiled contracts, whose "code" is a native function: 0x01 to 0x0a in Cancun, EIP-2537's BLS12-381
+// operations at 0x0b to 0x11 from Prague, and P256VERIFY at 0x100 from Osaka.
 //
 // A precompile that runs out of gas, or is handed input it refuses, fails like any frame: all the gas it
-// was given is gone and the caller sees 0. One that is not implemented here yet fails the same way, which is
-// wrong in a way the state tests will show rather than hide.
+// was given is gone and the caller sees 0.
 
 import { crypto.sha256 } from "wac";
 import { ecrecover } from "../precompiles/ecrecover.wac";
@@ -13,6 +11,8 @@ import { modexp, modexpGas } from "../precompiles/modexp.wac";
 import { blake2f, blake2fRounds } from "../precompiles/blake2f.wac";
 import { ecAdd, ecMul, ecPairing } from "../crypto/bn254.wac";
 import { crypto.p256VerifyDigest } from "wac";
+import { pointEvaluation, g1AddOp, g2AddOp, g1MsmOp, g2MsmOp, pairingOp, mapFpToG1Op, mapFp2ToG2Op, msmGas,
+         pairingGas } from "../precompiles/bls.wac";
 import { U256 } from "../u256.wac";
 import { Outcome, Halt } from "./interp.wac";
 import { Spec } from "./spec.wac";
@@ -74,6 +74,23 @@ export Outcome runPrecompile(Spec spec, U256 addr, u8[] input, i64 gas) {
       if (rounds > gas) { return outOfGas(); }
       return Outcome(Halt.Return(blake2f(input)), gas - rounds);
     }
+    case 0x0a: { return checked(gas, 50000, gas < 50000 ? null : pointEvaluation(input)); }
+    case 0x0b: { return checked(gas, 375, gas < 375 ? null : g1AddOp(input)); }
+    case 0x0c: {
+      i64 cost = msmGas(input.len(), false);
+      return checked(gas, cost, gas < cost ? null : g1MsmOp(input));
+    }
+    case 0x0d: { return checked(gas, 600, gas < 600 ? null : g2AddOp(input)); }
+    case 0x0e: {
+      i64 cost = msmGas(input.len(), true);
+      return checked(gas, cost, gas < cost ? null : g2MsmOp(input));
+    }
+    case 0x0f: {
+      i64 cost = pairingGas(input.len());
+      return checked(gas, cost, gas < cost ? null : pairingOp(input));
+    }
+    case 0x10: { return checked(gas, 5500, gas < 5500 ? null : mapFpToG1Op(input)); }
+    case 0x11: { return checked(gas, 23800, gas < 23800 ? null : mapFp2ToG2Op(input)); }
     case 0x100: {
       // EIP-7951: a bad signature, key or length is an empty answer, not a failure — the gas is paid either way.
       if (gas < 6900) { return outOfGas(); }
