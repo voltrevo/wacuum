@@ -1,0 +1,105 @@
+// Blob sidecars: what a blob transaction carries on its way into the mempool and leaves behind when it
+// goes into a block. A block holds only the versioned hashes; the consensus client publishes the blobs
+// themselves, so whichever execution client built the block must hand them back with
+// `engine_getPayload`'s blobs bundle, and to anyone who asks with `engine_getBlobs`.
+//
+// The network form of a blob transaction is `0x03 ‖ rlp([body, blobs, commitments, proofs])` before Osaka,
+// with one KZG proof per blob, and `0x03 ‖ rlp([body, 1, blobs, commitments, cell_proofs])` from Osaka
+// (EIP-7594), with 128 cell proofs per blob. The body is the transaction as a block holds it.
+//
+// What is checked: the shapes; that each commitment hashes to the versioned hash the transaction names, so
+// a sidecar can never be filed under a blob it is not; and, before Osaka, that each blob proof proves its
+// blob. Osaka's cell proofs are not checked yet — that needs the ceremony's G1 points, which this client
+// does not carry — so until then it trusts whoever submits an Osaka blob transaction to have sent cell
+// proofs that verify. A bad one makes the built block's blobs unavailable to the consensus layer.
+
+import { crypto.sha256 } from "wac";
+import { rlp.Item, rlp.encode, rlp.decode, rlp.Decoded, rlp.bytesOf, rlp.itemsOf, rlp.isList } from "wac";
+import { U256 } from "../u256.wac";
+import { verifyBlobProof } from "../crypto/kzg.wac";
+
+export static i32 BLOB_BYTES = 131072;
+export static i32 CELLS_PER_BLOB = 128;
+
+export struct Sidecar {
+  u8[] blob;
+  u8[] commitment;
+  /** One blob proof before Osaka; 128 cell proofs from it. */
+  u8[][] proofs;
+}
+
+/** A transaction from `eth_sendRawTransaction`: the form a block holds, and its sidecars in blob order. */
+export struct Unwrapped {
+  u8[] canonical;
+  Sidecar[] sidecars;
+  /** Whether it came in the network form at all; a blob transaction without its blobs did not. */
+  bool wrapped;
+  string error;
+}
+
+Unwrapped refused(string why) { return Unwrapped(u8[].filled(0, 0), Sidecar[].defaulted(0), false, why); }
+
+/** The versioned hash of a commitment: 0x01, then its sha256 after the first byte. */
+export U256 versionedHash(u8[] commitment) {
+  u8[] h = sha256(commitment);
+  h[0] = 0x01;
+  return U256.fromBytes(h, 0, 32);
+}
+
+/** `raw` with any blob sidecars taken off. `cellProofs` is whether the fork wants EIP-7594's form. */
+export Unwrapped unwrap(u8[] raw, bool cellProofs) {
+  if (raw.len() < 2 || raw[0] != 0x03) { return Unwrapped(raw, Sidecar[].defaulted(0), false, ""); }
+  u8[] rest = u8[].filled(raw.len() - 1, 0);
+  for (i32 i = 0; i < rest.len(); i++) { rest[i] = raw[i + 1]; }
+  Decoded d = decode(rest);
+  if (!d.ok || !isList(d.item)) { return refused("the transaction does not decode"); }
+  Item[] parts = itemsOf(d.item);
+  if (parts.len() == 0 || !isList(parts[0])) { return Unwrapped(raw, Sidecar[].defaulted(0), false, ""); }
+
+  i32 at = 1;
+  if (parts.len() == 5) {
+    u8[] version = bytesOf(parts[1]);
+    if (version.len() != 1 || version[0] != 1) { return refused("unknown blob sidecar version"); }
+    at = 2;
+  } else if (parts.len() != 4) {
+    return refused("a blob transaction's network form has four or five parts");
+  }
+  if (cellProofs != (parts.len() == 5)) {
+    return refused(cellProofs ? "from Osaka, blob sidecars carry cell proofs" : "cell proofs before Osaka");
+  }
+  if (!isList(parts[at]) || !isList(parts[at + 1]) || !isList(parts[at + 2])) { return refused("malformed blob sidecar"); }
+  Item[] blobs = itemsOf(parts[at]);
+  Item[] commitments = itemsOf(parts[at + 1]);
+  Item[] proofs = itemsOf(parts[at + 2]);
+  i32 per = cellProofs ? CELLS_PER_BLOB : 1;
+  if (commitments.len() != blobs.len() || proofs.len() != per * blobs.len()) {
+    return refused("the sidecar's blobs, commitments and proofs do not match in number");
+  }
+  Sidecar[] out = Sidecar[].defaulted(blobs.len());
+  for (i32 i = 0; i < blobs.len(); i++) {
+    u8[] blob = bytesOf(blobs[i]);
+    u8[] c = bytesOf(commitments[i]);
+    if (blob.len() != BLOB_BYTES || c.len() != 48) { return refused("a blob or commitment of the wrong size"); }
+    u8[][] ps = u8[][].defaulted(per);
+    for (i32 k = 0; k < per; k++) {
+      ps[k] = bytesOf(proofs[i * per + k]);
+      if (ps[k].len() != 48) { return refused("a proof of the wrong size"); }
+    }
+    if (!cellProofs && !verifyBlobProof(blob, c, ps[0])) { return refused("blob \{i}'s proof does not verify"); }
+    out[i] = Sidecar(blob, c, ps);
+  }
+  u8[] body = encode(parts[0]);
+  u8[] canonical = u8[].filled(body.len() + 1, 0);
+  canonical[0] = 0x03;
+  for (i32 i = 0; i < body.len(); i++) { canonical[i + 1] = body[i]; }
+  return Unwrapped(canonical, out, true, "");
+}
+
+/** Whether `sidecars` are exactly the blobs `hashes` name, in order. */
+export bool sidecarsFit(Sidecar[] sidecars, U256[] hashes) {
+  if (sidecars.len() != hashes.len()) { return false; }
+  for (i32 i = 0; i < hashes.len(); i++) {
+    if (!versionedHash(sidecars[i].commitment).eq(hashes[i])) { return false; }
+  }
+  return true;
+}

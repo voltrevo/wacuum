@@ -33,6 +33,7 @@ import { Header, Block, Withdrawal, applyBlock, headerItem, nextBaseFee, nextExc
          indexedRoot } from "../chain/block.wac";
 import { decodeTransaction, DecodedTx } from "../tx/decode.wac";
 import { Attributes, Built, buildBlock } from "../chain/build.wac";
+import { Sidecar, Unwrapped, unwrap, sidecarsFit, CELLS_PER_BLOB } from "./blobs.wac";
 
 /** A block this client has executed, with the state after it. */
 struct Node {
@@ -65,11 +66,19 @@ export struct Engine {
   /** Blocks built for a payload id, waiting for engine_getPayload. */
   Map<U256, Built> payloads;
   u64 nextPayloadId;
+  /** The blobs of the blob transactions in the mempool, by versioned hash. */
+  Map<U256, Sidecar> sidecars;
+  /**
+   * Whether a blob transaction may arrive without its blobs. Never for a node: a block it built from one
+   * would have blobs nobody can publish. The fixtures' transactions are in block form, so their runners
+   * set it, and their payloads' blobs bundles are then short of those blobs.
+   */
+  bool sidecarsOptional;
 
   /** An engine whose chain starts at `genesis`, with `world` its state. */
   Engine create(ChainConfig config, Header genesis, World world) {
     Engine e = Engine(config, config.chainId, Map.create(hashU256, eqU256), Map.create(hashU256, eqU256), genesis.hash, genesis.hash,
-                      genesis.hash, Vec.create(), Map.create(hashU256, eqU256), 1);
+                      genesis.hash, Vec.create(), Map.create(hashU256, eqU256), 1, Map.create(hashU256, eqU256), false);
     e.blocks.set(genesis.hash, Node(genesis, world));
     e.canonical.set(genesis.number, genesis.hash);
     return e;
@@ -88,6 +97,9 @@ export struct Engine {
     }
     if (method == "engine_getPayloadV3") { return this.getPayload(3, ps!); }
     if (method == "engine_getPayloadV4") { return this.getPayload(4, ps!); }
+    if (method == "engine_getPayloadV5") { return this.getPayload(5, ps!); }
+    if (method == "engine_getBlobsV1") { return this.getBlobs(1, ps!); }
+    if (method == "engine_getBlobsV2") { return this.getBlobs(2, ps!); }
     if (method == "eth_sendRawTransaction") { return this.sendRawTransaction(ps!); }
     if (method == "eth_getBalance") { return Answer.ok(str(this.headState().balance(hexU256(arg(ps!, 0))).toHex())); }
     if (method == "eth_getTransactionCount") {
@@ -252,8 +264,12 @@ export struct Engine {
       Attributes attrs = Attributes(hexU256(at.member("timestamp")), hexU256(at.member("prevRandao")),
                                     hexU256(at.member("suggestedFeeRecipient")), withdrawalsFrom(at.member("withdrawals")),
                                     hexU256(at.member("parentBeaconBlockRoot")));
-      Built built = buildBlock(this.config.specAt(attrs.timestamp), this.blocks.get(head)!.world.clone(), parent, attrs, this.mempool.toArray(),
+      Spec spec = this.config.specAt(attrs.timestamp);
+      Built built = buildBlock(spec, this.blocks.get(head)!.world.clone(), parent, attrs, this.candidates(spec),
                                this.chainId, this.ancestorHashes(parent));
+      // A body that fails is a chain this client cannot extend at all — a system contract missing or
+      // broken — and not something to hand out as an empty block.
+      if (built.body.error != "") { return Answer.error(-32603, "cannot build on this head: " + built.body.error); }
       U256 id = U256.ofU64(this.nextPayloadId);
       this.nextPayloadId++;
       this.payloads.set(id, built);
@@ -277,6 +293,36 @@ export struct Engine {
       keep.push(all[i]);
     }
     this.mempool = keep;
+    // A sidecar goes with the last transaction that names its blob.
+    Map<U256, Sidecar> blobs = Map.create(hashU256, eqU256);
+    for (i32 i = 0; i < keep.len(); i++) {
+      U256[] hashes = decodeTransaction(keep.get(i), this.chainId).tx.blobHashes;
+      for (i32 k = 0; k < hashes.len(); k++) {
+        Sidecar? sc = this.sidecars.get(hashes[k]);
+        if (sc is not null) { blobs.set(hashes[k], sc!); }
+      }
+    }
+    this.sidecars = blobs;
+  }
+
+  /**
+   * The mempool as a block under `spec` may take it: a blob transaction only with every blob's sidecar,
+   * in the form the fork's blobs bundle carries — a transaction sent with blob proofs before Osaka cannot
+   * go into an Osaka block, whose bundle needs cell proofs.
+   */
+  Item[] candidates(this, Spec spec) {
+    if (this.sidecarsOptional) { return this.mempool.toArray(); }
+    Vec<Item> out = Vec.create();
+    for (i32 i = 0; i < this.mempool.len(); i++) {
+      U256[] hashes = decodeTransaction(this.mempool.get(i), this.chainId).tx.blobHashes;
+      bool ready = true;
+      for (i32 k = 0; k < hashes.len(); k++) {
+        Sidecar? sc = this.sidecars.get(hashes[k]);
+        if (sc is null || sc!.proofs.len() != (spec.isOsaka ? CELLS_PER_BLOB : 1)) { ready = false; }
+      }
+      if (ready) { out.push(this.mempool.get(i)); }
+    }
+    return out.toArray();
   }
 
   // ── eth_sendRawTransaction ──
@@ -285,11 +331,22 @@ export struct Engine {
     if (ps.len() < 1) { return Answer.error(-32602, "no transaction"); }
     u8[]? raw = hexToBytes(ps.get(0).text() ?? "x");
     if (raw is null) { return Answer.error(-32602, "the transaction is not hex"); }
-    Item? it = txItem(raw!);
+    // The sidecar's form is the next block's fork's, taking the next block to be a slot after the head.
+    Header h = this.blocks.get(this.head)!.header;
+    Unwrapped u = unwrap(raw!, this.config.specAt(h.timestamp.add(U256.ofU64(12))).isOsaka);
+    if (u.error != "") { return Answer.error(-32000, u.error); }
+    Item? it = txItem(u.canonical);
     if (it is null) { return Answer.error(-32602, "the transaction does not decode"); }
     DecodedTx d = decodeTransaction(it!, this.chainId);
     if (d.error != "") { return Answer.error(-32000, d.error); }
     if (d.tx.nonce.lt(U256.ofU64(this.headState().nonce(d.tx.sender)))) { return Answer.error(-32000, "nonce too low"); }
+    if (d.tx.txType == 3) {
+      if (!u.wrapped && !this.sidecarsOptional) { return Answer.error(-32000, "a blob transaction without its blobs"); }
+      if (u.wrapped && !sidecarsFit(u.sidecars, d.tx.blobHashes)) {
+        return Answer.error(-32000, "the sidecar's commitments are not the transaction's blobs");
+      }
+      for (i32 k = 0; k < u.sidecars.len(); k++) { this.sidecars.set(d.tx.blobHashes[k], u.sidecars[k]); }
+    }
     this.mempool.push(it!);
     return Answer.ok(str(bytesToHex(keccak256(d.raw))));
   }
@@ -302,6 +359,9 @@ export struct Engine {
     if (b is null) { return Answer.error(-38001, "unknown payload"); }
     Built built = b!;
     Header h = built.block.header;
+    Spec spec = this.config.specAt(h.timestamp);
+    i32 wants = spec.isOsaka ? 5 : spec.isPrague ? 4 : 3;
+    if (version != wants) { return Answer.error(-38005, "unsupported fork: this payload wants engine_getPayloadV\{wants}"); }
     JsonObject p = JsonObject.create();
     p.push("parentHash".toBytes(), str(hex32(h.parentHash)));
     p.push("feeRecipient".toBytes(), str(bytesToHex(addressBytes(h.coinbase))));
@@ -336,10 +396,24 @@ export struct Engine {
     p.push("blobGasUsed".toBytes(), str(h.blobGasUsed.toHex()));
     p.push("excessBlobGas".toBytes(), str(h.excessBlobGas.toHex()));
 
+    // Every blob the block's transactions name, in order, with its commitment and its proof or proofs.
+    JsonArray commitments = JsonArray.create();
+    JsonArray proofs = JsonArray.create();
+    JsonArray blobs = JsonArray.create();
+    for (i32 i = 0; i < built.block.txs.len(); i++) {
+      U256[] hashes = decodeTransaction(built.block.txs[i], this.chainId).tx.blobHashes;
+      for (i32 k = 0; k < hashes.len(); k++) {
+        Sidecar? sc = this.sidecars.get(hashes[k]);
+        if (sc is null) { continue; }
+        commitments.push(str(bytesToHex(sc!.commitment)));
+        blobs.push(str(bytesToHex(sc!.blob)));
+        for (i32 j = 0; j < sc!.proofs.len(); j++) { proofs.push(str(bytesToHex(sc!.proofs[j]))); }
+      }
+    }
     JsonObject bundle = JsonObject.create();
-    bundle.push("commitments".toBytes(), JsonValue.Array(JsonArray.create()));
-    bundle.push("proofs".toBytes(), JsonValue.Array(JsonArray.create()));
-    bundle.push("blobs".toBytes(), JsonValue.Array(JsonArray.create()));
+    bundle.push("commitments".toBytes(), JsonValue.Array(commitments));
+    bundle.push("proofs".toBytes(), JsonValue.Array(proofs));
+    bundle.push("blobs".toBytes(), JsonValue.Array(blobs));
     JsonObject out = JsonObject.create();
     out.push("executionPayload".toBytes(), JsonValue.Object(p));
     out.push("blockValue".toBytes(), str(built.body.fees.toHex()));
@@ -387,6 +461,38 @@ export struct Engine {
     return Answer.ok(str(bytesToHex(o.output())));
   }
 
+  /**
+   * engine_getBlobs: the mempool's blobs, for versioned hashes the consensus client has seen in a block or
+   * gossip. V1 answers each hash with its blob and proof or null; V2 (Osaka) answers with each blob's cell
+   * proofs, and with null for the whole call if any blob is missing.
+   */
+  Answer getBlobs(this, i32 version, JsonArray ps) {
+    JsonArray? hashes = ps.len() > 0 ? ps.get(0).array() : null;
+    if (hashes is null) { return Answer.error(-32602, "no versioned hashes"); }
+    if (hashes!.len() > 128) { return Answer.error(-38004, "too large request"); }
+    JsonArray out = JsonArray.create();
+    for (i32 i = 0; i < hashes!.len(); i++) {
+      Sidecar? sc = this.sidecars.get(hexU256(hashes!.get(i)));
+      if (sc is not null && sc!.proofs.len() != (version == 2 ? CELLS_PER_BLOB : 1)) { sc = null; }
+      if (sc is null) {
+        if (version == 2) { return Answer.ok(JsonValue.Null); }
+        out.push(JsonValue.Null);
+        continue;
+      }
+      JsonObject o = JsonObject.create();
+      o.push("blob".toBytes(), str(bytesToHex(sc!.blob)));
+      if (version == 1) {
+        o.push("proof".toBytes(), str(bytesToHex(sc!.proofs[0])));
+      } else {
+        JsonArray cells = JsonArray.create();
+        for (i32 j = 0; j < sc!.proofs.len(); j++) { cells.push(str(bytesToHex(sc!.proofs[j]))); }
+        o.push("proofs".toBytes(), JsonValue.Array(cells));
+      }
+      out.push(JsonValue.Object(o));
+    }
+    return Answer.ok(JsonValue.Array(out));
+  }
+
   /** The state at the head of the chain. */
   World headState(this) { return this.blocks.get(this.head)!.world; }
 }
@@ -413,7 +519,8 @@ JsonValue forkchoiceResult(JsonValue payloadStatus) {
 JsonValue capabilities() {
   string[] names = ["engine_newPayloadV1", "engine_newPayloadV2", "engine_newPayloadV3", "engine_newPayloadV4",
                     "engine_forkchoiceUpdatedV1", "engine_forkchoiceUpdatedV2", "engine_forkchoiceUpdatedV3",
-                    "engine_getPayloadV3", "engine_getPayloadV4"];
+                    "engine_getPayloadV3", "engine_getPayloadV4", "engine_getPayloadV5", "engine_getBlobsV1",
+                    "engine_getBlobsV2"];
   JsonArray a = JsonArray.create();
   for (i32 i = 0; i < names.len(); i++) { a.push(str(names[i])); }
   return JsonValue.Array(a);

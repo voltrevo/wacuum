@@ -52,6 +52,7 @@ string runTest(ChainConfig chain, JsonValue test) {
   Header genesis = genesisOf(test.member("genesisBlockHeader")!);
   Spec spec = chain.specAt(genesis.timestamp);
   Engine e = Engine.create(chain, genesis, w);
+  e.sidecarsOptional = true;
 
   JsonArray payloads = test.member("engineNewPayloads")!.array()!;
   for (i32 i = 0; i < payloads.len(); i++) {
@@ -81,7 +82,9 @@ string runTest(ChainConfig chain, JsonValue test) {
     if (id is null || id!.isNull()) { return "payload \{i + 1}: no payload id: \{f.message}"; }
     JsonArray idArgs = JsonArray.create();
     idArgs.push(id!);
-    Answer g = e.call("engine_getPayloadV" + v, JsonValue.Array(idArgs));
+    // Osaka's payloads go in with newPayloadV4 and come out of getPayloadV5.
+    bool osaka = chain.specAt(num(want.member("timestamp"))).isOsaka;
+    Answer g = e.call("engine_getPayloadV" + (osaka ? "5" : v), JsonValue.Array(idArgs));
     if (g.result is null) { return "payload \{i + 1}: getPayload: \{g.message}"; }
     JsonValue built = g.result!.member("executionPayload")!;
 

@@ -1,0 +1,157 @@
+// Blob sidecars through the Engine API: a blob transaction sent in its network form, a block built with it,
+// and the blob back out of engine_getPayload and engine_getBlobs — once with Prague's one proof per blob,
+// once with Osaka's 128 cell proofs.
+//
+// The blob is all zeros, so its commitment and every proof of it is the point at infinity (0xc0 then 47
+// zeros), which makes a sidecar that verifies without a trusted setup in the test. The transaction around
+// it was signed by ethers (key 0x11…11, chain 1) naming that commitment's versioned hash.
+
+import { json.parse, json.JsonValue, json.JsonObject, json.JsonArray } from "wac";
+import { rlp.Item, rlp.encode, rlp.decode } from "wac";
+import { U256 } from "../src/u256.wac";
+import { hexToBytes, bytesToHex } from "../src/hex.wac";
+import { genesisFrom, Genesis } from "../src/chain/genesis.wac";
+import { Engine, Answer } from "../src/engine/engine.wac";
+import { BLOB_BYTES, CELLS_PER_BLOB } from "../src/engine/blobs.wac";
+import { verifyBlobProof } from "../src/crypto/kzg.wac";
+import { Check } from "./check.wac";
+
+static string SIGNED = "0x03f88e0180018502540be4008252089422222222222222222222222222222222222222220180c0843b9aca00e1a0010657f37554c781402a22917dee2f75def7ab966d7b770905398eba3c44401401a00e85a3cc5946bcec0b4a6cc6f63a83f187d371e7ed6403eb1af918a7f104d042a05049608605d8318e2d23e248b9855bfbccaeabb10855a6d6588baee4e4e91bcd";
+// The system contracts a Prague block calls (EIP-4788, EIP-2935, EIP-7002, EIP-7251): without them a block
+// cannot be built at all.
+static string WITHDRAWALS = "0x3373fffffffffffffffffffffffffffffffffffffffe1460cb5760115f54807fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff146101f457600182026001905f5b5f82111560685781019083028483029004916001019190604d565b909390049250505036603814608857366101f457346101f4575f5260205ff35b34106101f457600154600101600155600354806003026004013381556001015f35815560010160203590553360601b5f5260385f601437604c5fa0600101600355005b6003546002548082038060101160df575060105b5f5b8181146101835782810160030260040181604c02815460601b8152601401816001015481526020019060020154807fffffffffffffffffffffffffffffffff00000000000000000000000000000000168252906010019060401c908160381c81600701538160301c81600601538160281c81600501538160201c81600401538160181c81600301538160101c81600201538160081c81600101535360010160e1565b910180921461019557906002556101a0565b90505f6002555f6003555b5f54807fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff14156101cd57505f5b6001546002828201116101e25750505f6101e8565b01600290035b5f555f600155604c025ff35b5f5ffd";
+static string CONSOLIDATIONS = "0x3373fffffffffffffffffffffffffffffffffffffffe1460d35760115f54807fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff1461019a57600182026001905f5b5f82111560685781019083028483029004916001019190604d565b9093900492505050366060146088573661019a573461019a575f5260205ff35b341061019a57600154600101600155600354806004026004013381556001015f358155600101602035815560010160403590553360601b5f5260605f60143760745fa0600101600355005b6003546002548082038060021160e7575060025b5f5b8181146101295782810160040260040181607402815460601b815260140181600101548152602001816002015481526020019060030154905260010160e9565b910180921461013b5790600255610146565b90505f6002555f6003555b5f54807fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff141561017357505f5b6001546001828201116101885750505f61018e565b01600190035b5f555f6001556074025ff35b5f5ffd";
+static string HISTORY = "0x3373fffffffffffffffffffffffffffffffffffffffe14604657602036036042575f35600143038111604257611fff81430311604257611fff9006545f5260205ff35b5f5ffd5b5f35611fff60014303065500";
+static string BEACON_ROOTS = "0x3373fffffffffffffffffffffffffffffffffffffffe14604d57602036146024575f5ffd5b5f35801560495762001fff810690815414603c575f5ffd5b62001fff01545f5260205ff35b5f5ffd5b62001fff42064281555f359062001fff015500";
+static string HASH = "0x010657f37554c781402a22917dee2f75def7ab966d7b770905398eba3c444014";
+
+/** SIGNED in its network form: one zero blob, its commitment, and `proofs` proofs of it. */
+string wrapped(i32 proofs, bool cellProofs) {
+  u8[] raw = hexToBytes(SIGNED)!;
+  u8[] body = u8[].filled(raw.len() - 1, 0);
+  for (i32 i = 0; i < body.len(); i++) { body[i] = raw[i + 1]; }
+  u8[] point = u8[].filled(48, 0);
+  point[0] = 0xc0;
+  Item[] ps = Item[].filled(proofs, Item.Bytes(point));
+  Item blobs = Item.List([Item.Bytes(u8[].filled(BLOB_BYTES, 0))]);
+  Item commitments = Item.List([Item.Bytes(point)]);
+  Item[] parts = cellProofs
+    ? [decode(body).item, Item.Bytes([1 as u8]), blobs, commitments, Item.List(ps)]
+    : [decode(body).item, blobs, commitments, Item.List(ps)];
+  string hex = bytesToHex(encode(Item.List(parts)));
+  return "0x03" + hex.slice(2, hex.len());
+}
+
+Engine? engineFor(string forks) {
+  string g = "{\"config\": {\"chainId\": 1, \{forks}}, \"gasLimit\": \"0x1c9c380\", \"baseFeePerGas\": \"0x3b9aca00\", " +
+             "\"alloc\": {\"0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A\": {\"balance\": \"0x56bc75e2d63100000\"}" + ", \"0x00000961ef480eb55e80d19ad83579a64c007002\": {\"nonce\": \"0x1\", \"code\": \"" + WITHDRAWALS + "\"}" + ", \"0x0000bbddc7ce488642fb579f8b00f3a590007251\": {\"nonce\": \"0x1\", \"code\": \"" + CONSOLIDATIONS + "\"}" + ", \"0x0000f90827f1c53a10cb7a02335b175320002935\": {\"nonce\": \"0x1\", \"code\": \"" + HISTORY + "\"}" + ", \"0x000f3df6d732807ef1319fb7b8bb8522d0beac02\": {\"nonce\": \"0x1\", \"code\": \"" + BEACON_ROOTS + "\"}" + "}}";
+  string[] why = [""];
+  match (parse(g.toBytes())) {
+    Ok(doc): {
+      Genesis gen = genesisFrom(doc, why)!;
+      return Engine.create(gen.config, gen.header, gen.world);
+    }
+    Err(e): { return null; }
+  }
+}
+
+JsonValue str(string s) { return JsonValue.Str(s.toBytes()); }
+
+JsonValue one(JsonValue v) {
+  JsonArray a = JsonArray.create();
+  a.push(v);
+  return JsonValue.Array(a);
+}
+
+/** Build on the genesis and return getPayload's blobs bundle, or null. */
+JsonValue? built(Engine e, i32 version) {
+  string zero = "0x0000000000000000000000000000000000000000000000000000000000000000";
+  JsonObject state = JsonObject.create();
+  state.push("headBlockHash".toBytes(), str(e.head.toHex()));
+  state.push("safeBlockHash".toBytes(), str(e.head.toHex()));
+  state.push("finalizedBlockHash".toBytes(), str(e.head.toHex()));
+  JsonObject attrs = JsonObject.create();
+  attrs.push("timestamp".toBytes(), str("0xc"));
+  attrs.push("prevRandao".toBytes(), str(zero));
+  attrs.push("suggestedFeeRecipient".toBytes(), str("0x0000000000000000000000000000000000000000"));
+  attrs.push("withdrawals".toBytes(), JsonValue.Array(JsonArray.create()));
+  attrs.push("parentBeaconBlockRoot".toBytes(), str(zero));
+  JsonArray ps = JsonArray.create();
+  ps.push(JsonValue.Object(state));
+  ps.push(JsonValue.Object(attrs));
+  Answer f = e.call("engine_forkchoiceUpdatedV3", JsonValue.Array(ps));
+  JsonValue? id = f.result?.member("payloadId");
+  if (id is null || id!.isNull()) { return JsonValue.Str("no id: \{f.message}".toBytes()); }
+  Answer g = e.call("engine_getPayloadV\{version}", one(id!));
+  if (g.result is null) { return JsonValue.Str("getPayload: \{g.message}".toBytes()); }
+  if (g.result!.member("executionPayload")!.member("transactions")!.array()!.len() != 1) { return null; }
+  return g.result!.member("blobsBundle");
+}
+
+void checkBundle(Check t, JsonValue? bundle, i32 proofs) {
+  if (bundle is null || bundle!.text() is not null) {
+    t.fail("no payload with the transaction in it: \{bundle?.text() ?? ""}");
+    return;
+  }
+  t.ok(bundle!.member("blobs")!.array()!.len() == 1, "one blob");
+  t.ok(bundle!.member("commitments")!.array()!.len() == 1, "one commitment");
+  t.ok(bundle!.member("proofs")!.array()!.len() == proofs, "\{proofs} proofs");
+  t.ok((bundle!.member("blobs")!.array()!.get(0).text() ?? "").len() == 2 + 2 * BLOB_BYTES, "the blob whole");
+}
+
+export string test_prague_blobs_come_back_with_one_proof_each() {
+  Check t = Check.create();
+  Engine e = engineFor("\"cancunTime\": 0, \"pragueTime\": 0")!;
+  Answer bare = e.call("eth_sendRawTransaction", one(str(SIGNED)));
+  t.ok(bare.result is null, "a blob transaction without its blobs is refused");
+  Answer cells = e.call("eth_sendRawTransaction", one(str(wrapped(CELLS_PER_BLOB, true))));
+  t.ok(cells.result is null, "cell proofs before Osaka are refused");
+  Answer sent = e.call("eth_sendRawTransaction", one(str(wrapped(1, false))));
+  t.eqStr(sent.message, "", "the network form is taken");
+
+  Answer v1 = e.call("engine_getBlobsV1", one(one(str(HASH))));
+  t.ok(v1.result is not null && v1.result!.array()!.get(0).member("proof") is not null, "getBlobsV1 has it");
+  t.ok(e.call("engine_getPayloadV5", one(str("0x0000000000000001"))).code != 0, "an unknown payload is an error");
+  checkBundle(t, built(e, 4), 1);
+  return t.report();
+}
+
+export string test_osaka_blobs_come_back_with_their_cell_proofs() {
+  Check t = Check.create();
+  Engine e = engineFor("\"cancunTime\": 0, \"pragueTime\": 0, \"osakaTime\": 0")!;
+  Answer old = e.call("eth_sendRawTransaction", one(str(wrapped(1, false))));
+  t.ok(old.result is null, "a blob proof from Osaka is refused");
+  Answer sent = e.call("eth_sendRawTransaction", one(str(wrapped(CELLS_PER_BLOB, true))));
+  t.eqStr(sent.message, "", "the EIP-7594 form is taken");
+
+  Answer v2 = e.call("engine_getBlobsV2", one(one(str(HASH))));
+  t.ok(v2.result is not null && v2.result!.array()!.get(0).member("proofs")!.array()!.len() == CELLS_PER_BLOB,
+       "getBlobsV2 has its cell proofs");
+  Answer missing = e.call("engine_getBlobsV2", one(one(str("0x01ff" + HASH.slice(6, HASH.len())))));
+  t.ok(missing.result is not null && missing.result!.isNull(), "getBlobsV2 is null when a blob is missing");
+  checkBundle(t, built(e, 5), CELLS_PER_BLOB);
+  return t.report();
+}
+
+/** The blob whose element i is i² + 1, its commitment and its proof, from micro-eth-signer's KZG. */
+static string SQUARES_COMMITMENT = "0xb7c82ff57d986aa2622ffefb910b85ea77d9da8fccd2634bd6a125d2705a334525c781e9f58f0026123e02ef0eaa76dc";
+static string SQUARES_PROOF = "0xb4b57d37d9fae09ddb27e7c36795d7c2e5f7d5f357c21c2589db8221da1af227becf71de81fbe57f03acb5bd1dde2834";
+
+export string test_blob_proofs_verify_and_their_forgeries_do_not() {
+  Check t = Check.create();
+  u8[] blob = u8[].filled(BLOB_BYTES, 0);
+  for (i32 i = 0; i < 4096; i++) {
+    u8[] v = U256.ofI32(i * i + 1).toBytes();
+    for (i32 k = 0; k < 32; k++) { blob[32 * i + k] = v[k]; }
+  }
+  u8[] c = hexToBytes(SQUARES_COMMITMENT)!;
+  u8[] p = hexToBytes(SQUARES_PROOF)!;
+  t.ok(verifyBlobProof(blob, c, p), "the proof verifies");
+  t.ok(!verifyBlobProof(blob, c, c), "the commitment is not a proof of itself");
+  blob[100] = blob[100] ^ 1;
+  t.ok(!verifyBlobProof(blob, c, p), "a changed blob does not");
+  u8[] point = u8[].filled(48, 0);
+  point[0] = 0xc0;
+  t.ok(verifyBlobProof(u8[].filled(BLOB_BYTES, 0), point, point), "the zero blob's proof is the identity");
+  return t.report();
+}

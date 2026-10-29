@@ -90,7 +90,7 @@ u8[] g2Bytes(G2 p) {
 }
 
 /** A 32-byte big-endian scalar as `bls` takes one: 32-bit limbs, least significant first. Not reduced. */
-u32[] scalarAt(u8[] b, i32 at) {
+export u32[] scalarAt(u8[] b, i32 at) {
   u32[] k = u32[].filled(8, 0);
   for (i32 i = 0; i < 8; i++) {
     i32 o = at + 28 - 4 * i;
@@ -376,6 +376,21 @@ bool belowModulus(u8[] b, i32 at) {
 }
 
 /**
+ * Whether `proof` shows that the polynomial `commitment` commits to is `y` at `z` (both below r, as `bls`
+ * scalars): e(C − [y]G1, −G2) · e(π, [τ]G2 − [z]G2) = 1. False too for a commitment or proof that is not
+ * the compressed encoding of a point in G1.
+ */
+export bool kzgProofHolds(u8[] commitment, u32[] z, u32[] y, u8[] proof) {
+  G1? c = g1FromBytes(commitment);
+  G1? pi = g1FromBytes(proof);
+  if (c is null || pi is null) { return false; }
+  G2 tau = g2FromBytes(hexToBytes(TAU_G2)!)!;
+  G1[] g1s = [g1Add(c!, g1Negate(g1Mul(g1Generator(), y))), pi!];
+  G2[] g2s = [g2Negate(g2Generator()), g2Add(tau, g2Negate(g2Mul(g2Generator(), z)))];
+  return pairingIsOne(g1s, g2s);
+}
+
+/**
  * 192 bytes: a versioned hash, z, y, a commitment and a proof. The output is FIELD_ELEMENTS_PER_BLOB and
  * BLS_MODULUS as two 32-byte words, when the proof shows the committed polynomial is y at z.
  */
@@ -394,17 +409,7 @@ export u8[]? pointEvaluation(u8[] input) {
     if (input[i] != h[i]) { return null; }
   }
   if (!belowModulus(input, 32) || !belowModulus(input, 64)) { return null; }
-  G1? c = g1FromBytes(commitment);
-  G1? pi = g1FromBytes(proof);
-  if (c is null || pi is null) { return null; }
-
-  // e(C − [y]G1, −G2) · e(π, [τ]G2 − [z]G2) = 1.
-  u32[] z = scalarAt(input, 32);
-  u32[] y = scalarAt(input, 64);
-  G2 tau = g2FromBytes(hexToBytes(TAU_G2)!)!;
-  G1[] g1s = [g1Add(c!, g1Negate(g1Mul(g1Generator(), y))), pi!];
-  G2[] g2s = [g2Negate(g2Generator()), g2Add(tau, g2Negate(g2Mul(g2Generator(), z)))];
-  if (!pairingIsOne(g1s, g2s)) { return null; }
+  if (!kzgProofHolds(commitment, scalarAt(input, 32), scalarAt(input, 64), proof)) { return null; }
 
   u8[] out = u8[].filled(64, 0);
   out[30] = 0x10;                                       // 4096
