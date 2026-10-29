@@ -2,9 +2,7 @@
 // opcode, so the interpreter checks underflow, overflow and static gas once, before dispatch, rather than
 // in 140 places.
 //
-// The costs are the Cancun schedule's. An opcode this interpreter does not implement yet is simply absent,
-// and so executes as INVALID — which is the honest answer until it is here, because it is what an opcode
-// the fork does not define does.
+// The costs are the Cancun schedule's. An opcode the fork does not define is absent, and executes as INVALID.
 
 export struct OpTable {
   /** Static gas, or -1 for an opcode that is not defined. */
@@ -42,23 +40,48 @@ export struct OpTable {
     t.def(0x1c, "SHR", 3, 2, 1);
     t.def(0x1d, "SAR", 3, 2, 1);
     t.def(0x20, "KECCAK256", 30, 2, 1);
+    // The account-reading opcodes cost nothing statically: EIP-2929 prices them warm or cold, at dispatch.
+    t.def(0x30, "ADDRESS", 2, 0, 1);
+    t.def(0x31, "BALANCE", 0, 1, 1);
+    t.def(0x32, "ORIGIN", 2, 0, 1);
+    t.def(0x33, "CALLER", 2, 0, 1);
+    t.def(0x34, "CALLVALUE", 2, 0, 1);
     t.def(0x35, "CALLDATALOAD", 3, 1, 1);
     t.def(0x36, "CALLDATASIZE", 2, 0, 1);
     t.def(0x37, "CALLDATACOPY", 3, 3, 0);
     t.def(0x38, "CODESIZE", 2, 0, 1);
     t.def(0x39, "CODECOPY", 3, 3, 0);
+    t.def(0x3a, "GASPRICE", 2, 0, 1);
+    t.def(0x3b, "EXTCODESIZE", 0, 1, 1);
+    t.def(0x3c, "EXTCODECOPY", 0, 4, 0);
     t.def(0x3d, "RETURNDATASIZE", 2, 0, 1);
     t.def(0x3e, "RETURNDATACOPY", 3, 3, 0);
+    t.def(0x3f, "EXTCODEHASH", 0, 1, 1);
+    t.def(0x40, "BLOCKHASH", 20, 1, 1);
+    t.def(0x41, "COINBASE", 2, 0, 1);
+    t.def(0x42, "TIMESTAMP", 2, 0, 1);
+    t.def(0x43, "NUMBER", 2, 0, 1);
+    t.def(0x44, "PREVRANDAO", 2, 0, 1);
+    t.def(0x45, "GASLIMIT", 2, 0, 1);
+    t.def(0x46, "CHAINID", 2, 0, 1);
+    t.def(0x47, "SELFBALANCE", 5, 0, 1);
+    t.def(0x48, "BASEFEE", 2, 0, 1);
+    t.def(0x49, "BLOBHASH", 3, 1, 1);
+    t.def(0x4a, "BLOBBASEFEE", 2, 0, 1);
     t.def(0x50, "POP", 2, 1, 0);
     t.def(0x51, "MLOAD", 3, 1, 1);
     t.def(0x52, "MSTORE", 3, 2, 0);
     t.def(0x53, "MSTORE8", 3, 2, 0);
+    t.def(0x54, "SLOAD", 0, 1, 1);
+    t.def(0x55, "SSTORE", 0, 2, 0);
     t.def(0x56, "JUMP", 8, 1, 0);
     t.def(0x57, "JUMPI", 10, 2, 0);
     t.def(0x58, "PC", 2, 0, 1);
     t.def(0x59, "MSIZE", 2, 0, 1);
     t.def(0x5a, "GAS", 2, 0, 1);
     t.def(0x5b, "JUMPDEST", 1, 0, 0);
+    t.def(0x5c, "TLOAD", 100, 1, 1);
+    t.def(0x5d, "TSTORE", 100, 2, 0);
     t.def(0x5e, "MCOPY", 3, 3, 0);
     t.def(0x5f, "PUSH0", 2, 0, 1);
     for (i32 n = 1; n <= 32; n++) { t.def(0x5f + n, "PUSH\{n}", 3, 0, 1); }
@@ -67,8 +90,16 @@ export struct OpTable {
       t.def(0x7f + n, "DUP\{n}", 3, n, n + 1);
       t.def(0x8f + n, "SWAP\{n}", 3, n + 1, n + 1);
     }
+    for (i32 n = 0; n <= 4; n++) { t.def(0xa0 + n, "LOG\{n}", 375 + 375 * (n as i64), 2 + n, 0); }
+    t.def(0xf0, "CREATE", 32000, 3, 1);
+    t.def(0xf1, "CALL", 0, 7, 1);
+    t.def(0xf2, "CALLCODE", 0, 7, 1);
     t.def(0xf3, "RETURN", 0, 2, 0);
+    t.def(0xf4, "DELEGATECALL", 0, 6, 1);
+    t.def(0xf5, "CREATE2", 32000, 4, 1);
+    t.def(0xfa, "STATICCALL", 0, 6, 1);
     t.def(0xfd, "REVERT", 0, 2, 0);
+    t.def(0xff, "SELFDESTRUCT", 5000, 1, 0);
     return t;
   }
 

@@ -1,12 +1,14 @@
 // The interpreter on hand-written bytecode, with every gas figure worked out by hand beside it.
 
-import { Frame, Outcome, Halt, run } from "../src/evm/interp.wac";
-import { OpTable } from "../src/evm/table.wac";
+import { Outcome, Halt } from "../src/evm/interp.wac";
+import { newEvm, runCode } from "./evmkit.wac";
+import { createAddress } from "../src/evm/evm.wac";
+import { U256 } from "../src/u256.wac";
 import { hexToBytes, bytesToHex } from "../src/hex.wac";
 import { Check } from "./check.wac";
 
 Outcome exec(string code, string calldata, i64 gas) {
-  return run(Frame.create(OpTable.cancun(), hexToBytes(code)!, hexToBytes(calldata)!, gas));
+  return runCode(newEvm(), hexToBytes(code)!, hexToBytes(calldata)!, gas);
 }
 
 string kind(Outcome o) {
@@ -105,5 +107,16 @@ export string test_keccak_and_mcopy() {
   // MSTORE8 0x42 at 0, MCOPY(1, 0, 1), RETURN 2 bytes.
   expect(t, "mcopy", "60426000536001600060015e60026000f3", "", "return", "0x4242",
          3 + 3 + 6 + 3 + 3 + 3 + 6 + 3 + 3);
+  return t.report();
+}
+
+export string test_create_addresses_match_ethers() {
+  Check t = Check.create();
+  // From ethers' getCreateAddress. A nonce whose bytes differ is the case that matters: an all-ones nonce
+  // and a one-byte nonce read the same backwards, and a byte-order bug passed both.
+  U256 a = U256.fromHex("0xfeee422f48b68759a80b6b1ac5a578226a58d0db")!;
+  t.eqU256(createAddress(a, 0), U256.fromHex("0x6428b58b5544bdec27bafdd91f48fe0eaf791186")!, "nonce 0");
+  t.eqU256(createAddress(a, 0xfffffffffffffffe), U256.fromHex("0x92139cfbb9f7aaf8d99621b1628643ac98477276")!, "nonce 2^64 - 2");
+  t.eqU256(createAddress(a, 0xffffffffffffffff), U256.fromHex("0xedd8812fb96557285388706869065ba655d873ae")!, "nonce 2^64 - 1");
   return t.report();
 }

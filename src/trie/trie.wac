@@ -1,0 +1,142 @@
+// The root of a Merkle-Patricia trie, built from its contents in one pass.
+//
+// wac's `mpt` package verifies proofs against a root; this goes the other way, which is what a client has
+// to do after every block. There is no incremental trie here yet: the pairs are sorted and the root is
+// built recursively, because a root computed from scratch is the one that cannot drift from the state.
+// A trie that updates in place is an optimisation to make once this one is the oracle for it.
+//
+// ## The construction
+//
+// Over keys sorted as nibble strings, a range of keys that all share a prefix beyond the current depth is
+// an extension node; a range of one key is a leaf; anything else is a branch with up to sixteen children.
+// A child node whose encoding is shorter than 32 bytes is embedded in its parent rather than hashed — the
+// rule that makes small tries cheap and makes every implementation get it wrong once.
+
+import { crypto.keccak256 } from "wac";
+import { rlp.Item, rlp.encode } from "wac";
+
+/** keccak256(rlp("")): the root of a trie with nothing in it. */
+export u8[] emptyRoot() {
+  return keccak256(encode(Item.Bytes(u8[].filled(0, 0))));
+}
+
+struct Entry {
+  u8[] nibbles;
+  u8[] value;
+}
+
+/** The root of the trie holding `values[i]` at `keys[i]`. Keys must be distinct; values must not be empty. */
+export u8[] trieRoot(u8[][] keys, u8[][] values) {
+  if (keys.len() == 0) { return emptyRoot(); }
+  Entry?[] es = Entry?[].defaulted(keys.len());
+  for (i32 i = 0; i < keys.len(); i++) { es[i] = Entry(nibblesOf(keys[i]), values[i]); }
+  Entry[] sorted = sortEntries(es);
+  return keccak256(encode(build(sorted, 0, sorted.len(), 0)));
+}
+
+u8[] nibblesOf(u8[] key) {
+  u8[] n = u8[].filled(key.len() * 2, 0);
+  for (i32 i = 0; i < key.len(); i++) {
+    n[2 * i] = key[i] >> 4;
+    n[2 * i + 1] = key[i] & 15;
+  }
+  return n;
+}
+
+Item build(Entry[] es, i32 lo, i32 hi, i32 depth) {
+  if (hi - lo == 1) {
+    Item[] leaf = [Item.Bytes(hexPrefix(es[lo].nibbles, depth, es[lo].nibbles.len(), true)), Item.Bytes(es[lo].value)];
+    return Item.List(leaf);
+  }
+  // Sorted, so the prefix every key in the range shares is the one its first and last share.
+  u8[] first = es[lo].nibbles;
+  u8[] last = es[hi - 1].nibbles;
+  i32 cp = 0;
+  while (depth + cp < first.len() && depth + cp < last.len() && first[depth + cp] == last[depth + cp]) { cp++; }
+  if (cp > 0) {
+    Item[] ext = [Item.Bytes(hexPrefix(first, depth, depth + cp, false)), ref(build(es, lo, hi, depth + cp))];
+    return Item.List(ext);
+  }
+  Item[] branch = Item[].filled(17, Item.Bytes(u8[].filled(0, 0)));
+  i32 i = lo;
+  while (i < hi) {
+    if (es[i].nibbles.len() == depth) {
+      // A key that ends here is the branch's own value. Fixed-length keys never do this; the code is for
+      // the general trie, so a test with keys of mixed length gets the right answer rather than a trap.
+      branch[16] = Item.Bytes(es[i].value);
+      i++;
+      continue;
+    }
+    u8 nib = es[i].nibbles[depth];
+    i32 j = i;
+    while (j < hi && es[j].nibbles.len() > depth && es[j].nibbles[depth] == nib) { j++; }
+    branch[nib as i32] = ref(build(es, i, j, depth + 1));
+    i = j;
+  }
+  return Item.List(branch);
+}
+
+/** How a parent refers to a child: the child itself when its encoding is under 32 bytes, its hash otherwise. */
+Item ref(Item node) {
+  u8[] enc = encode(node);
+  return enc.len() < 32 ? node : Item.Bytes(keccak256(enc));
+}
+
+/** Hex-prefix encoding of nibbles `[from, to)`, flagged as a leaf's or an extension's path. */
+u8[] hexPrefix(u8[] nibbles, i32 from, i32 to, bool leaf) {
+  i32 n = to - from;
+  bool odd = n % 2 == 1;
+  u8 flag = (leaf ? 2 : 0) + (odd ? 1 : 0);
+  u8[] out = u8[].filled(n / 2 + 1, 0);
+  i32 at = from;
+  if (odd) {
+    out[0] = (flag << 4) | nibbles[at];
+    at++;
+  } else {
+    out[0] = flag << 4;
+  }
+  for (i32 k = 1; k < out.len(); k++) {
+    out[k] = (nibbles[at] << 4) | nibbles[at + 1];
+    at += 2;
+  }
+  return out;
+}
+
+/** Byte-wise order, shorter first on a tie — which is nibble order too. */
+i32 compareBytes(u8[] a, u8[] b) {
+  i32 n = a.len() < b.len() ? a.len() : b.len();
+  for (i32 i = 0; i < n; i++) {
+    if (a[i] != b[i]) { return a[i] < b[i] ? -1 : 1; }
+  }
+  return a.len() - b.len();
+}
+
+/** A merge sort: stable, O(n log n), and with no recursion deep enough to matter. */
+Entry[] sortEntries(Entry?[] es) {
+  i32 n = es.len();
+  Entry?[] a = es;
+  Entry?[] b = Entry?[].defaulted(n);
+  for (i32 width = 1; width < n; width *= 2) {
+    for (i32 lo = 0; lo < n; lo += 2 * width) {
+      i32 mid = lo + width < n ? lo + width : n;
+      i32 hi = lo + 2 * width < n ? lo + 2 * width : n;
+      i32 i = lo;
+      i32 j = mid;
+      for (i32 k = lo; k < hi; k++) {
+        if (i < mid && (j >= hi || compareBytes(a[i]!.nibbles, a[j]!.nibbles) <= 0)) {
+          b[k] = a[i];
+          i++;
+        } else {
+          b[k] = a[j];
+          j++;
+        }
+      }
+    }
+    Entry?[] t = a;
+    a = b;
+    b = t;
+  }
+  Entry[] out = Entry[].filled(n, a[0]!);
+  for (i32 k = 0; k < n; k++) { out[k] = a[k]!; }
+  return out;
+}

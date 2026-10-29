@@ -1,0 +1,53 @@
+// ECRECOVER (0x01): the address whose key signed a hash, from the signature (v, r, s) on secp256k1.
+//
+// An input that is not a valid signature is not an error: the precompile succeeds and returns nothing,
+// and the caller sees an empty return. That covers v other than 27 or 28, r or s out of [1, n), an r that
+// is not the x of any point, and a recovered key at infinity.
+
+import { crypto.keccak256 } from "wac";
+import { U256 } from "../u256.wac";
+import { Field } from "../crypto/field.wac";
+import { Curve, Jac } from "../crypto/curve.wac";
+
+export U256 secpP() { return U256.fromHex("0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f")!; }
+export U256 secpN() { return U256.fromHex("0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141")!; }
+
+export u8[] ecrecover(u8[] input) {
+  u8[] none = u8[].filled(0, 0);
+  U256 h = U256.fromBytes(input, 0, 32);
+  U256 v = U256.fromBytes(input, 32, 32);
+  U256 r = U256.fromBytes(input, 64, 32);
+  U256 s = U256.fromBytes(input, 96, 32);
+  U256 n = secpN();
+  if (!v.eq(U256.ofU64(27)) && !v.eq(U256.ofU64(28))) { return none; }
+  if (r.isZero() || r.ge(n) || s.isZero() || s.ge(n)) { return none; }
+
+  Field fp = Field.create(secpP());
+  Curve c = Curve.create(fp, U256.ofU64(7));
+  // R's x is r itself: v only says which of the two y's, and r < n < p always holds here.
+  u64[] x = fp.fromU256(r);
+  u64[]? y = fp.sqrt(fp.add(fp.mul(fp.square(x), x), c.b));
+  if (y is null) { return none; }
+  bool odd = (fp.toU256(y!).low() & 1) == 1;
+  bool wantOdd = v.eq(U256.ofU64(28));
+  u64[] yy = odd == wantOdd ? y! : fp.neg(y!);
+  Jac rPoint = Jac(x, yy, fp.one());
+
+  // Q = r^-1 (s R - e G), as u1 G + u2 R with u1 = -e / r and u2 = s / r, all mod n.
+  Field fq = Field.create(n);
+  u64[] rInv = fq.inv(fq.fromU256(r));
+  U256 u1 = fq.toU256(fq.mul(fq.neg(fq.fromU256(h.mod(n))), rInv));
+  U256 u2 = fq.toU256(fq.mul(fq.fromU256(s), rInv));
+  Jac g = c.fromAffine(U256.fromHex("0x79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")!,
+                       U256.fromHex("0x483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8")!);
+  Jac q = c.add(c.mul(g, u1), c.mul(rPoint, u2));
+  if (c.isInfinity(q)) { return none; }
+  U256[] xy = c.toAffine(q);
+  u8[] pub = u8[].filled(64, 0);
+  xy[0].writeBytes(pub, 0);
+  xy[1].writeBytes(pub, 32);
+  u8[] hash = keccak256(pub);
+  u8[] out = u8[].filled(32, 0);
+  for (i32 i = 12; i < 32; i++) { out[i] = hash[i]; }
+  return out;
+}

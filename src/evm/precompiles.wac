@@ -1,0 +1,80 @@
+// The precompiled contracts: addresses 0x01 to 0x0a in Cancun, whose "code" is a native function. KZG point
+// evaluation (0x0a) is the one missing: it needs BLS12-381 pairings, which wac's `bls` package has but does
+// not export to a project outside the wac repository — see docs/wac-asks.md.
+//
+// A precompile that runs out of gas, or is handed input it refuses, fails like any frame: all the gas it
+// was given is gone and the caller sees 0. One that is not implemented here yet fails the same way, which is
+// wrong in a way the state tests will show rather than hide.
+
+import { crypto.sha256 } from "wac";
+import { ecrecover } from "../precompiles/ecrecover.wac";
+import { ripemd160 } from "../precompiles/ripemd160.wac";
+import { modexp, modexpGas } from "../precompiles/modexp.wac";
+import { blake2f, blake2fRounds } from "../precompiles/blake2f.wac";
+import { ecAdd, ecMul, ecPairing } from "../crypto/bn254.wac";
+import { U256 } from "../u256.wac";
+import { Outcome, Halt } from "./interp.wac";
+
+export bool isPrecompile(U256 a) {
+  return a.fitsU64() && a.low() >= 1 && a.low() <= 0x0a;
+}
+
+/** The precompile addresses, which every transaction starts with warm (EIP-2929). */
+export U256[] precompileAddresses() {
+  U256[] out = [U256.ofU64(1), U256.ofU64(2), U256.ofU64(3), U256.ofU64(4), U256.ofU64(5), U256.ofU64(6),
+                U256.ofU64(7), U256.ofU64(8), U256.ofU64(9), U256.ofU64(10)];
+  return out;
+}
+
+i64 words(i32 len) { return ((len as i64) + 31) / 32; }
+
+Outcome charged(i64 gas, i64 cost, u8[] output) {
+  if (cost > gas) { return Outcome(Halt.Failure("out of gas in a precompile"), 0); }
+  return Outcome(Halt.Return(output), gas - cost);
+}
+
+export Outcome runPrecompile(U256 addr, u8[] input, i64 gas) {
+  i64 w = words(input.len());
+  switch (addr.low() as! i32) {
+    case 0x01: {
+      if (gas < 3000) { return outOfGas(); }
+      return Outcome(Halt.Return(ecrecover(input)), gas - 3000);
+    }
+    case 0x02: { return charged(gas, 60 + 12 * w, sha256(input)); }
+    case 0x03: {
+      if (gas < 600 + 120 * w) { return outOfGas(); }
+      u8[] h = ripemd160(input);
+      u8[] out = u8[].filled(32, 0);
+      for (i32 i = 0; i < 20; i++) { out[12 + i] = h[i]; }
+      return Outcome(Halt.Return(out), gas - 600 - 120 * w);
+    }
+    case 0x04: { return charged(gas, 15 + 3 * w, input); }
+    case 0x05: {
+      i64 cost = modexpGas(input);
+      if (cost < 0 || cost > gas) { return outOfGas(); }
+      return Outcome(Halt.Return(modexp(input)), gas - cost);
+    }
+    case 0x06: { return checked(gas, 150, gas < 150 ? null : ecAdd(input)); }
+    case 0x07: { return checked(gas, 6000, gas < 6000 ? null : ecMul(input)); }
+    case 0x08: {
+      i64 cost = 45000 + 34000 * ((input.len() / 192) as i64);
+      return checked(gas, cost, gas < cost ? null : ecPairing(input));
+    }
+    case 0x09: {
+      i64 rounds = blake2fRounds(input);
+      if (rounds < 0) { return Outcome(Halt.Failure("malformed BLAKE2F input"), 0); }
+      if (rounds > gas) { return outOfGas(); }
+      return Outcome(Halt.Return(blake2f(input)), gas - rounds);
+    }
+    default: { return Outcome(Halt.Failure("precompile 0x\{addr.low() as! i32} is not implemented"), 0); }
+  }
+}
+
+Outcome outOfGas() { return Outcome(Halt.Failure("out of gas in a precompile"), 0); }
+
+/** A precompile that may refuse its input: null output is a failure, which consumes everything. */
+Outcome checked(i64 gas, i64 cost, u8[]? output) {
+  if (cost > gas) { return outOfGas(); }
+  if (output is null) { return Outcome(Halt.Failure("precompile refused its input"), 0); }
+  return Outcome(Halt.Return(output!), gas - cost);
+}

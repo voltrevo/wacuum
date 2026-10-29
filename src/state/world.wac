@@ -1,0 +1,313 @@
+// The world a transaction runs against: accounts and their storage, and everything about the transaction in
+// flight that a revert has to undo — transient storage, the warm sets of EIP-2929, logs, the refund counter,
+// and which accounts were created or destroyed.
+//
+// ## One journal, and a snapshot is its length
+//
+// Every change goes through a method here that first records how to undo it. A call frame takes a snapshot
+// before it runs — the journal's length and the log count — and a failure rolls back to it by undoing
+// entries newest first. That is the whole mechanism, so a change made any other way would survive a revert
+// it should not; nothing outside this file writes an account's fields.
+//
+// ## Original values
+//
+// SSTORE's gas (EIP-2200) depends on what a slot held when the *transaction* began, which is neither the
+// current value nor the value before this frame. The first write to a slot in a transaction records the
+// value it is overwriting in `original`, and `endTransaction` forgets them all. A revert does not remove the
+// record, and need not: what the slot held at the start of the transaction is still what it held.
+
+import { Map, Vec } from "core";
+import { crypto.keccak256 } from "wac";
+import { U256 } from "../u256.wac";
+
+export i32 hashU256(U256 k) {
+  u64 h = k.w0 ^ (k.w1 * 0x9e3779b97f4a7c15) ^ (k.w2 * 0xc2b2ae3d27d4eb4f) ^ (k.w3 * 0x165667b19e3779f9);
+  h = h ^ (h >> 29);
+  return (h ^ (h >> 32)) as@ i32;
+}
+export bool eqU256(U256 a, U256 b) { return a.eq(b); }
+
+export Map<U256, U256> slotMap() { return Map.create(hashU256, eqU256); }
+
+/** keccak256 of the empty string: the code hash of every account without code. */
+export U256 emptyCodeHash() {
+  return U256.fromHex("0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470")!;
+}
+
+export struct Account {
+  u64 nonce;
+  U256 balance;
+  u8[] code;
+  U256 codeHash;
+  /** Nonzero slots only: writing zero removes the entry, so iterating gives exactly what the trie holds. */
+  Map<U256, U256> storage;
+
+  Account empty() { return Account(0, U256.zero(), u8[].filled(0, 0), emptyCodeHash(), slotMap()); }
+
+  /** EIP-161's "empty": no nonce, no balance, no code. Such an account is deleted when touched. */
+  bool isEmpty(this) { return this.nonce == 0 && this.balance.isZero() && this.code.len() == 0; }
+}
+
+export struct Log {
+  U256 address;
+  U256[] topics;
+  u8[] data;
+}
+
+/** How to undo one change. */
+enum Change {
+  Created(U256 addr),
+  Balance(U256 addr, U256 prev),
+  Nonce(U256 addr, u64 prev),
+  Code(U256 addr, u8[] prev, U256 prevHash),
+  Storage(U256 addr, U256 key, U256 prev),
+  Transient(U256 addr, U256 key, U256 prev),
+  WarmAddress(U256 addr),
+  WarmSlot(U256 addr, U256 key),
+  Refund(i64 prev),
+  Destructed(U256 addr),
+  CreatedThisTx(U256 addr),
+  Touched(U256 addr),
+}
+
+export struct Snapshot {
+  i32 journal;
+  i32 logs;
+}
+
+export struct World {
+  Map<U256, Account> accounts;
+  Vec<Change> journal;
+
+  // Per transaction, cleared by `endTransaction`.
+  Map<U256, Map<U256, U256>> original;
+  Map<U256, Map<U256, U256>> transient;
+  Map<U256, bool> warmAddresses;
+  Map<U256, Map<U256, bool>> warmSlots;
+  Map<U256, bool> createdThisTx;
+  Map<U256, bool> destructed;
+  Map<U256, bool> touched;
+  Vec<Log> logs;
+  i64 refund;
+
+  World create() {
+    return World(Map.create(hashU256, eqU256), Vec.create(), Map.create(hashU256, eqU256), Map.create(hashU256, eqU256),
+                 Map.create(hashU256, eqU256), Map.create(hashU256, eqU256), Map.create(hashU256, eqU256),
+                 Map.create(hashU256, eqU256), Map.create(hashU256, eqU256), Vec.create(), 0);
+  }
+
+  // ── Reading ─────────────────────────────────────────────────────────────────
+
+  Account? get(this, U256 addr) { return this.accounts.get(addr); }
+  bool exists(this, U256 addr) { return this.accounts.has(addr); }
+
+  /** Absent, or present and empty — what the gas rules call "dead". */
+  bool isDead(this, U256 addr) {
+    Account? a = this.accounts.get(addr);
+    return a is null || a!.isEmpty();
+  }
+
+  U256 balance(this, U256 addr) {
+    Account? a = this.accounts.get(addr);
+    return a is null ? U256.zero() : a!.balance;
+  }
+  u64 nonce(this, U256 addr) {
+    Account? a = this.accounts.get(addr);
+    return a is null ? 0 : a!.nonce;
+  }
+  u8[] code(this, U256 addr) {
+    Account? a = this.accounts.get(addr);
+    return a is null ? u8[].filled(0, 0) : a!.code;
+  }
+  U256 storage(this, U256 addr, U256 key) {
+    Account? a = this.accounts.get(addr);
+    if (a is null) { return U256.zero(); }
+    return a!.storage.getOr(key, U256.zero());
+  }
+  /** What the slot held when the transaction began. */
+  U256 originalStorage(this, U256 addr, U256 key) {
+    Map<U256, U256>? o = this.original.get(addr);
+    if (o is not null) {
+      U256? v = o!.get(key);
+      if (v is not null) { return v!; }
+    }
+    return this.storage(addr, key);
+  }
+  U256 transientStorage(this, U256 addr, U256 key) {
+    Map<U256, U256>? t = this.transient.get(addr);
+    return t is null ? U256.zero() : t!.getOr(key, U256.zero());
+  }
+
+  // ── Writing, journaled ──────────────────────────────────────────────────────
+
+  /** The account, created empty (and journaled) if it does not exist. */
+  Account touch(this, U256 addr) {
+    Account? a = this.accounts.get(addr);
+    if (a is not null) { return a!; }
+    Account n = Account.empty();
+    this.accounts.set(addr, n);
+    this.journal.push(Change.Created(addr));
+    return n;
+  }
+
+  /**
+   * Note that an account was touched, for EIP-161's end-of-transaction sweep of empty accounts. Touching
+   * does not create: an account that does not exist has nothing to sweep.
+   */
+  void markTouched(this, U256 addr) {
+    if (this.touched.has(addr)) { return; }
+    this.touched.set(addr, true);
+    this.journal.push(Change.Touched(addr));
+  }
+
+  void setBalance(this, U256 addr, U256 v) {
+    Account a = this.touch(addr);
+    this.journal.push(Change.Balance(addr, a.balance));
+    a.balance = v;
+    this.markTouched(addr);
+  }
+
+  void addBalance(this, U256 addr, U256 v) { this.setBalance(addr, this.balance(addr).add(v)); }
+
+  /** Move `v` from one account to another. The caller has checked the balance. */
+  void transfer(this, U256 from, U256 to, U256 v) {
+    this.setBalance(from, this.balance(from).sub(v));
+    this.setBalance(to, this.balance(to).add(v));
+  }
+
+  void setNonce(this, U256 addr, u64 n) {
+    Account a = this.touch(addr);
+    this.journal.push(Change.Nonce(addr, a.nonce));
+    a.nonce = n;
+  }
+
+  void setCode(this, U256 addr, u8[] code) {
+    Account a = this.touch(addr);
+    this.journal.push(Change.Code(addr, a.code, a.codeHash));
+    a.code = code;
+    a.codeHash = code.len() == 0 ? emptyCodeHash() : U256.fromBytes(keccak256(code), 0, 32);
+  }
+
+  void setStorage(this, U256 addr, U256 key, U256 v) {
+    Account a = this.touch(addr);
+    U256 prev = a.storage.getOr(key, U256.zero());
+    Map<U256, U256>? o = this.original.get(addr);
+    if (o is null) {
+      Map<U256, U256> fresh = slotMap();
+      this.original.set(addr, fresh);
+      o = fresh;
+    }
+    if (!o!.has(key)) { o!.set(key, prev); }
+    this.journal.push(Change.Storage(addr, key, prev));
+    putSlot(a.storage, key, v);
+  }
+
+  void setTransient(this, U256 addr, U256 key, U256 v) {
+    Map<U256, U256>? t = this.transient.get(addr);
+    if (t is null) {
+      Map<U256, U256> fresh = slotMap();
+      this.transient.set(addr, fresh);
+      t = fresh;
+    }
+    this.journal.push(Change.Transient(addr, key, t!.getOr(key, U256.zero())));
+    putSlot(t!, key, v);
+  }
+
+  /** Warm the address, answering whether it was cold. */
+  bool warmAddress(this, U256 addr) {
+    if (this.warmAddresses.has(addr)) { return false; }
+    this.warmAddresses.set(addr, true);
+    this.journal.push(Change.WarmAddress(addr));
+    return true;
+  }
+
+  /** Warm the slot, answering whether it was cold. */
+  bool warmSlot(this, U256 addr, U256 key) {
+    Map<U256, bool>? s = this.warmSlots.get(addr);
+    if (s is null) {
+      Map<U256, bool> fresh = Map.create(hashU256, eqU256);
+      this.warmSlots.set(addr, fresh);
+      s = fresh;
+    }
+    if (s!.has(key)) { return false; }
+    s!.set(key, true);
+    this.journal.push(Change.WarmSlot(addr, key));
+    return true;
+  }
+
+  void addRefund(this, i64 delta) {
+    this.journal.push(Change.Refund(this.refund));
+    this.refund += delta;
+  }
+
+  void log(this, Log l) { this.logs.push(l); }
+
+  void markCreated(this, U256 addr) {
+    if (this.createdThisTx.has(addr)) { return; }
+    this.createdThisTx.set(addr, true);
+    this.journal.push(Change.CreatedThisTx(addr));
+  }
+
+  void markDestructed(this, U256 addr) {
+    if (this.destructed.has(addr)) { return; }
+    this.destructed.set(addr, true);
+    this.journal.push(Change.Destructed(addr));
+  }
+
+  // ── Snapshots ───────────────────────────────────────────────────────────────
+
+  Snapshot snapshot(const this) { return Snapshot(this.journal.len(), this.logs.len()); }
+
+  void revert(this, Snapshot s) {
+    while (this.journal.len() > s.journal) {
+      Change c = this.journal.pop()!;
+      match (c) {
+        Created(addr): { this.accounts.remove(addr); }
+        Balance(addr, prev): { Account a = this.accounts.get(addr)!; a.balance = prev; }
+        Nonce(addr, prev): { Account a = this.accounts.get(addr)!; a.nonce = prev; }
+        Code(addr, prev, prevHash): {
+          Account a = this.accounts.get(addr)!;
+          a.code = prev;
+          a.codeHash = prevHash;
+        }
+        Storage(addr, key, prev): { putSlot(this.accounts.get(addr)!.storage, key, prev); }
+        Transient(addr, key, prev): { putSlot(this.transient.get(addr)!, key, prev); }
+        WarmAddress(addr): { this.warmAddresses.remove(addr); }
+        WarmSlot(addr, key): { this.warmSlots.get(addr)!.remove(key); }
+        Refund(prev): { this.refund = prev; }
+        Destructed(addr): { this.destructed.remove(addr); }
+        CreatedThisTx(addr): { this.createdThisTx.remove(addr); }
+        Touched(addr): { this.touched.remove(addr); }
+      }
+    }
+    while (this.logs.len() > s.logs) { this.logs.pop(); }
+  }
+
+  /**
+   * Close a transaction: remove what SELFDESTRUCT destroyed and the empty accounts it touched, and forget
+   * everything that lives only as long as one transaction. Nothing after this can be reverted.
+   */
+  void endTransaction(this) {
+    U256[] gone = this.destructed.keys();
+    for (i32 i = 0; i < gone.len(); i++) { this.accounts.remove(gone[i]); }
+    U256[] t = this.touched.keys();
+    for (i32 i = 0; i < t.len(); i++) {
+      Account? a = this.accounts.get(t[i]);
+      if (a is not null && a!.isEmpty()) { this.accounts.remove(t[i]); }
+    }
+    this.journal.clear();
+    this.original = Map.create(hashU256, eqU256);
+    this.transient = Map.create(hashU256, eqU256);
+    this.warmAddresses = Map.create(hashU256, eqU256);
+    this.warmSlots = Map.create(hashU256, eqU256);
+    this.createdThisTx = Map.create(hashU256, eqU256);
+    this.destructed = Map.create(hashU256, eqU256);
+    this.touched = Map.create(hashU256, eqU256);
+    this.refund = 0;
+  }
+}
+
+/** Set a slot, removing it when the value is zero, so a map holds only what a trie would. */
+void putSlot(Map<U256, U256> m, U256 key, U256 v) {
+  if (v.isZero()) { m.remove(key); } else { m.set(key, v); }
+}

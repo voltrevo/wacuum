@@ -48,3 +48,16 @@ export const struct W {
 
 **What it costs here:** `U256`'s methods take a plain `this`, and nothing in this repository writes
 `const U256`. The type is immutable either way.
+
+## `bls` and `bignum` are not reachable from outside the repository
+
+A project depending on wac gets `lib.wac`, and `lib.wac` exports neither `packages/bls` nor
+`packages/bignum`; neither has a `wac.json5` of its own, so no `subdir` mapping reaches them either.
+
+**What it costs here:** KZG point evaluation (precompile 0x0a, EIP-4844) needs BLS12-381 pairings, which
+`bls` has, so it is not implemented: 65 of the Cancun state tests. Prague's seven BLS12-381 precompiles
+(EIP-2537) will want the same package, with G1 and G2 addition and multi-scalar multiplication besides.
+MODEXP went without `bignum` because `src/limbs.wac` already had the division it needed.
+
+The fix is two lines in `lib.wac`, `export * as bls from …` and `export * as bignum from …`, if their
+public names are what they should be for a consumer.

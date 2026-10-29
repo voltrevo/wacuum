@@ -1,0 +1,42 @@
+// The trie builder against `trieanyorder.json` from ethereum/tests (vendored in wac's packages/mpt): seven
+// tries whose keys share prefixes, differ in length and hold values small enough to be embedded.
+
+import { trieRoot, emptyRoot } from "../src/trie/trie.wac";
+import { hexToBytes, bytesToHex } from "../src/hex.wac";
+import { Check } from "./check.wac";
+
+/** Text as bytes, or hex when it starts `0x` — the fixture's own convention. */
+u8[] bytesOf(string s) {
+  if (s.len() >= 2 && s.slice(0, 2) == "0x") { return hexToBytes(s)!; }
+  return s.toBytes();
+}
+
+void expectRoot(Check t, string name, string[] pairs, string root) {
+  u8[][] ks = u8[][].defaulted(pairs.len() / 2);
+  u8[][] vs = u8[][].defaulted(pairs.len() / 2);
+  for (i32 i = 0; i < pairs.len() / 2; i++) {
+    ks[i] = bytesOf(pairs[2 * i]);
+    vs[i] = bytesOf(pairs[2 * i + 1]);
+  }
+  t.eqStr(bytesToHex(trieRoot(ks, vs)), root, name);
+}
+
+export string test_trieanyorder() {
+  Check t = Check.create();
+  expectRoot(t, "singleItem", ["A", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+             "0xd23786fb4a010da3ce639d66d5e904a11dbc02746d1ce25029e53290cabf28ab");
+  expectRoot(t, "dogs", ["doe", "reindeer", "dog", "puppy", "dogglesworth", "cat"],
+             "0x8aad789dff2f538bca5d8ea56e8abe10f4c7ba3a5dea95fea4cd6e7c3a1168d3");
+  expectRoot(t, "puppy", ["do", "verb", "horse", "stallion", "doge", "coin", "dog", "puppy"],
+             "0x5991bb8c6514148a29db676a14ac506cd2cd5775ace63c30a4fe457715e9ac84");
+  expectRoot(t, "foo", ["foo", "bar", "food", "bass"],
+             "0x17beaa1648bafa633cda809c90c04af50fc8aed3cb40d16efbddee6fdf63c4c3");
+  expectRoot(t, "smallValues", ["be", "e", "dog", "puppy", "bed", "d"],
+             "0x3f67c7a47520f79faa29255d2d3c084a7a6df0453116ed7232ff10277a8be68b");
+  expectRoot(t, "testy", ["test", "test", "te", "testy"],
+             "0x8452568af70d8d140f58d941338542f645fcca50094b20f3c3d8c3df49337928");
+  expectRoot(t, "hex", ["0x0045", "0x0123456789", "0x4500", "0x9876543210"],
+             "0x285505fcabe84badc8aa310e2aae17eddc7d120aabec8a476902c8184b3a3503");
+  t.eqStr(bytesToHex(emptyRoot()), "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421", "empty");
+  return t.report();
+}

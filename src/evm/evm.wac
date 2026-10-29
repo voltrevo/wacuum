@@ -1,0 +1,151 @@
+// Messages: what a call or a creation is, and how one runs against the world.
+//
+// This follows the structure of `ethereum/execution-specs` for Cancun — `process_message`,
+// `process_create_message`, `generic_call` and `generic_create` — closely enough that each function here can
+// be read beside its counterpart there. Where the spec's order of operations is observable (which charges
+// come before which checks, what is refunded when a call cannot happen) the order here is the spec's.
+
+import { Map } from "core";
+import { crypto.keccak256 } from "wac";
+import { rlp.Item, rlp.encode } from "wac";
+import { U256 } from "../u256.wac";
+import { World, Snapshot } from "../state/world.wac";
+import { Frame, Outcome, Halt, run } from "./interp.wac";
+import { OpTable } from "./table.wac";
+import { isPrecompile, runPrecompile } from "./precompiles.wac";
+
+export static i32 MAX_DEPTH = 1024;
+/** EIP-170. */
+export static i32 MAX_CODE_SIZE = 24576;
+/** EIP-3860: twice the code size limit. */
+export static i32 MAX_INITCODE_SIZE = 49152;
+
+export struct BlockEnv {
+  U256 coinbase;
+  U256 number;
+  U256 timestamp;
+  U256 gasLimit;
+  U256 prevRandao;
+  U256 baseFee;
+  U256 blobBaseFee;
+  U256 chainId;
+  /** The hashes BLOCKHASH can answer, by block number. */
+  Map<U256, U256> hashes;
+}
+
+export struct TxEnv {
+  U256 origin;
+  U256 gasPrice;
+  U256[] blobHashes;
+}
+
+export struct Evm {
+  World world;
+  BlockEnv block;
+  TxEnv tx;
+  OpTable table;
+  /** Handed one line per step when set: depth, pc, opcode, gas and the top of the stack. For debugging. */
+  fn<void(string)>? tracer;
+}
+
+export struct Message {
+  U256 caller;
+  /** Whose account the code runs as: its storage, its balance, ADDRESS. */
+  U256 target;
+  /** Whose code runs; differs from `target` for DELEGATECALL and CALLCODE. */
+  U256 codeAddress;
+  U256 value;
+  u8[] data;
+  i64 gas;
+  bool isStatic;
+  i32 depth;
+  /** False for DELEGATECALL, whose value is only what CALLVALUE reports. */
+  bool transfersValue;
+}
+
+/** Run a message call: the value moves, then the code (or the precompile) runs, and a failure undoes both. */
+export Outcome processMessage(Evm evm, Message m) {
+  World w = evm.world;
+  Snapshot s = w.snapshot();
+  w.markTouched(m.target);
+  if (m.transfersValue && !m.value.isZero()) { w.transfer(m.caller, m.target, m.value); }
+  Outcome o = execute(evm, m, w.code(m.codeAddress));
+  if (!o.succeeded()) { w.revert(s); }
+  return o;
+}
+
+Outcome execute(Evm evm, Message m, u8[] code) {
+  if (isPrecompile(m.codeAddress)) { return runPrecompile(m.codeAddress, m.data, m.gas); }
+  if (code.len() == 0) { return Outcome(Halt.Stop, m.gas); }
+  return run(Frame.create(evm, m, code));
+}
+
+/**
+ * Run a creation whose address is already chosen and checked for collision: the new account gets nonce 1,
+ * the init code runs, and what it returns becomes the code if it is allowed and paid for.
+ */
+export Outcome processCreate(Evm evm, Message m) {
+  World w = evm.world;
+  Snapshot s = w.snapshot();
+  w.touch(m.target);
+  w.markCreated(m.target);
+  w.setNonce(m.target, 1);
+  w.markTouched(m.target);
+  if (!m.value.isZero()) { w.transfer(m.caller, m.target, m.value); }
+  // The message carries the init code to here; once it is code, the frame's calldata is empty.
+  u8[] initcode = m.data;
+  m.data = u8[].filled(0, 0);
+  Outcome o = execute(evm, m, initcode);
+  if (!o.succeeded()) {
+    w.revert(s);
+    return o;
+  }
+  u8[] code = o.output();
+  // EIP-3541 refuses code starting 0xEF; EIP-170 caps the size; and the deposit is 200 gas a byte.
+  i64 deposit = 200 * (code.len() as i64);
+  if ((code.len() > 0 && code[0] == 0xEF) || code.len() > MAX_CODE_SIZE || deposit > o.gasLeft) {
+    w.revert(s);
+    return Outcome(Halt.Failure("code deposit refused"), 0);
+  }
+  w.setCode(m.target, code);
+  return Outcome(Halt.Return(u8[].filled(0, 0)), o.gasLeft - deposit);
+}
+
+/** The address CREATE gives: the last 20 bytes of keccak256(rlp([sender, nonce])). */
+export U256 createAddress(U256 sender, u64 nonce) {
+  Item[] fields = [Item.Bytes(addressBytes(sender)), Item.Bytes(minimalBytes(nonce))];
+  return U256.fromBytes(keccak256(encode(Item.List(fields))), 12, 20);
+}
+
+/** The address CREATE2 gives: keccak256(0xff ++ sender ++ salt ++ keccak256(initcode)), last 20 bytes. */
+export U256 create2Address(U256 sender, U256 salt, u8[] initcode) {
+  u8[] buf = u8[].filled(85, 0);
+  buf[0] = 0xFF;
+  u8[] a = addressBytes(sender);
+  for (i32 i = 0; i < 20; i++) { buf[1 + i] = a[i]; }
+  salt.writeBytes(buf, 21);
+  u8[] h = keccak256(initcode);
+  for (i32 i = 0; i < 32; i++) { buf[53 + i] = h[i]; }
+  return U256.fromBytes(keccak256(buf), 12, 20);
+}
+
+/** An address's 20 bytes. */
+export u8[] addressBytes(U256 a) {
+  u8[] full = a.toBytes();
+  u8[] out = u8[].filled(20, 0);
+  for (i32 i = 0; i < 20; i++) { out[i] = full[12 + i]; }
+  return out;
+}
+
+/** The shortest big-endian bytes of `v`: RLP's spelling of an integer, empty for zero. */
+export u8[] minimalBytes(u64 v) {
+  i32 n = 0;
+  u64 x = v;
+  while (x != 0) { n++; x = x >> 8; }
+  u8[] out = u8[].filled(n, 0);
+  for (i32 i = 0; i < n; i++) { out[i] = (v >> ((n - 1 - i) * 8)) as@ u8; }
+  return out;
+}
+
+/** All but one 64th — EIP-150's cap on the gas a call or creation may pass on. */
+export i64 allButOne64th(i64 g) { return g - g / 64; }

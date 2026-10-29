@@ -1,0 +1,186 @@
+// Arithmetic modulo a prime below 2^256, in Montgomery form.
+//
+// An element is eight 32-bit limbs in u64s, least significant first, holding aR mod p with R = 2^256.
+// Multiplication is CIOS — Koç, Acar and Kaliski's coarsely integrated operand scanning — over those
+// limbs, which needs no 64x64->128 multiply: a limb product plus two limbs fits in a u64. One `Field`
+// serves any odd prime, so secp256k1's two moduli and bn254's share it; none of this is constant-time,
+// and nothing here handles a secret — the precompiles only verify.
+//
+// Elements are treated as values: no method writes into an argument.
+
+import { U256 } from "../u256.wac";
+import { modLimbs } from "../limbs.wac";
+
+static u64 MASK = 0xFFFFFFFF;
+
+export struct Field {
+  U256 modulus;
+  u64[] p;
+  /** -p^-1 mod 2^32. */
+  u64 n0;
+  /** R^2 mod p, which `fromU256` multiplies by to enter Montgomery form. */
+  u64[] r2;
+  /** R mod p: one, in Montgomery form. */
+  u64[] oneM;
+
+  Field create(U256 modulus) {
+    u64[] p = limbsOf(modulus);
+    // Newton's iteration doubles the correct low bits each step: five steps reach 32.
+    u64 inv = 1;
+    for (i32 i = 0; i < 5; i++) { inv = (inv * (2 - p[0] * inv)) & MASK; }
+    u64 n0 = (0 - inv) & MASK;
+    u64[] r = u64[].filled(9, 0);
+    r[8] = 1;
+    u64[] rr = u64[].filled(17, 0);
+    rr[16] = 1;
+    return Field(modulus, p, n0, fit(modLimbs(rr, p)), fit(modLimbs(r, p)));
+  }
+
+  u64[] zero(this) { return u64[].filled(8, 0); }
+  u64[] one(this) { return this.oneM; }
+
+  u64[] fromU256(this, U256 x) {
+    return this.mul(fit(modLimbs(limbsOf(x), this.p)), this.r2);
+  }
+
+  U256 toU256(this, u64[] a) {
+    u64[] plain = u64[].filled(8, 0);
+    plain[0] = 1;
+    u64[] l = this.mul(a, plain);
+    return U256(l[0] | (l[1] << 32), l[2] | (l[3] << 32), l[4] | (l[5] << 32), l[6] | (l[7] << 32));
+  }
+
+  u64[] mul(this, u64[] a, u64[] b) {
+    u64[] p = this.p;
+    u64[] t = u64[].filled(10, 0);
+    for (i32 i = 0; i < 8; i++) {
+      u64 c = 0;
+      u64 bi = b[i];
+      for (i32 j = 0; j < 8; j++) {
+        u64 s = t[j] + a[j] * bi + c;
+        t[j] = s & MASK;
+        c = s >> 32;
+      }
+      u64 s8 = t[8] + c;
+      t[8] = s8 & MASK;
+      t[9] = s8 >> 32;
+      u64 m = (t[0] * this.n0) & MASK;
+      u64 s0 = t[0] + m * p[0];
+      c = s0 >> 32;
+      for (i32 j = 1; j < 8; j++) {
+        u64 s = t[j] + m * p[j] + c;
+        t[j - 1] = s & MASK;
+        c = s >> 32;
+      }
+      u64 s7 = t[8] + c;
+      t[7] = s7 & MASK;
+      t[8] = t[9] + (s7 >> 32);
+    }
+    u64[] out = u64[].filled(8, 0);
+    for (i32 j = 0; j < 8; j++) { out[j] = t[j]; }
+    if (t[8] != 0 || !less(out, p)) { subInPlace(out, p); }
+    return out;
+  }
+
+  u64[] square(this, u64[] a) { return this.mul(a, a); }
+
+  u64[] add(this, u64[] a, u64[] b) {
+    u64[] out = u64[].filled(8, 0);
+    u64 c = 0;
+    for (i32 i = 0; i < 8; i++) {
+      u64 s = a[i] + b[i] + c;
+      out[i] = s & MASK;
+      c = s >> 32;
+    }
+    if (c != 0 || !less(out, this.p)) { subInPlace(out, this.p); }
+    return out;
+  }
+
+  u64[] sub(this, u64[] a, u64[] b) {
+    u64[] out = u64[].filled(8, 0);
+    u64 borrow = 0;
+    for (i32 i = 0; i < 8; i++) {
+      u64 d = a[i] - b[i] - borrow;
+      out[i] = d & MASK;
+      borrow = (d >> 32) != 0 ? 1 : 0;
+    }
+    if (borrow != 0) {
+      u64 c = 0;
+      for (i32 i = 0; i < 8; i++) {
+        u64 s = out[i] + this.p[i] + c;
+        out[i] = s & MASK;
+        c = s >> 32;
+      }
+    }
+    return out;
+  }
+
+  u64[] neg(this, u64[] a) { return this.sub(this.zero(), a); }
+
+  u64[] double(this, u64[] a) { return this.add(a, a); }
+
+  bool isZero(this, u64[] a) {
+    for (i32 i = 0; i < 8; i++) {
+      if (a[i] != 0) { return false; }
+    }
+    return true;
+  }
+
+  bool eq(this, u64[] a, u64[] b) {
+    for (i32 i = 0; i < 8; i++) {
+      if (a[i] != b[i]) { return false; }
+    }
+    return true;
+  }
+
+  u64[] pow(this, u64[] a, U256 e) {
+    u64[] result = this.oneM;
+    for (i32 i = 255; i >= 0; i--) {
+      result = this.square(result);
+      if (!e.shr(i).and(U256.one()).isZero()) { result = this.mul(result, a); }
+    }
+    return result;
+  }
+
+  /** a^(p-2): the inverse of a nonzero element, by Fermat. Zero has none and gives zero. */
+  u64[] inv(this, u64[] a) { return this.pow(a, this.modulus.sub(U256.ofU64(2))); }
+
+  /** A square root when p is 3 mod 4, or null when `a` is not a square. */
+  u64[]? sqrt(this, u64[] a) {
+    u64[] c = this.pow(a, this.modulus.add(U256.one()).shr(2));
+    return this.eq(this.square(c), a) ? c : null;
+  }
+}
+
+u64[] limbsOf(U256 x) {
+  u64[] l = u64[].filled(8, 0);
+  for (i32 i = 0; i < 4; i++) {
+    u64 w = x.word(i);
+    l[2 * i] = w & MASK;
+    l[2 * i + 1] = w >> 32;
+  }
+  return l;
+}
+
+/** Exactly eight limbs, from a reduced value that may have been held in more or fewer. */
+u64[] fit(u64[] x) {
+  u64[] out = u64[].filled(8, 0);
+  for (i32 i = 0; i < 8 && i < x.len(); i++) { out[i] = x[i]; }
+  return out;
+}
+
+bool less(u64[] a, u64[] b) {
+  for (i32 i = 7; i >= 0; i--) {
+    if (a[i] != b[i]) { return a[i] < b[i]; }
+  }
+  return false;
+}
+
+void subInPlace(u64[] a, u64[] b) {
+  u64 borrow = 0;
+  for (i32 i = 0; i < 8; i++) {
+    u64 d = a[i] - b[i] - borrow;
+    a[i] = d & MASK;
+    borrow = (d >> 32) != 0 ? 1 : 0;
+  }
+}

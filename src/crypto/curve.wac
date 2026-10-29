@@ -1,0 +1,98 @@
+// Points on y^2 = x^3 + b over a prime field, in Jacobian coordinates: (X, Y, Z) is the affine point
+// (X/Z^2, Y/Z^3), and Z = 0 is the point at infinity. secp256k1 (b = 7) and bn254's G1 (b = 3) are both
+// this shape, so ecrecover and the bn254 precompiles share it.
+//
+// The formulas are the Explicit-Formulas Database's for a = 0: dbl-2009-l and add-2007-bl.
+
+import { U256 } from "../u256.wac";
+import { Field } from "./field.wac";
+
+export struct Jac {
+  u64[] x;
+  u64[] y;
+  u64[] z;
+}
+
+export struct Curve {
+  Field f;
+  /** b, in Montgomery form. */
+  u64[] b;
+
+  Curve create(Field f, U256 b) { return Curve(f, f.fromU256(b)); }
+
+  Jac infinity(this) { return Jac(this.f.one(), this.f.one(), this.f.zero()); }
+  bool isInfinity(this, Jac p) { return this.f.isZero(p.z); }
+
+  /** An affine point given as plain integers. The caller has checked it is on the curve. */
+  Jac fromAffine(this, U256 x, U256 y) { return Jac(this.f.fromU256(x), this.f.fromU256(y), this.f.one()); }
+
+  /** Whether plain (x, y) satisfies the curve equation; both must already be below p. */
+  bool onCurve(this, U256 x, U256 y) {
+    Field f = this.f;
+    u64[] xm = f.fromU256(x);
+    u64[] ym = f.fromU256(y);
+    return f.eq(f.square(ym), f.add(f.mul(f.square(xm), xm), this.b));
+  }
+
+  Jac double(this, Jac p) {
+    Field f = this.f;
+    if (f.isZero(p.z) || f.isZero(p.y)) { return this.infinity(); }
+    u64[] a = f.square(p.x);
+    u64[] bb = f.square(p.y);
+    u64[] c = f.square(bb);
+    u64[] d = f.double(f.sub(f.sub(f.square(f.add(p.x, bb)), a), c));
+    u64[] e = f.add(f.double(a), a);
+    u64[] ff = f.square(e);
+    u64[] x3 = f.sub(ff, f.double(d));
+    u64[] c8 = f.double(f.double(f.double(c)));
+    u64[] y3 = f.sub(f.mul(e, f.sub(d, x3)), c8);
+    u64[] z3 = f.double(f.mul(p.y, p.z));
+    return Jac(x3, y3, z3);
+  }
+
+  Jac add(this, Jac p, Jac q) {
+    Field f = this.f;
+    if (f.isZero(p.z)) { return q; }
+    if (f.isZero(q.z)) { return p; }
+    u64[] z1z1 = f.square(p.z);
+    u64[] z2z2 = f.square(q.z);
+    u64[] u1 = f.mul(p.x, z2z2);
+    u64[] u2 = f.mul(q.x, z1z1);
+    u64[] s1 = f.mul(f.mul(p.y, q.z), z2z2);
+    u64[] s2 = f.mul(f.mul(q.y, p.z), z1z1);
+    u64[] h = f.sub(u2, u1);
+    u64[] r = f.double(f.sub(s2, s1));
+    if (f.isZero(h)) {
+      return f.isZero(r) ? this.double(p) : this.infinity();
+    }
+    u64[] i = f.square(f.double(h));
+    u64[] j = f.mul(h, i);
+    u64[] v = f.mul(u1, i);
+    u64[] x3 = f.sub(f.sub(f.square(r), j), f.double(v));
+    u64[] y3 = f.sub(f.mul(r, f.sub(v, x3)), f.double(f.mul(s1, j)));
+    u64[] z3 = f.mul(f.sub(f.sub(f.square(f.add(p.z, q.z)), z1z1), z2z2), h);
+    return Jac(x3, y3, z3);
+  }
+
+  Jac neg(this, Jac p) { return Jac(p.x, this.f.neg(p.y), p.z); }
+
+  /** k * p, double and add from the top bit. */
+  Jac mul(this, Jac p, U256 k) {
+    Jac r = this.infinity();
+    for (i32 i = 255; i >= 0; i--) {
+      r = this.double(r);
+      if (!k.shr(i).and(U256.one()).isZero()) { r = this.add(r, p); }
+    }
+    return r;
+  }
+
+  /** The affine coordinates as plain integers; the point must not be at infinity. */
+  U256[] toAffine(this, Jac p) {
+    Field f = this.f;
+    u64[] zi = f.inv(p.z);
+    u64[] zi2 = f.square(zi);
+    U256 x = f.toU256(f.mul(p.x, zi2));
+    U256 y = f.toU256(f.mul(p.y, f.mul(zi2, zi)));
+    return [x, y];
+  }
+}

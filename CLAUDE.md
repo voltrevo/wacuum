@@ -21,10 +21,24 @@ README's table, top to bottom, and each row is "done" when the matching `ethereu
   was the test's (MLOAD at 33 reaches a third word).
 - Comments explain *why*, in full sentences, as wac's own do.
 
+## Finding out what is wrong
+
+The state tests are the oracle, and they are good at it: almost every bug so far was found by one, and
+named by `--verbose` (which accounts differ from the fixture's post-state) and `--trace` (every step).
+
+    wac task statetests                                         # the totals, and every failure
+    wac dist/statetest.wasm --verbose --filter 'd29-g0]' FILE    # one case, and what differs
+
+When a fixture and this disagree about something derived (an address, a hash), check the derivation
+against an independent implementation before reading bytecode: `CREATE` addresses were wrong for any
+nonce whose bytes are not a palindrome, and ethers' `getCreateAddress` showed it in one line.
+
 ## Building and testing here
 
-    wac task test        # everything, in about a second
+    wac task test        # the unit tests, in about a second
     wac task vectors     # regenerate the U256 cases (needs node)
+    wac task fixtures    # execution-spec-tests v5.4.0 into fixtures/
+    wac task statetests  # every Cancun state test, about a minute
 
 - `wac update` could not reach the network in the container this was started in. `sh tools/use-local-wac.sh
   <wac clone>` fills the package cache from a clone instead.
@@ -36,6 +50,9 @@ README's table, top to bottom, and each row is "done" when the matching `ethereu
   `docs/wac-asks.md`.
 - `not`, `is`, `matches` and friends are keywords, so a method cannot be called `not`; it is `inverted`.
 - No `string.replace`, no `string.startsWith` (use `indexOf(x) == 0`).
+- `fn` is a keyword (it spells function types), so a local cannot be called `fn`.
+- A method call's result is not an lvalue: `m.get(k)!.balance = v` does not parse. Bind it first.
+- Only some of wac's packages are reachable from a project: `lib.wac` decides. `bls` and `bignum` are not.
 - `const` is enforced even on a `const struct`, where the spec says it means nothing; `U256` avoids `const`
   entirely. See `docs/wac-asks.md`.
 - **A diagnostic can be a cascade.** One run reported `unknown type 'bool'` for a `bool[]` that is fine, and

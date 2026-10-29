@@ -1,0 +1,128 @@
+// Unsigned integers of any length, as arrays of 32-bit limbs held in u64s, least significant first.
+//
+// A limb product plus two limbs is at most 2^64 - 1, so schoolbook multiplication never overflows a u64 and
+// needs no 64x64->128 multiply, which wasm does not have. `U256` uses these for its wide operations, and
+// MODEXP uses them at whatever size its operands are.
+
+static u64 MASK32 = 0xFFFFFFFF;
+
+/** The whole product, as many limbs as the two operands together. */
+export u64[] mulFull(const u64[] a, const u64[] b) {
+  u64[] r = u64[].filled(a.len() + b.len(), 0);
+  for (i32 i = 0; i < a.len(); i++) {
+    if (a[i] == 0) { continue; }
+    u64 carry = 0;
+    for (i32 j = 0; j < b.len(); j++) {
+      u64 t = r[i + j] + a[i] * b[j] + carry;
+      r[i + j] = t & MASK32;
+      carry = t >> 32;
+    }
+    r[i + b.len()] = carry;
+  }
+  return r;
+}
+
+export struct DivMod {
+  u64[] quotient;
+  u64[] remainder;
+}
+
+export u64[] modLimbs(const u64[] u, const u64[] v) {
+  return divmod(u, v).remainder;
+}
+
+/** Significant limbs: the length without leading zero limbs. */
+export i32 sigLimbs(const u64[] x) {
+  i32 n = x.len();
+  while (n > 0 && x[n - 1] == 0) { n--; }
+  return n;
+}
+
+i32 leadingZeros32(u64 x) {
+  i32 n = 0;
+  u64 v = x;
+  while ((v & 0x80000000) == 0) { v = v << 1; n++; }
+  return n;
+}
+
+/**
+ * Knuth's algorithm D: `u` divided by `v`, both limb arrays of any length, `v` nonzero. Hacker's Delight's
+ * `divmnu` with the same names, so it can be checked against the book line by line.
+ */
+export DivMod divmod(const u64[] u, const u64[] v) {
+  i32 m = sigLimbs(u);
+  i32 n = sigLimbs(v);
+  u64[] q = u64[].filled(u.len() > 0 ? u.len() : 1, 0);
+  u64[] r = u64[].filled(v.len(), 0);
+  if (n == 0) { trap; }
+  if (m < n) {
+    for (i32 i = 0; i < m; i++) { r[i] = u[i]; }
+    return DivMod(q, r);
+  }
+  if (n == 1) {
+    u64 k = 0;
+    for (i32 j = m - 1; j >= 0; j--) {
+      u64 num = (k << 32) | u[j];
+      q[j] = num / v[0];
+      k = num - q[j] * v[0];
+    }
+    r[0] = k;
+    return DivMod(q, r);
+  }
+
+  // Normalise so the divisor's top limb has its high bit set; then the estimate below is off by at most 2.
+  i32 s = leadingZeros32(v[n - 1]);
+  u64[] vn = u64[].filled(n, 0);
+  for (i32 i = n - 1; i > 0; i--) {
+    vn[i] = ((v[i] << s) | (s == 0 ? 0 : v[i - 1] >> (32 - s))) & MASK32;
+  }
+  vn[0] = (v[0] << s) & MASK32;
+  u64[] un = u64[].filled(m + 1, 0);
+  un[m] = s == 0 ? 0 : u[m - 1] >> (32 - s);
+  for (i32 i = m - 1; i > 0; i--) {
+    un[i] = ((u[i] << s) | (s == 0 ? 0 : u[i - 1] >> (32 - s))) & MASK32;
+  }
+  un[0] = (u[0] << s) & MASK32;
+
+  u64 b = 0x100000000;
+  for (i32 j = m - n; j >= 0; j--) {
+    u64 num = (un[j + n] << 32) | un[j + n - 1];
+    u64 qhat = num / vn[n - 1];
+    u64 rhat = num - qhat * vn[n - 1];
+    while (qhat >= b || qhat * vn[n - 2] > ((rhat << 32) | un[j + n - 2])) {
+      qhat--;
+      rhat += vn[n - 1];
+      if (rhat >= b) { break; }
+    }
+
+    // Multiply and subtract. `k` is the borrow, and `t` is signed so a negative partial result is visible.
+    i64 k = 0;
+    i64 t = 0;
+    for (i32 i = 0; i < n; i++) {
+      u64 p = qhat * vn[i];
+      t = (un[i + j] as@ i64) - k - ((p & MASK32) as@ i64);
+      un[i + j] = (t as@ u64) & MASK32;
+      k = ((p >> 32) as@ i64) - (t >> 32);
+    }
+    t = (un[j + n] as@ i64) - k;
+    un[j + n] = (t as@ u64) & MASK32;
+
+    q[j] = qhat;
+    if (t < 0) {
+      // The estimate was one too many: add the divisor back.
+      q[j] = qhat - 1;
+      u64 c = 0;
+      for (i32 i = 0; i < n; i++) {
+        u64 sum = un[i + j] + vn[i] + c;
+        un[i + j] = sum & MASK32;
+        c = sum >> 32;
+      }
+      un[j + n] = (un[j + n] + c) & MASK32;
+    }
+  }
+
+  for (i32 i = 0; i < n; i++) {
+    r[i] = ((un[i] >> s) | (s == 0 ? 0 : un[i + 1] << (32 - s))) & MASK32;
+  }
+  return DivMod(q, r);
+}

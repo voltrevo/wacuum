@@ -1,0 +1,21 @@
+// An empty world and a plain block, for tests that run bytecode directly.
+
+import { Map } from "core";
+import { U256 } from "../src/u256.wac";
+import { World, hashU256, eqU256 } from "../src/state/world.wac";
+import { Evm, BlockEnv, TxEnv, Message } from "../src/evm/evm.wac";
+import { Frame, Outcome, run } from "../src/evm/interp.wac";
+import { OpTable } from "../src/evm/table.wac";
+
+export Evm newEvm() {
+  BlockEnv b = BlockEnv(U256.ofU64(0xc0ffee), U256.ofU64(1), U256.ofU64(1000), U256.ofU64(30000000), U256.zero(),
+                        U256.ofU64(7), U256.ofU64(1), U256.ofU64(1), Map.create(hashU256, eqU256));
+  TxEnv t = TxEnv(U256.ofU64(0xaaaa), U256.ofU64(10), U256[].filled(0, U256.zero()));
+  return Evm(World.create(), b, t, OpTable.cancun(), null);
+}
+
+/** Run `code` as the account 0x1000, called by 0xaaaa with `data`. */
+export Outcome runCode(Evm evm, u8[] code, u8[] data, i64 gas) {
+  Message m = Message(U256.ofU64(0xaaaa), U256.ofU64(0x1000), U256.ofU64(0x1000), U256.zero(), data, gas, false, 0, true);
+  return run(Frame.create(evm, m, code));
+}

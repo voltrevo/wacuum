@@ -1,0 +1,196 @@
+// A transaction, from validity to the coinbase's fee: execution-specs' `validate_transaction`,
+// `check_transaction` and `process_transaction` for Cancun, in their order.
+//
+// ## Invalid is not failed
+//
+// A transaction that *fails* — runs out of gas, reverts — is still included: the sender pays, the nonce
+// moves, and only the execution's effects are undone. One that is *invalid* — wrong nonce, can't pay,
+// below the base fee — cannot be in a block at all, and processing it must leave the world exactly as it
+// was. `Processed.invalid` is the second kind, and is decided before anything is written.
+
+import { Vec } from "core";
+import { U256 } from "../u256.wac";
+import { World, Log } from "../state/world.wac";
+import { Evm, BlockEnv, TxEnv, Message, processMessage, processCreate, createAddress, MAX_INITCODE_SIZE } from "../evm/evm.wac";
+import { Outcome, Halt } from "../evm/interp.wac";
+import { OpTable } from "../evm/table.wac";
+import { precompileAddresses } from "../evm/precompiles.wac";
+
+export static i64 GAS_PER_BLOB = 131072;
+/** Cancun: six blobs a block. */
+export static i64 MAX_BLOB_GAS_PER_BLOCK = 786432;
+export static u64 BLOB_BASE_FEE_UPDATE_FRACTION = 3338477;
+
+export struct AccessEntry {
+  U256 address;
+  U256[] keys;
+}
+
+export struct Transaction {
+  /** 0 legacy, 1 access list (EIP-2930), 2 dynamic fee (EIP-1559), 3 blob (EIP-4844). */
+  i32 txType;
+  U256 nonce;
+  /** Legacy and access-list transactions. */
+  U256 gasPrice;
+  /** Dynamic-fee and blob transactions. */
+  U256 maxFeePerGas;
+  U256 maxPriorityFeePerGas;
+  U256 gasLimit;
+  /** Null for a creation. */
+  U256? to;
+  U256 value;
+  u8[] data;
+  AccessEntry[] accessList;
+  U256 maxFeePerBlobGas;
+  U256[] blobHashes;
+  /** Recovered from the signature by whoever hands this over; the state tests give it directly. */
+  U256 sender;
+}
+
+export struct Processed {
+  /** Why it could not be included, or "" when it was. */
+  string invalid;
+  i64 gasUsed;
+  bool success;
+  Log[] logs;
+}
+
+Processed invalid(string why) { return Processed(why, 0, false, Log[].filled(0, Log(U256.zero(), U256[].filled(0, U256.zero()), u8[].filled(0, 0)))); }
+
+/** EIP-4844's price of blob gas: `fake_exponential(1, excess, fraction)`, a Taylor series in integers. */
+export U256 blobGasPrice(U256 excessBlobGas) {
+  return fakeExponential(U256.one(), excessBlobGas, U256.ofU64(BLOB_BASE_FEE_UPDATE_FRACTION));
+}
+
+export U256 fakeExponential(U256 factor, U256 numerator, U256 denominator) {
+  U256 output = U256.zero();
+  U256 acc = factor.mul(denominator);
+  u64 i = 1;
+  while (!acc.isZero()) {
+    output = output.add(acc);
+    acc = acc.mul(numerator).div(denominator.mul(U256.ofU64(i)));
+    i++;
+  }
+  return output.div(denominator);
+}
+
+/** EIP-2028 calldata, EIP-2930 access lists, and for a creation its base cost and EIP-3860's per word. */
+export i64 intrinsicGas(Transaction tx) {
+  i64 g = 21000;
+  for (i32 i = 0; i < tx.data.len(); i++) { g += tx.data[i] == 0 ? 4 : 16; }
+  if (tx.to is null) { g += 32000 + 2 * (((tx.data.len() as i64) + 31) / 32); }
+  for (i32 i = 0; i < tx.accessList.len(); i++) { g += 2400 + 1900 * (tx.accessList[i].keys.len() as i64); }
+  return g;
+}
+
+/**
+ * Process one transaction against `w`. `blockGasLeft` is what the block still has room for; the result
+ * says how much this one used, or why it is invalid.
+ */
+export Processed processTransaction(World w, BlockEnv block, Transaction tx, i64 blockGasLeft, i64 blobGasLeft,
+                                    fn<void(string)>? tracer) {
+  // ── Validity: nothing is written until all of it holds ──
+  i64 intrinsic = intrinsicGas(tx);
+  if (!tx.gasLimit.fitsU64() || tx.gasLimit.low() > 0x7FFFFFFFFFFFFFFF) { return invalid("gas limit too high"); }
+  i64 gasLimit = tx.gasLimit.low() as@ i64;
+  if (intrinsic > gasLimit) { return invalid("intrinsic gas too low"); }
+  if (!tx.nonce.fitsU64() || tx.nonce.low() == 0xFFFFFFFFFFFFFFFF) { return invalid("nonce too high"); }
+  if (tx.to is null && tx.data.len() > MAX_INITCODE_SIZE) { return invalid("init code too large"); }
+  if (gasLimit > blockGasLeft) { return invalid("gas limit exceeds the block's"); }
+
+  U256 baseFee = block.baseFee;
+  U256 price;
+  U256 maxGasFee;
+  if (tx.txType >= 2) {
+    if (tx.maxFeePerGas.lt(tx.maxPriorityFeePerGas)) { return invalid("priority fee above max fee"); }
+    if (tx.maxFeePerGas.lt(baseFee)) { return invalid("max fee below base fee"); }
+    U256 headroom = tx.maxFeePerGas.sub(baseFee);
+    U256 priority = tx.maxPriorityFeePerGas.lt(headroom) ? tx.maxPriorityFeePerGas : headroom;
+    price = priority.add(baseFee);
+    if (!mulFits(tx.gasLimit, tx.maxFeePerGas)) { return invalid("max fee overflows"); }
+    maxGasFee = tx.gasLimit.mul(tx.maxFeePerGas);
+  } else {
+    if (tx.gasPrice.lt(baseFee)) { return invalid("gas price below base fee"); }
+    price = tx.gasPrice;
+    if (!mulFits(tx.gasLimit, tx.gasPrice)) { return invalid("gas fee overflows"); }
+    maxGasFee = tx.gasLimit.mul(tx.gasPrice);
+  }
+
+  i64 blobGas = 0;
+  U256 blobPrice = block.blobBaseFee;
+  if (tx.txType == 3) {
+    if (tx.to is null) { return invalid("a blob transaction cannot create"); }
+    if (tx.blobHashes.len() == 0) { return invalid("a blob transaction without blobs"); }
+    for (i32 i = 0; i < tx.blobHashes.len(); i++) {
+      if (tx.blobHashes[i].byteAt(U256.zero()).low() != 0x01) { return invalid("blob hash with the wrong version"); }
+    }
+    blobGas = GAS_PER_BLOB * (tx.blobHashes.len() as i64);
+    if (blobGas > blobGasLeft) { return invalid("too many blobs"); }
+    if (tx.maxFeePerBlobGas.lt(blobPrice)) { return invalid("max blob fee below the blob gas price"); }
+    maxGasFee = maxGasFee.add(U256.ofU64(blobGas as! u64).mul(tx.maxFeePerBlobGas));
+  }
+
+  U256 cost = maxGasFee.add(tx.value);
+  if (cost.lt(maxGasFee)) { return invalid("cost overflows"); }
+  if (w.balance(tx.sender).lt(cost)) { return invalid("insufficient funds"); }
+  if (!U256.ofU64(w.nonce(tx.sender)).eq(tx.nonce)) { return invalid("nonce mismatch"); }
+  // EIP-3607: a sender must not have code.
+  if (w.code(tx.sender).len() != 0) { return invalid("sender has code"); }
+
+  // ── Execution ──
+  U256 sender = tx.sender;
+  U256 blobFee = U256.ofU64(blobGas as! u64).mul(blobPrice);
+  w.setBalance(sender, w.balance(sender).sub(tx.gasLimit.mul(price)).sub(blobFee));
+  u64 nonce = w.nonce(sender);
+  w.setNonce(sender, nonce + 1);
+
+  // EIP-2929 and EIP-3651: the coinbase, the precompiles, the sender, the target and the access list start warm.
+  w.warmAddress(block.coinbase);
+  U256[] pre = precompileAddresses();
+  for (i32 i = 0; i < pre.len(); i++) { w.warmAddress(pre[i]); }
+  for (i32 i = 0; i < tx.accessList.len(); i++) {
+    AccessEntry e = tx.accessList[i];
+    w.warmAddress(e.address);
+    for (i32 k = 0; k < e.keys.len(); k++) { w.warmSlot(e.address, e.keys[k]); }
+  }
+  w.warmAddress(sender);
+
+  Evm evm = Evm(w, block, TxEnv(sender, price, tx.blobHashes), OpTable.cancun(), tracer);
+  i64 gas = gasLimit - intrinsic;
+  Outcome o;
+  if (tx.to is null) {
+    U256 addr = createAddress(sender, nonce);
+    w.warmAddress(addr);
+    Message m = Message(sender, addr, addr, tx.value, tx.data, gas, false, 0, true);
+    if (w.nonce(addr) != 0 || w.code(addr).len() != 0 || w.get(addr) is not null && w.get(addr)!.storage.len() > 0) {
+      o = Outcome(Halt.Failure("address collision"), 0);
+    } else {
+      o = processCreate(evm, m);
+    }
+  } else {
+    U256 to = tx.to!;
+    w.warmAddress(to);
+    o = processMessage(evm, Message(sender, to, to, tx.value, tx.data, gas, false, 0, true));
+  }
+
+  // ── Settlement: EIP-3529 caps the refund at a fifth of the gas used ──
+  i64 usedBefore = gasLimit - o.gasLeft;
+  i64 refund = w.refund;
+  if (refund < 0) { refund = 0; }
+  if (refund > usedBefore / 5) { refund = usedBefore / 5; }
+  i64 used = usedBefore - refund;
+  i64 left = gasLimit - used;
+  w.setBalance(sender, w.balance(sender).add(U256.ofU64(left as! u64).mul(price)));
+  w.addBalance(block.coinbase, U256.ofU64(used as! u64).mul(price.sub(baseFee)));
+
+  Log[] logs = w.logs.toArray();
+  w.logs.clear();
+  w.endTransaction();
+  return Processed("", used, o.succeeded(), logs);
+}
+
+/** Whether a * b fits in 256 bits. */
+bool mulFits(U256 a, U256 b) {
+  if (a.isZero()) { return true; }
+  return a.mul(b).div(a).eq(b);
+}

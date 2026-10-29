@@ -1,0 +1,382 @@
+// alt_bn128 (bn254): ECADD (0x06), ECMUL (0x07) and the pairing check (0x08) — EIP-196 and EIP-197.
+//
+// G1 is y^2 = x^3 + 3 over Fp and is `Curve`. G2 is the sextic twist y^2 = x^3 + 3/(9 + i) over
+// Fp2 = Fp[i]/(i^2 + 1). The pairing follows py_ecc's `bn128` so the two can be read side by side: Fp12 is
+// Fp[w]/(w^12 - 18 w^6 + 82), in which i is w^6 - 9 and the twist sends (x, y) to (x w^2, y w^3); the Miller
+// loop walks the same signed-digit encoding of 6u + 2 and finishes with the same two Frobenius steps.
+//
+// ## Where this departs from py_ecc, and why it still agrees
+//
+// G2 points are kept affine over Fp2 and each line is evaluated exactly in Fp12, which py_ecc does with a
+// numerator and a denominator in projective coordinates. The values are the same; this way has no
+// denominators to divide out at the end. Nothing in Fp12 is ever inverted: the check asks whether
+// f^((p^12 - 1)/r) is one, which is f^(p^6 - 1) raised to k = (p^2 + 1)(p^4 - p^2 + 1)/r, and
+// f^(p^6 - 1) = f^(p^6) / f — so the test is whether f^(p^6) and f agree after raising both to k.
+// f^(p^6) costs nothing in this basis: w^(p^6) = -w, so it negates the odd coefficients.
+
+import { U256 } from "../u256.wac";
+import { mulFull, divmod, sigLimbs } from "../limbs.wac";
+import { Field } from "./field.wac";
+import { Curve, Jac } from "./curve.wac";
+
+export U256 bnP() { return U256.fromHex("0x30644e72e131a029b85045b68181585d97816a916871ca8d3c208c16d87cfd47")!; }
+export U256 bnR() { return U256.fromHex("0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001")!; }
+
+/** 6u + 2 in signed binary, least significant first — py_ecc's `pseudo_binary_encoding`. */
+static i32[] ATE = [0, 0, 0, 1, 0, 1, 0, -1, 0, 0, 1, -1, 0, 0, 1, 0, 0, 1, 1, 0, -1, 0, 0, 1, 0, -1, 0, 0, 0, 0, 1, 1,
+                    1, 0, 0, -1, 0, 0, 1, 0, 0, 0, 0, 0, -1, 0, 0, 1, 1, 0, 0, -1, 0, 0, 0, 1, 1, 0, -1, 0, 0, 1, 0, 1, 1];
+
+// ── Fp2 ─────────────────────────────────────────────────────────────────────────
+
+export struct Fq2 {
+  u64[] a;
+  u64[] b;
+}
+
+export struct Bn {
+  Field f;
+  Curve g1;
+  /** 3 / (9 + i): the twist's b. */
+  Fq2 b2;
+  /** ξ^((p-1)/3) and ξ^((p-1)/2), ξ = 9 + i: the twisted Frobenius on G2. */
+  Fq2 frobX;
+  Fq2 frobY;
+  /** w^(p^2) = γ w with γ in Fp: Frobenius squared multiplies coefficient i by γ^i. */
+  u64[][] frob2Powers;
+  /** (p^4 - p^2 + 1) / r as limbs: the hard part of the final exponent. */
+  u64[] hard;
+  u64[] c82;
+  u64[] c18;
+  u64[] c9;
+
+  Bn create() {
+    Field f = Field.create(bnP());
+    Curve g1 = Curve.create(f, U256.ofU64(3));
+    Bn bn = Bn(f, g1, Fq2(f.zero(), f.zero()), Fq2(f.zero(), f.zero()), Fq2(f.zero(), f.zero()), u64[][].defaulted(0),
+               u64[].filled(0, 0), f.fromU256(U256.ofU64(82)), f.fromU256(U256.ofU64(18)), f.fromU256(U256.ofU64(9)));
+    Fq2 xi = Fq2(f.fromU256(U256.ofU64(9)), f.one());
+    bn.b2 = bn.mul2(Fq2(f.fromU256(U256.ofU64(3)), f.zero()), bn.inv2(xi));
+    U256 pm1 = bnP().sub(U256.one());
+    bn.frobX = bn.pow2(xi, pm1.div(U256.ofU64(3)));
+    bn.frobY = bn.pow2(xi, pm1.shr(1));
+    bn.frob2Powers = bn.frobeniusPowers();
+    bn.hard = hardExponent();
+    return bn;
+  }
+
+  Fq2 add2(this, Fq2 x, Fq2 y) { return Fq2(this.f.add(x.a, y.a), this.f.add(x.b, y.b)); }
+  Fq2 sub2(this, Fq2 x, Fq2 y) { return Fq2(this.f.sub(x.a, y.a), this.f.sub(x.b, y.b)); }
+  Fq2 neg2(this, Fq2 x) { return Fq2(this.f.neg(x.a), this.f.neg(x.b)); }
+  Fq2 conj2(this, Fq2 x) { return Fq2(x.a, this.f.neg(x.b)); }
+  Fq2 mul2(this, Fq2 x, Fq2 y) {
+    Field f = this.f;
+    return Fq2(f.sub(f.mul(x.a, y.a), f.mul(x.b, y.b)), f.add(f.mul(x.a, y.b), f.mul(x.b, y.a)));
+  }
+  Fq2 square2(this, Fq2 x) { return this.mul2(x, x); }
+  Fq2 scale2(this, Fq2 x, u64[] k) { return Fq2(this.f.mul(x.a, k), this.f.mul(x.b, k)); }
+  bool isZero2(this, Fq2 x) { return this.f.isZero(x.a) && this.f.isZero(x.b); }
+  bool eq2(this, Fq2 x, Fq2 y) { return this.f.eq(x.a, y.a) && this.f.eq(x.b, y.b); }
+  /** 1 / (a + bi) = (a - bi) / (a^2 + b^2). */
+  Fq2 inv2(this, Fq2 x) {
+    Field f = this.f;
+    u64[] n = f.inv(f.add(f.square(x.a), f.square(x.b)));
+    return Fq2(f.mul(x.a, n), f.neg(f.mul(x.b, n)));
+  }
+  Fq2 pow2(this, Fq2 x, U256 e) {
+    Fq2 r = Fq2(this.f.one(), this.f.zero());
+    for (i32 i = 255; i >= 0; i--) {
+      r = this.square2(r);
+      if (!e.shr(i).and(U256.one()).isZero()) { r = this.mul2(r, x); }
+    }
+    return r;
+  }
+
+  // ── G2, affine; `null` is the point at infinity ──
+
+  bool onTwist(this, Fq2 x, Fq2 y) {
+    return this.eq2(this.square2(y), this.add2(this.mul2(this.square2(x), x), this.b2));
+  }
+
+  G2? g2Add(this, G2? p, G2? q) {
+    if (p is null) { return q; }
+    if (q is null) { return p; }
+    G2 a = p!;
+    G2 b = q!;
+    Fq2 lambda;
+    if (this.eq2(a.x, b.x)) {
+      if (!this.eq2(a.y, b.y) || this.isZero2(a.y)) { return null; }
+      Fq2 x2 = this.square2(a.x);
+      lambda = this.mul2(this.add2(this.add2(x2, x2), x2), this.inv2(this.add2(a.y, a.y)));
+    } else {
+      lambda = this.mul2(this.sub2(b.y, a.y), this.inv2(this.sub2(b.x, a.x)));
+    }
+    Fq2 x3 = this.sub2(this.sub2(this.square2(lambda), a.x), b.x);
+    Fq2 y3 = this.sub2(this.mul2(lambda, this.sub2(a.x, x3)), a.y);
+    return G2(x3, y3);
+  }
+
+  G2? g2Mul(this, G2 p, U256 k) {
+    G2? r = null;
+    for (i32 i = 255; i >= 0; i--) {
+      r = this.g2Add(r, r);
+      if (!k.shr(i).and(U256.one()).isZero()) { r = this.g2Add(r, p); }
+    }
+    return r;
+  }
+
+  /** The Frobenius endomorphism on the twist: (x, y) -> (conj(x) ξ^((p-1)/3), conj(y) ξ^((p-1)/2)). */
+  G2 frobenius(this, G2 q) {
+    return G2(this.mul2(this.conj2(q.x), this.frobX), this.mul2(this.conj2(q.y), this.frobY));
+  }
+
+  // ── Fp12 = Fp[w] / (w^12 - 18 w^6 + 82) ──
+
+  u64[][] one12(this) {
+    u64[][] r = u64[][].filled(12, this.f.zero());
+    r[0] = this.f.one();
+    return r;
+  }
+
+  u64[][] mul12(this, u64[][] x, u64[][] y) {
+    Field f = this.f;
+    u64[][] t = u64[][].filled(23, f.zero());
+    for (i32 i = 0; i < 12; i++) {
+      if (f.isZero(x[i])) { continue; }
+      for (i32 j = 0; j < 12; j++) {
+        if (f.isZero(y[j])) { continue; }
+        t[i + j] = f.add(t[i + j], f.mul(x[i], y[j]));
+      }
+    }
+    // w^12 = 18 w^6 - 82, from the top down so each reduction lands below what is left to reduce.
+    for (i32 k = 22; k >= 12; k--) {
+      if (f.isZero(t[k])) { continue; }
+      t[k - 6] = f.add(t[k - 6], f.mul(t[k], this.c18));
+      t[k - 12] = f.sub(t[k - 12], f.mul(t[k], this.c82));
+    }
+    u64[][] out = u64[][].filled(12, f.zero());
+    for (i32 i = 0; i < 12; i++) { out[i] = t[i]; }
+    return out;
+  }
+
+  bool eq12(this, u64[][] x, u64[][] y) {
+    for (i32 i = 0; i < 12; i++) {
+      if (!this.f.eq(x[i], y[i])) { return false; }
+    }
+    return true;
+  }
+
+  /** An Fp2 element times w^k, as Fp12 coefficients: i is w^6 - 9, so a + bi is (a - 9b) + b w^6. */
+  void place(this, u64[][] into, Fq2 c, i32 k) {
+    Field f = this.f;
+    into[k] = f.add(into[k], f.sub(c.a, f.mul(c.b, this.c9)));
+    into[k + 6] = f.add(into[k + 6], c.b);
+  }
+
+  /** f^(p^6): w^(p^6) is -w, and coefficients in Fp are fixed, so the odd ones change sign. */
+  u64[][] frob6(this, u64[][] x) {
+    u64[][] out = u64[][].filled(12, this.f.zero());
+    for (i32 i = 0; i < 12; i++) { out[i] = i % 2 == 1 ? this.f.neg(x[i]) : x[i]; }
+    return out;
+  }
+
+  /** f^(p^2): coefficient i times γ^i, where w^(p^2) = γ w. */
+  u64[][] frob2(this, u64[][] x) {
+    u64[][] out = u64[][].filled(12, this.f.zero());
+    for (i32 i = 0; i < 12; i++) { out[i] = this.f.mul(x[i], this.frob2Powers[i]); }
+    return out;
+  }
+
+  /** γ^i for i < 12, from w^(p^2) computed once by exponentiation — and checked to be a multiple of w. */
+  u64[][] frobeniusPowers(this) {
+    u64[][] w = u64[][].filled(12, this.f.zero());
+    w[1] = this.f.one();
+    u64[][] wp = this.pow12(this.pow12Big(w, limbsOf(bnP())), limbsOf(bnP()));
+    for (i32 i = 0; i < 12; i++) {
+      if (i != 1 && !this.f.isZero(wp[i])) { trap; }
+    }
+    u64[][] out = u64[][].filled(12, this.f.one());
+    for (i32 i = 1; i < 12; i++) { out[i] = this.f.mul(out[i - 1], wp[1]); }
+    return out;
+  }
+
+  u64[][] pow12(this, u64[][] x, u64[] e) { return this.pow12Big(x, e); }
+
+  /** x^e for an exponent of any length, given as 32-bit limbs. */
+  u64[][] pow12Big(this, u64[][] x, u64[] e) {
+    u64[][] r = this.one12();
+    i32 n = sigLimbs(e);
+    for (i32 i = n * 32 - 1; i >= 0; i--) {
+      r = this.mul12(r, r);
+      if (((e[i / 32] >> (i % 32)) & 1) == 1) { r = this.mul12(r, x); }
+    }
+    return r;
+  }
+
+  // ── The Miller loop ──
+
+  /**
+   * The line through T and Q (the tangent when they are equal), evaluated at P, in Fp12. With T and Q
+   * twisted to (x w^2, y w^3) and slope λ w, it is yP - λ xP w + (λ xT - yT) w^3; a vertical line is
+   * xP - xT w^2.
+   */
+  u64[][] line(this, G2 t, G2 q, u64[] xp, u64[] yp) {
+    Field f = this.f;
+    u64[][] l = u64[][].filled(12, f.zero());
+    Fq2 lambda;
+    if (this.eq2(t.x, q.x)) {
+      if (!this.eq2(t.y, q.y) || this.isZero2(t.y)) {
+        l[0] = xp;
+        this.place(l, this.neg2(t.x), 2);
+        return l;
+      }
+      Fq2 x2 = this.square2(t.x);
+      lambda = this.mul2(this.add2(this.add2(x2, x2), x2), this.inv2(this.add2(t.y, t.y)));
+    } else {
+      lambda = this.mul2(this.sub2(q.y, t.y), this.inv2(this.sub2(q.x, t.x)));
+    }
+    l[0] = yp;
+    this.place(l, this.neg2(this.scale2(lambda, xp)), 1);
+    this.place(l, this.sub2(this.mul2(lambda, t.x), t.y), 3);
+    return l;
+  }
+
+  /** The Miller loop for e(P, Q), before the final exponentiation. Neither point is at infinity. */
+  u64[][] miller(this, G2 q, u64[] xp, u64[] yp) {
+    u64[][] fv = this.one12();
+    G2 t = q;
+    G2 nq = G2(q.x, this.neg2(q.y));
+    for (i32 i = 63; i >= 0; i--) {
+      fv = this.mul12(this.mul12(fv, fv), this.line(t, t, xp, yp));
+      t = this.g2Add(t, t)!;
+      if (ATE[i] == 1) {
+        fv = this.mul12(fv, this.line(t, q, xp, yp));
+        t = this.g2Add(t, q)!;
+      } else if (ATE[i] == -1) {
+        fv = this.mul12(fv, this.line(t, nq, xp, yp));
+        t = this.g2Add(t, nq)!;
+      }
+    }
+    G2 q1 = this.frobenius(q);
+    G2 q2 = this.frobenius(q1);
+    G2 nq2 = G2(q2.x, this.neg2(q2.y));
+    fv = this.mul12(fv, this.line(t, q1, xp, yp));
+    t = this.g2Add(t, q1)!;
+    return this.mul12(fv, this.line(t, nq2, xp, yp));
+  }
+
+  /** Whether the product of Miller loops `fv` is one after the final exponentiation. */
+  bool finalIsOne(this, u64[][] fv) {
+    u64[][] a = this.frob6(fv);
+    u64[][] x = this.pow12Big(this.mul12(this.frob2(a), a), this.hard);
+    u64[][] y = this.pow12Big(this.mul12(this.frob2(fv), fv), this.hard);
+    return this.eq12(x, y);
+  }
+}
+
+export struct G2 {
+  Fq2 x;
+  Fq2 y;
+}
+
+u64[] limbsOf(U256 x) {
+  u64[] l = u64[].filled(8, 0);
+  for (i32 i = 0; i < 4; i++) {
+    l[2 * i] = x.word(i) & 0xFFFFFFFF;
+    l[2 * i + 1] = x.word(i) >> 32;
+  }
+  return l;
+}
+
+/** (p^4 - p^2 + 1) / r, which divides exactly. */
+u64[] hardExponent() {
+  u64[] p = limbsOf(bnP());
+  u64[] p2 = mulFull(p, p);
+  u64[] p4 = mulFull(p2, p2);
+  // p^4 - p^2 + 1, in limbs: p4 has room, and p^4 > p^2.
+  u64[] n = u64[].filled(p4.len(), 0);
+  i64 borrow = 0;
+  for (i32 i = 0; i < p4.len(); i++) {
+    i64 d = (p4[i] as@ i64) - (i < p2.len() ? p2[i] as@ i64 : 0) - borrow + (i == 0 ? 1 : 0);
+    borrow = d < 0 ? 1 : 0;
+    n[i] = ((d + (borrow << 32)) as@ u64) & 0xFFFFFFFF;
+  }
+  return divmod(n, limbsOf(bnR())).quotient;
+}
+
+// ── The precompiles ──────────────────────────────────────────────────────────────
+
+/** A G1 point from 64 bytes: null if a coordinate is out of range or it is off the curve; (0, 0) is infinity. */
+Jac? readG1(Bn bn, u8[] input, i32 off) {
+  U256 x = U256.fromBytes(input, off, 32);
+  U256 y = U256.fromBytes(input, off + 32, 32);
+  U256 p = bnP();
+  if (x.ge(p) || y.ge(p)) { return null; }
+  if (x.isZero() && y.isZero()) { return bn.g1.infinity(); }
+  if (!bn.g1.onCurve(x, y)) { return null; }
+  return bn.g1.fromAffine(x, y);
+}
+
+u8[] writeG1(Bn bn, Jac pt) {
+  u8[] out = u8[].filled(64, 0);
+  if (bn.g1.isInfinity(pt)) { return out; }
+  U256[] xy = bn.g1.toAffine(pt);
+  xy[0].writeBytes(out, 0);
+  xy[1].writeBytes(out, 32);
+  return out;
+}
+
+/** ECADD's answer, or null when either point is invalid and the precompile fails. */
+export u8[]? ecAdd(u8[] input) {
+  Bn bn = Bn.create();
+  Jac? a = readG1(bn, input, 0);
+  Jac? b = readG1(bn, input, 64);
+  if (a is null || b is null) { return null; }
+  return writeG1(bn, bn.g1.add(a!, b!));
+}
+
+/** ECMUL's answer, or null when the point is invalid. Any scalar is allowed. */
+export u8[]? ecMul(u8[] input) {
+  Bn bn = Bn.create();
+  Jac? a = readG1(bn, input, 0);
+  if (a is null) { return null; }
+  return writeG1(bn, bn.g1.mul(a!, U256.fromBytes(input, 64, 32)));
+}
+
+/**
+ * The pairing check: 32 bytes, 1 when the product of e(P_i, Q_i) is one and 0 otherwise. Null — the
+ * precompile fails — for a length that is not a multiple of 192, a coordinate out of range, a point off
+ * its curve, or a G2 point outside the order-r subgroup.
+ */
+export u8[]? ecPairing(u8[] input) {
+  if (input.len() % 192 != 0) { return null; }
+  Bn bn = Bn.create();
+  Field f = bn.f;
+  U256 p = bnP();
+  u64[][] acc = bn.one12();
+  for (i32 off = 0; off < input.len(); off += 192) {
+    Jac? g1 = readG1(bn, input, off);
+    if (g1 is null) { return null; }
+    // Fp2 elements are written imaginary part first.
+    U256 xb = U256.fromBytes(input, off + 64, 32);
+    U256 xa = U256.fromBytes(input, off + 96, 32);
+    U256 yb = U256.fromBytes(input, off + 128, 32);
+    U256 ya = U256.fromBytes(input, off + 160, 32);
+    if (xa.ge(p) || xb.ge(p) || ya.ge(p) || yb.ge(p)) { return null; }
+    bool g2Inf = xa.isZero() && xb.isZero() && ya.isZero() && yb.isZero();
+    G2? q = null;
+    if (!g2Inf) {
+      Fq2 x = Fq2(f.fromU256(xa), f.fromU256(xb));
+      Fq2 y = Fq2(f.fromU256(ya), f.fromU256(yb));
+      if (!bn.onTwist(x, y)) { return null; }
+      G2 pt = G2(x, y);
+      if (bn.g2Mul(pt, bnR()) is not null) { return null; }
+      q = pt;
+    }
+    if (q is null || bn.g1.isInfinity(g1!)) { continue; }
+    U256[] xy = bn.g1.toAffine(g1!);
+    acc = bn.mul12(acc, bn.miller(q!, f.fromU256(xy[0]), f.fromU256(xy[1])));
+  }
+  u8[] out = u8[].filled(32, 0);
+  if (bn.finalIsOne(acc)) { out[31] = 1; }
+  return out;
+}

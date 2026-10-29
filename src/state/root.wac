@@ -1,0 +1,59 @@
+// The commitments a block header carries about execution: the state root over every account, and the
+// hash of a transaction's logs as the state tests check it.
+
+import { crypto.keccak256 } from "wac";
+import { rlp.Item, rlp.encode } from "wac";
+import { U256 } from "../u256.wac";
+import { World, Account, Log } from "./world.wac";
+import { trieRoot } from "../trie/trie.wac";
+import { addressBytes, minimalBytes } from "../evm/evm.wac";
+
+/** A U256 as RLP spells an integer: big-endian, no leading zeros, empty for zero. */
+export u8[] u256Bytes(U256 v) {
+  u8[] full = v.toBytes();
+  i32 skip = 0;
+  while (skip < 32 && full[skip] == 0) { skip++; }
+  u8[] out = u8[].filled(32 - skip, 0);
+  for (i32 i = 0; i < out.len(); i++) { out[i] = full[skip + i]; }
+  return out;
+}
+
+/** The root of an account's storage trie: keccak256 of each slot's key, RLP of each value. */
+export u8[] storageRoot(Account a) {
+  U256[] keys = a.storage.keys();
+  u8[][] ks = u8[][].defaulted(keys.len());
+  u8[][] vs = u8[][].defaulted(keys.len());
+  for (i32 i = 0; i < keys.len(); i++) {
+    ks[i] = keccak256(keys[i].toBytes());
+    vs[i] = encode(Item.Bytes(u256Bytes(a.storage.get(keys[i])!)));
+  }
+  return trieRoot(ks, vs);
+}
+
+/** The state root: every account at keccak256(address), as rlp([nonce, balance, storageRoot, codeHash]). */
+export u8[] stateRoot(World w) {
+  U256[] addrs = w.accounts.keys();
+  u8[][] ks = u8[][].defaulted(addrs.len());
+  u8[][] vs = u8[][].defaulted(addrs.len());
+  for (i32 i = 0; i < addrs.len(); i++) {
+    Account a = w.accounts.get(addrs[i])!;
+    ks[i] = keccak256(addressBytes(addrs[i]));
+    Item[] fields = [Item.Bytes(minimalBytes(a.nonce)), Item.Bytes(u256Bytes(a.balance)), Item.Bytes(storageRoot(a)),
+                     Item.Bytes(a.codeHash.toBytes())];
+    vs[i] = encode(Item.List(fields));
+  }
+  return trieRoot(ks, vs);
+}
+
+/** keccak256(rlp(logs)), each log as [address, [topics], data] — what a state test's `logs` field is. */
+export u8[] logsHash(Log[] logs) {
+  Item[] items = Item[].filled(logs.len(), Item.Bytes(u8[].filled(0, 0)));
+  for (i32 i = 0; i < logs.len(); i++) {
+    Log l = logs[i];
+    Item[] topics = Item[].filled(l.topics.len(), Item.Bytes(u8[].filled(0, 0)));
+    for (i32 t = 0; t < l.topics.len(); t++) { topics[t] = Item.Bytes(l.topics[t].toBytes()); }
+    Item[] fields = [Item.Bytes(addressBytes(l.address)), Item.List(topics), Item.Bytes(l.data)];
+    items[i] = Item.List(fields);
+  }
+  return keccak256(encode(Item.List(items)));
+}

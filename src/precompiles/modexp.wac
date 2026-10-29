@@ -1,0 +1,100 @@
+// MODEXP (0x05): base ^ exponent mod modulus, at whatever length the caller gives — EIP-198, priced by
+// EIP-2565.
+//
+// The three lengths come first, as 32-byte words, and can claim anything up to 2^256 bytes. Gas is
+// computed from the lengths and from the first 32 bytes of the exponent alone, so an absurd length is
+// priced (and refused for want of gas) before anything that size is allocated. Bytes past the end of
+// the input read as zero, as everywhere else in the EVM.
+
+import { U256 } from "../u256.wac";
+import { mulFull, modLimbs, sigLimbs } from "../limbs.wac";
+
+/** What MODEXP costs for this input, or -1 when no amount of gas could pay for it. */
+export i64 modexpGas(u8[] input) {
+  U256 bl = U256.fromBytes(input, 0, 32);
+  U256 el = U256.fromBytes(input, 32, 32);
+  U256 ml = U256.fromBytes(input, 64, 32);
+  // Anything past 2^32 bytes is unpayable however it is priced; keeping the arithmetic small keeps it exact.
+  U256 limit = U256.ofU64(0x100000000);
+  if (bl.gt(limit) || ml.gt(limit)) { return -1; }
+  i64 b = bl.low() as@ i64;
+  i64 m = ml.low() as@ i64;
+  i64 maxLen = b > m ? b : m;
+  i64 words = (maxLen + 7) / 8;
+  // words^2 overflows past 2^31 words; that much is unpayable too.
+  if (words > 0x7FFFFFFF) { return -1; }
+  i64 complexity = words * words;
+  // No base and no modulus cost the minimum whatever the exponent claims, since the product is zero —
+  // and the exponent's length is then never read, so it may be anything.
+  if (complexity == 0) { return 200; }
+  if (el.gt(limit)) { return -1; }
+  i64 e = el.low() as@ i64;
+
+  // The exponent's head: its first min(32, e) bytes, which start at 96 + b.
+  i32 headLen = e < 32 ? e as! i32 : 32;
+  U256 head = 96 + b > 0x7FFFFFFF ? U256.zero() : U256.fromBytes(input, (96 + b) as! i32, headLen);
+  i64 bits = headBits(head);
+  i64 iterations;
+  if (e <= 32) {
+    iterations = bits == 0 ? 0 : bits - 1;
+  } else {
+    iterations = 8 * (e - 32) + (bits == 0 ? 0 : bits - 1);
+  }
+  if (iterations < 1) { iterations = 1; }
+  if (complexity > 0 && iterations > 0x7FFFFFFFFFFFFFFF / complexity) { return -1; }
+  i64 gas = complexity * iterations / 3;
+  return gas < 200 ? 200 : gas;
+}
+
+i64 headBits(U256 v) {
+  for (i32 i = 255; i >= 0; i--) {
+    if (!v.shr(i).and(U256.one()).isZero()) { return (i + 1) as i64; }
+  }
+  return 0;
+}
+
+/** The answer: msize bytes, big-endian. The caller has charged `modexpGas`, so the lengths are sane. */
+export u8[] modexp(u8[] input) {
+  // With no modulus there is no answer to compute, and the other lengths may be anything.
+  i32 m = U256.fromBytes(input, 64, 32).low() as! i32;
+  u8[] out = u8[].filled(m, 0);
+  if (m == 0) { return out; }
+  i32 b = U256.fromBytes(input, 0, 32).low() as! i32;
+  i32 e = U256.fromBytes(input, 32, 32).low() as! i32;
+  u64[] base = limbsOf(input, 96, b);
+  i32 expAt = 96 + b;
+  u64[] mod = limbsOf(input, expAt + e, m);
+  if (sigLimbs(mod) == 0) { return out; }
+
+  u64[] result = modLimbs(oneLimbs(), mod);
+  u64[] acc = modLimbs(base, mod);
+  // Square and multiply, from the exponent's least significant bit.
+  for (i32 byteIx = e - 1; byteIx >= 0; byteIx--) {
+    i32 at = expAt + byteIx;
+    u8 by = at < input.len() ? input[at] : 0;
+    for (i32 bit = 0; bit < 8; bit++) {
+      if (((by >> bit) & 1) == 1) { result = modLimbs(mulFull(result, acc), mod); }
+      // Skip the last squaring: it is wasted work and, for a long exponent, most of the time.
+      if (byteIx > 0 || bit < 7) { acc = modLimbs(mulFull(acc, acc), mod); }
+    }
+  }
+  i32 n = sigLimbs(result);
+  for (i32 i = 0; i < m && i / 4 < n; i++) {
+    u64 limb = result[i / 4];
+    out[m - 1 - i] = (limb >> ((i % 4) * 8)) as@ u8;
+  }
+  return out;
+}
+
+u64[] oneLimbs() { return u64[].filled(1, 1); }
+
+/** `len` big-endian bytes from `off` as limbs, reading zeros past the end of the input. */
+u64[] limbsOf(u8[] input, i32 off, i32 len) {
+  u64[] l = u64[].filled(len / 4 + 1, 0);
+  for (i32 i = 0; i < len; i++) {
+    i32 at = off + len - 1 - i;
+    u64 v = at >= 0 && at < input.len() ? input[at] as u64 : 0;
+    l[i / 4] = l[i / 4] | (v << ((i % 4) * 8));
+  }
+  return l;
+}

@@ -1,8 +1,8 @@
 // The interpreter: one call frame's code, run until it halts.
 //
-// This is the part of the EVM that needs no world — arithmetic, memory, control flow, calldata and the
-// frame's own code. Accounts, storage, logs, calls and creation reach a world through a host, and arrive
-// with the state milestone; until then their opcodes are absent from `OpTable` and halt as INVALID.
+// A frame belongs to an `Evm` — the world, the block and the transaction — and runs one `Message`. The
+// opcodes that reach outside the frame (accounts, storage, logs, calls, creation) go through the `Evm`,
+// and everything they change goes through `World`, whose journal is what undoes a failed frame.
 //
 // ## How a step is checked
 //
@@ -13,8 +13,11 @@
 
 import { crypto.keccak256 } from "wac";
 import { U256 } from "../u256.wac";
+import { World, Log, Account } from "../state/world.wac";
 import { Memory } from "./memory.wac";
 import { OpTable } from "./table.wac";
+import { Evm, Message, processMessage, processCreate, createAddress, create2Address, allButOne64th,
+         MAX_DEPTH, MAX_INITCODE_SIZE } from "./evm.wac";
 
 export enum Halt {
   Stop,
@@ -32,6 +35,10 @@ export struct Outcome {
     return match (this.halt) { Stop: true, Return: true, Revert: false, Failure: false };
   }
 
+  bool failed(const this) {
+    return match (this.halt) { Failure: true, default: false };
+  }
+
   /** RETURN's or REVERT's bytes, and nothing otherwise. */
   u8[] output(const this) {
     return match (this.halt) { Stop: u8[].filled(0, 0), Return(d): d, Revert(d): d, Failure: u8[].filled(0, 0) };
@@ -39,11 +46,12 @@ export struct Outcome {
 }
 
 export struct Frame {
+  Evm evm;
+  Message msg;
   OpTable table;
   u8[] code;
   bool[] jumpdests;
-  u8[] calldata;
-  /** The last call's output; nothing calls yet, so it is always empty. */
+  /** The last call's output, for RETURNDATASIZE and RETURNDATACOPY. */
   u8[] returndata;
   U256?[] stack;
   i32 sp;
@@ -51,9 +59,9 @@ export struct Frame {
   i32 pc;
   i64 gas;
 
-  Frame create(OpTable table, u8[] code, u8[] calldata, i64 gas) {
-    return Frame(table, code, jumpdestsOf(code), calldata, u8[].filled(0, 0), U256?[].defaulted(1024), 0,
-                 Memory.create(), 0, gas);
+  Frame create(Evm evm, Message msg, u8[] code) {
+    return Frame(evm, msg, evm.table, code, jumpdestsOf(code), u8[].filled(0, 0), U256?[].defaulted(1024), 0,
+                 Memory.create(), 0, msg.gas);
   }
 
   void push(this, U256 v) {
@@ -82,6 +90,29 @@ export struct Frame {
     this.memory.expand(off, n);
     return true;
   }
+
+  /**
+   * What growing memory to cover two ranges costs, without growing it — the CALL family prices both
+   * before deciding how much gas the callee may have. -1 when no amount of gas could pay.
+   */
+  i64 costOfTwo(this, U256 o1, U256 l1, U256 o2, U256 l2) {
+    i64 e1 = l1.isZero() ? 0 : endOf(o1, l1);
+    i64 e2 = l2.isZero() ? 0 : endOf(o2, l2);
+    if (e1 < 0 || e2 < 0) { return -1; }
+    return this.memory.expansionCost(0, e1 > e2 ? e1 : e2);
+  }
+
+  /** The current account: whose storage, balance and logs this frame's code acts on. */
+  U256 self(this) { return this.msg.target; }
+  World world(this) { return this.evm.world; }
+}
+
+/** The end of a range, or -1 when it is past anything memory could reach. */
+i64 endOf(U256 off, U256 len) {
+  i64 o = clampI64(off);
+  i64 n = clampI64(len);
+  if (o > 0x100000000 || n > 0x100000000) { return -1; }
+  return o + n;
 }
 
 /** A U256 as an i64 offset or length, with anything too big to be affordable clamped to the i64 maximum. */
@@ -125,6 +156,7 @@ export Outcome run(Frame f) {
     if (!t.defined(op)) { return fail(f, "invalid opcode 0x\{hexByte(op)} at \{f.pc}"); }
     if (f.sp < t.pops[op]) { return fail(f, "stack underflow in \{t.names[op]} at \{f.pc}"); }
     if (f.sp - t.pops[op] + t.pushes[op] > 1024) { return fail(f, "stack overflow in \{t.names[op]} at \{f.pc}"); }
+    if (f.evm.tracer is not null) { f.evm.tracer!(traceLine(f, op)); }
     if (!f.charge(t.gas[op])) { return fail(f, "out of gas in \{t.names[op]} at \{f.pc}"); }
     Halt? h = step(f, op);
     if (h is not null) {
@@ -161,6 +193,13 @@ Halt? step(Frame f, i32 op) {
     U256? a = f.stack[top];
     f.stack[top] = f.stack[top - n];
     f.stack[top - n] = a;
+    f.pc++;
+    return null;
+  }
+
+  if (op >= 0xa0 && op <= 0xa4) {
+    Halt? h = logOp(f, op);
+    if (h is not null) { return h; }
     f.pc++;
     return null;
   }
@@ -207,10 +246,10 @@ Halt? step(Frame f, i32 op) {
     }
     case 0x35: {
       U256 off = f.pop();
-      f.push(off.fitsU64() && off.low() < 0x7FFFFFFF ? U256.fromBytes(f.calldata, off.low() as! i32, 32) : U256.zero());
+      f.push(off.fitsU64() && off.low() < 0x7FFFFFFF ? U256.fromBytes(f.msg.data, off.low() as! i32, 32) : U256.zero());
     }
-    case 0x36: { f.push(U256.ofI32(f.calldata.len())); }
-    case 0x37: { Halt? h = copyOp(f, op, f.calldata); if (h is not null) { return h; } }
+    case 0x36: { f.push(U256.ofI32(f.msg.data.len())); }
+    case 0x37: { Halt? h = copyOp(f, op, f.msg.data); if (h is not null) { return h; } }
     case 0x38: { f.push(U256.ofI32(f.code.len())); }
     case 0x39: { Halt? h = copyOp(f, op, f.code); if (h is not null) { return h; } }
     case 0x3d: { f.push(U256.ofI32(f.returndata.len())); }
@@ -288,6 +327,67 @@ Halt? step(Frame f, i32 op) {
       if (!f.touch(off, len)) { return oog(f, op); }
       return Halt.Revert(len.isZero() ? u8[].filled(0, 0) : f.memory.read(clampI64(off), clampI64(len)));
     }
+    case 0x30: { f.push(f.self()); }
+    case 0x31: {
+      U256 a = toAddress(f.pop());
+      if (!f.charge(accessCost(f, a))) { return oog(f, op); }
+      f.push(f.world().balance(a));
+    }
+    case 0x32: { f.push(f.evm.tx.origin); }
+    case 0x33: { f.push(f.msg.caller); }
+    case 0x34: { f.push(f.msg.value); }
+    case 0x3a: { f.push(f.evm.tx.gasPrice); }
+    case 0x3b: {
+      U256 a = toAddress(f.pop());
+      if (!f.charge(accessCost(f, a))) { return oog(f, op); }
+      f.push(U256.ofI32(f.world().code(a).len()));
+    }
+    case 0x3c: {
+      U256 a = toAddress(f.pop());
+      if (!f.charge(accessCost(f, a))) { return oog(f, op); }
+      Halt? h = copyOp(f, op, f.world().code(a));
+      if (h is not null) { return h; }
+    }
+    case 0x3f: {
+      U256 a = toAddress(f.pop());
+      if (!f.charge(accessCost(f, a))) { return oog(f, op); }
+      // EIP-1052 with EIP-161: an account that does not exist, or is empty, hashes to zero.
+      f.push(f.world().isDead(a) ? U256.zero() : f.world().get(a)!.codeHash);
+    }
+    case 0x40: { f.push(blockHash(f.evm, f.pop())); }
+    case 0x41: { f.push(f.evm.block.coinbase); }
+    case 0x42: { f.push(f.evm.block.timestamp); }
+    case 0x43: { f.push(f.evm.block.number); }
+    case 0x44: { f.push(f.evm.block.prevRandao); }
+    case 0x45: { f.push(f.evm.block.gasLimit); }
+    case 0x46: { f.push(f.evm.block.chainId); }
+    case 0x47: { f.push(f.world().balance(f.self())); }
+    case 0x48: { f.push(f.evm.block.baseFee); }
+    case 0x49: {
+      U256 i = f.pop();
+      U256[] hashes = f.evm.tx.blobHashes;
+      f.push(i.fitsU64() && i.low() < (hashes.len() as@ u32) as u64 ? hashes[i.low() as! i32] : U256.zero());
+    }
+    case 0x4a: { f.push(f.evm.block.blobBaseFee); }
+    case 0x54: {
+      U256 key = f.pop();
+      if (!f.charge(f.world().warmSlot(f.self(), key) ? 2100 : 100)) { return oog(f, op); }
+      f.push(f.world().storage(f.self(), key));
+    }
+    case 0x55: { Halt? h = sstore(f); if (h is not null) { return h; } }
+    case 0x5c: { f.push(f.world().transientStorage(f.self(), f.pop())); }
+    case 0x5d: {
+      if (f.msg.isStatic) { return Halt.Failure("TSTORE in a static call"); }
+      U256 key = f.pop();
+      f.world().setTransient(f.self(), key, f.pop());
+    }
+    case 0xf0: { Halt? h = createOp(f, op); if (h is not null) { return h; } }
+    case 0xf5: { Halt? h = createOp(f, op); if (h is not null) { return h; } }
+    case 0xf1: { Halt? h = callOp(f, op); if (h is not null) { return h; } }
+    case 0xf2: { Halt? h = callOp(f, op); if (h is not null) { return h; } }
+    case 0xf4: { Halt? h = callOp(f, op); if (h is not null) { return h; } }
+    case 0xfa: { Halt? h = callOp(f, op); if (h is not null) { return h; } }
+    case 0xff: { return selfdestruct(f); }
     default: { return Halt.Failure("opcode 0x\{hexByte(op)} is in the table but not dispatched"); }
   }
   f.pc++;
@@ -311,4 +411,211 @@ Halt? copyOp(Frame f, i32 op, const u8[] from) {
 string hexByte(i32 b) {
   string d = "0123456789abcdef";
   return d.slice(b >> 4, (b >> 4) + 1) + d.slice(b & 15, (b & 15) + 1);
+}
+
+// ── The world ───────────────────────────────────────────────────────────────────
+
+/** An address is the low 160 bits of a stack word; the rest is ignored, not refused. */
+U256 toAddress(U256 v) {
+  return U256(v.w0, v.w1, v.w2 & 0xFFFFFFFF, 0);
+}
+
+/** EIP-2929: 2600 the first time a transaction touches an address, 100 after. Warms it. */
+i64 accessCost(Frame f, U256 a) { return f.world().warmAddress(a) ? 2600 : 100; }
+
+/** BLOCKHASH: one of the 256 blocks before this one, if the environment knows it, and zero otherwise. */
+U256 blockHash(Evm evm, U256 n) {
+  U256 cur = evm.block.number;
+  if (n.ge(cur) || cur.sub(n).gt(U256.ofU64(256))) { return U256.zero(); }
+  return evm.block.hashes.getOr(n, U256.zero());
+}
+
+/**
+ * SSTORE's gas and refunds: EIP-2200's net metering, priced by EIP-2929 and refunded by EIP-3529. The
+ * cases are the EIP's, in its order, and depend on three values — what the slot held when the transaction
+ * began, what it holds now, and what is being written.
+ */
+Halt? sstore(Frame f) {
+  if (f.msg.isStatic) { return Halt.Failure("SSTORE in a static call"); }
+  U256 key = f.pop();
+  U256 v = f.pop();
+  // EIP-2200's sentry: SSTORE cannot run on the stipend a value transfer gives.
+  if (f.gas <= 2300) { return Halt.Failure("SSTORE with 2300 gas or less at \{f.pc}"); }
+  World w = f.world();
+  U256 me = f.self();
+  i64 cost = w.warmSlot(me, key) ? 2100 : 0;
+  U256 orig = w.originalStorage(me, key);
+  U256 cur = w.storage(me, key);
+  if (cur.eq(v)) {
+    cost += 100;
+  } else if (orig.eq(cur)) {
+    cost += orig.isZero() ? 20000 : 2900;
+  } else {
+    cost += 100;
+  }
+  if (!f.charge(cost)) { return Halt.Failure("out of gas in SSTORE at \{f.pc}"); }
+  if (!cur.eq(v)) {
+    if (orig.eq(cur)) {
+      if (!orig.isZero() && v.isZero()) { w.addRefund(4800); }
+    } else {
+      if (!orig.isZero()) {
+        if (cur.isZero()) { w.addRefund(-4800); } else if (v.isZero()) { w.addRefund(4800); }
+      }
+      if (orig.eq(v)) { w.addRefund(orig.isZero() ? 20000 - 100 : 5000 - 2100 - 100); }
+    }
+  }
+  w.setStorage(me, key, v);
+  return null;
+}
+
+Halt? logOp(Frame f, i32 op) {
+  i32 n = op - 0xa0;
+  U256 off = f.pop();
+  U256 len = f.pop();
+  U256[] topics = U256[].filled(n, U256.zero());
+  for (i32 i = 0; i < n; i++) { topics[i] = f.pop(); }
+  i64 l = clampI64(len);
+  if (l > 0x100000000 || !f.charge(8 * l) || !f.touch(off, len)) { return oog(f, op); }
+  if (f.msg.isStatic) { return Halt.Failure("LOG in a static call"); }
+  u8[] data = len.isZero() ? u8[].filled(0, 0) : f.memory.read(clampI64(off), l);
+  f.world().log(Log(f.self(), topics, data));
+  return null;
+}
+
+/**
+ * CALL, CALLCODE, DELEGATECALL and STATICCALL — execution-specs' `call` family and `generic_call`.
+ *
+ * The gas a callee gets is decided before anything happens: memory for both ranges and the access, value
+ * and new-account costs are priced first, and the callee gets what it asked for capped at all but a 64th
+ * of what is left (EIP-150), plus a 2300 stipend when value moves. When the call cannot happen — too
+ * deep, or not enough balance — that gas, stipend included, comes straight back.
+ */
+Halt? callOp(Frame f, i32 op) {
+  bool hasValue = op == 0xf1 || op == 0xf2;
+  U256 gasAsked = f.pop();
+  U256 to = toAddress(f.pop());
+  U256 value = hasValue ? f.pop() : U256.zero();
+  U256 inOff = f.pop();
+  U256 inLen = f.pop();
+  U256 outOff = f.pop();
+  U256 outLen = f.pop();
+  World w = f.world();
+
+  i64 mem = f.costOfTwo(inOff, inLen, outOff, outLen);
+  if (mem < 0) { return oog(f, op); }
+  i64 extra = accessCost(f, to);
+  if (op == 0xf1 && !value.isZero() && w.isDead(to)) { extra += 25000; }
+  if (hasValue && !value.isZero()) { extra += 9000; }
+  if (f.gas < extra + mem) { return oog(f, op); }
+  i64 g = clampI64(gasAsked);
+  i64 cap = allButOne64th(f.gas - mem - extra);
+  if (g > cap) { g = cap; }
+  if (!f.charge(g + extra) || !f.touch(inOff, inLen) || !f.touch(outOff, outLen)) { return oog(f, op); }
+  if (op == 0xf1 && f.msg.isStatic && !value.isZero()) { return Halt.Failure("CALL with value in a static call"); }
+
+  i64 sub = g + (value.isZero() ? 0 : 2300);
+  f.returndata = u8[].filled(0, 0);
+  U256 me = f.self();
+  if ((hasValue && w.balance(me).lt(value)) || f.msg.depth + 1 > MAX_DEPTH) {
+    f.gas += sub;
+    f.push(U256.zero());
+    return null;
+  }
+  u8[] data = inLen.isZero() ? u8[].filled(0, 0) : f.memory.read(clampI64(inOff), clampI64(inLen));
+  Message m = Message(me, to, to, value, data, sub, f.msg.isStatic, f.msg.depth + 1, true);
+  if (op == 0xf2) { m.target = me; }
+  if (op == 0xf4) {
+    m.caller = f.msg.caller;
+    m.target = me;
+    m.value = f.msg.value;
+    m.transfersValue = false;
+  }
+  if (op == 0xfa) { m.isStatic = true; }
+  Outcome o = processMessage(f.evm, m);
+  f.gas += o.gasLeft;
+  f.returndata = o.output();
+  i64 n = clampI64(outLen);
+  if ((f.returndata.len() as i64) < n) { n = f.returndata.len() as i64; }
+  if (n > 0) { f.memory.write(clampI64(outOff), f.returndata, 0, n); }
+  f.push(o.succeeded() ? U256.one() : U256.zero());
+  return null;
+}
+
+/** CREATE and CREATE2 — execution-specs' `create`, `create2` and `generic_create`. */
+Halt? createOp(Frame f, i32 op) {
+  U256 value = f.pop();
+  U256 off = f.pop();
+  U256 len = f.pop();
+  U256 salt = op == 0xf5 ? f.pop() : U256.zero();
+  i64 words = wordsOf(len);
+  // EIP-3860 charges 2 a word of init code; CREATE2 also pays to hash it.
+  i64 perWord = op == 0xf5 ? 2 + 6 : 2;
+  if (!f.touch(off, len) || !f.charge(perWord * words)) { return oog(f, op); }
+  if (clampI64(len) > (MAX_INITCODE_SIZE as i64)) { return Halt.Failure("init code over the EIP-3860 limit"); }
+  World w = f.world();
+  U256 me = f.self();
+  u8[] initcode = len.isZero() ? u8[].filled(0, 0) : f.memory.read(clampI64(off), clampI64(len));
+  U256 addr = op == 0xf5 ? create2Address(me, salt, initcode) : createAddress(me, w.nonce(me));
+
+  w.warmAddress(addr);
+  i64 g = allButOne64th(f.gas);
+  f.gas -= g;
+  if (f.msg.isStatic) { return Halt.Failure("CREATE in a static call"); }
+  f.returndata = u8[].filled(0, 0);
+  if (w.balance(me).lt(value) || w.nonce(me) == 0xFFFFFFFFFFFFFFFF || f.msg.depth + 1 > MAX_DEPTH) {
+    f.gas += g;
+    f.push(U256.zero());
+    return null;
+  }
+  // A collision consumes the gas it was given: the address was never usable.
+  if (w.nonce(addr) != 0 || w.code(addr).len() != 0 || hasStorage(w, addr)) {
+    w.setNonce(me, w.nonce(me) + 1);
+    f.push(U256.zero());
+    return null;
+  }
+  w.setNonce(me, w.nonce(me) + 1);
+  Message m = Message(me, addr, addr, value, initcode, g, false, f.msg.depth + 1, true);
+  Outcome o = processCreate(f.evm, m);
+  f.gas += o.gasLeft;
+  if (o.succeeded()) {
+    f.push(addr);
+  } else {
+    f.returndata = o.output();
+    f.push(U256.zero());
+  }
+  return null;
+}
+
+bool hasStorage(World w, U256 addr) {
+  Account? a = w.get(addr);
+  return a is not null && a!.storage.len() > 0;
+}
+
+/**
+ * SELFDESTRUCT after EIP-6780: the balance always moves to the beneficiary, but the account is deleted
+ * only if this same transaction created it. EIP-3529 took away its refund.
+ */
+Halt selfdestruct(Frame f) {
+  U256 to = toAddress(f.pop());
+  World w = f.world();
+  U256 me = f.self();
+  i64 cost = w.warmAddress(to) ? 2600 : 0;
+  if (w.isDead(to) && !w.balance(me).isZero()) { cost += 25000; }
+  if (!f.charge(cost)) { return Halt.Failure("out of gas in SELFDESTRUCT at \{f.pc}"); }
+  if (f.msg.isStatic) { return Halt.Failure("SELFDESTRUCT in a static call"); }
+  U256 bal = w.balance(me);
+  w.transfer(me, to, bal);
+  if (w.createdThisTx.has(me)) {
+    w.setBalance(me, U256.zero());
+    w.markDestructed(me);
+  }
+  return Halt.Stop;
+}
+
+/** One step, as the tracer sees it: before the opcode runs and before its gas is charged. */
+string traceLine(Frame f, i32 op) {
+  string line = "\{f.msg.depth} \{f.pc} \{f.table.names[op]} gas=\{f.gas}";
+  i32 shown = f.sp < 4 ? f.sp : 4;
+  for (i32 i = 0; i < shown; i++) { line += " " + f.stack[f.sp - 1 - i]!.toHex(); }
+  return line;
 }
