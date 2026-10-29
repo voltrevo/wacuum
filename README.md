@@ -37,7 +37,7 @@ in about an hour and a half.
 | blocks | **done**. Blocks and transactions decoded from RLP with every sender recovered, headers checked against their parents (base fee, blob gas with EIP-7918's floor, gas limit), EIP-4788 and EIP-2935 system calls, withdrawals, EIP-7685 requests, EIP-7934's size limit, and every root and the bloom checked. An invalid block is undone and leaves no trace |
 | the Engine API | **done**. `engine_newPayloadV1`–`V4`, `engine_forkchoiceUpdatedV1`–`V3` with and without payload attributes, `engine_getPayloadV3`–`V5` with blobs bundles, `engine_getBlobsV1`/`V2`, `eth_sendRawTransaction` into a mempool (blob transactions in their network form, blob proofs verified), over JSON-RPC and HTTP with HS256 JWT authentication, from a geth-format `genesis.json`. Forks are followed and finality prunes them. Not yet: verifying Osaka's cell proofs |
 | persistence | **done, simply**. With `--datadir`, every imported block and fork choice is appended to a log before it is acknowledged, and the log is replayed on start. Not yet: a state snapshot, so a long chain restarts slowly |
-| the user's JSON-RPC | **a start**. `eth_chainId`, `eth_blockNumber`, `eth_getBalance`, `eth_getTransactionCount`, `eth_getCode`, `eth_getStorageAt` and `eth_call` at the head, on the Engine API's port |
+| the user's JSON-RPC | **done for what wallets and libraries use**. Blocks, transactions and receipts (`eth_getBlockByNumber`/`ByHash`, `eth_getTransactionByHash`, `eth_getTransactionReceipt`, `eth_getBlockReceipts`), `eth_getLogs`, state reads at any unfinalized block, `eth_call`, `eth_estimateGas`, fees (`eth_gasPrice`, `eth_maxPriorityFeePerGas`, `eth_feeHistory`, `eth_blobBaseFee`), and the `net_` and `web3_` basics. With `--public-rpc` they are answered without a token; ethers drives them all in `tools/rpc-e2e.mjs`. Not yet: subscriptions and traces |
 | devp2p, sync | not started |
 
 ## Running it
@@ -84,13 +84,14 @@ wac app --allow-read --allow-write --allow-net cmd/wacuum.wac -o dist/wacuum
 ```
 
 ```bash
-./dist/wacuum --genesis genesis.json --jwt-secret jwt.hex --datadir data --port 8551
+./dist/wacuum --genesis genesis.json --jwt-secret jwt.hex --datadir data --public-rpc --port 8551
 ```
 
 It needs a `wac` on a native host (`./bootstrap.sh --host wasmtime` or the default v8): on the JavaScript
 hosts a program is given no network, whatever it is granted. `node tools/engine-e2e.mjs FIXTURE` drives a
 running node through an engine fixture over HTTP, JWT and all, then restarts it on its data directory and
-checks the replayed state.
+checks the replayed state; `node tools/rpc-e2e.mjs` makes blocks as a consensus client would and uses
+ethers as a wallet against them.
 
 ## Layout
 
@@ -112,6 +113,7 @@ checks the replayed state.
     src/chain/genesis.wac    a chain's first block from a geth-format genesis.json
     src/engine/engine.wac    the Engine API's methods, the blocks it knows, and the log it keeps
     src/engine/blobs.wac     blob sidecars: the network form of a blob transaction, and what is checked
+    src/engine/eth.wac       blocks, transactions, receipts and logs as the eth_ methods spell them
     src/engine/rpc.wac       JSON-RPC over HTTP, and the JWT gate in front of it
     src/engine/jwt.wac       HS256 JWTs, as the Engine API authenticates them
     cmd/wacuum.wac           the node: genesis, then the Engine API on a socket

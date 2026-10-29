@@ -1,0 +1,143 @@
+// secp256k1 as devp2p uses it: a node's key, ECDH between two keys (the shared x coordinate), signatures
+// over 32-byte hashes in the 65-byte r ‖ s ‖ recovery-id form, and the public key a signature recovers to.
+//
+// Public keys are 64 bytes, x ‖ y, without the 0x04 that SEC1 puts in front; that is how devp2p writes
+// them in every message and how a node id is spelled.
+//
+// Signing takes its nonce from RFC 6979 (HMAC-SHA256 over the key and the hash), so a signature never
+// depends on a random number generator being good, and the same key and hash always sign the same way.
+// It is not constant-time: this is a node's identity key for authenticating sessions, not a wallet.
+
+import { crypto.hmacSha256 } from "wac";
+import { U256 } from "../u256.wac";
+import { Field } from "../crypto/field.wac";
+import { Curve, Jac } from "../crypto/curve.wac";
+import { secpP, secpN } from "../precompiles/ecrecover.wac";
+
+Curve curve() { return Curve.create(Field.create(secpP()), U256.ofU64(7)); }
+
+Jac generator(Curve c) {
+  return c.fromAffine(U256.fromHex("0x79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")!,
+                      U256.fromHex("0x483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8")!);
+}
+
+u8[] pointBytes(Curve c, Jac p) {
+  U256[] xy = c.toAffine(p);
+  u8[] out = u8[].filled(64, 0);
+  xy[0].writeBytes(out, 0);
+  xy[1].writeBytes(out, 32);
+  return out;
+}
+
+/** The point a 64-byte public key names, or null if it is not on the curve. */
+Jac? pointOf(Curve c, u8[] pub) {
+  if (pub.len() != 64) { return null; }
+  U256 x = U256.fromBytes(pub, 0, 32);
+  U256 y = U256.fromBytes(pub, 32, 32);
+  if (!x.lt(secpP()) || !y.lt(secpP()) || !c.onCurve(x, y)) { return null; }
+  return c.fromAffine(x, y);
+}
+
+/** Whether `k` is a usable private key: 32 bytes, in [1, n). */
+export bool validKey(u8[] k) {
+  if (k.len() != 32) { return false; }
+  U256 v = U256.fromBytes(k, 0, 32);
+  return !v.isZero() && v.lt(secpN());
+}
+
+export u8[] publicKey(u8[] priv) {
+  Curve c = curve();
+  return pointBytes(c, c.mul(generator(c), U256.fromBytes(priv, 0, 32)));
+}
+
+/** The x coordinate of priv·pub, as 32 bytes: what ECIES and RLPx call the shared secret. Null for a bad key. */
+export u8[]? ecdh(u8[] priv, u8[] pub) {
+  Curve c = curve();
+  Jac? p = pointOf(c, pub);
+  if (p is null) { return null; }
+  Jac s = c.mul(p!, U256.fromBytes(priv, 0, 32));
+  if (c.isInfinity(s)) { return null; }
+  u8[] out = u8[].filled(32, 0);
+  c.toAffine(s)[0].writeBytes(out, 0);
+  return out;
+}
+
+/** RFC 6979's nonce for signing `hash` with `priv`, with HMAC-SHA256 and qlen = 256. */
+U256 rfc6979(u8[] priv, u8[] hash) {
+  U256 n = secpN();
+  u8[] h1 = U256.fromBytes(hash, 0, 32).mod(n).toBytes();
+  u8[] v = u8[].filled(32, 1);
+  u8[] k = u8[].filled(32, 0);
+  k = hmacSha256(k, concat([v, [0 as u8], priv, h1]));
+  v = hmacSha256(k, v);
+  k = hmacSha256(k, concat([v, [1 as u8], priv, h1]));
+  v = hmacSha256(k, v);
+  while (true) {
+    v = hmacSha256(k, v);
+    U256 t = U256.fromBytes(v, 0, 32);
+    if (!t.isZero() && t.lt(n)) { return t; }
+    k = hmacSha256(k, concat([v, [0 as u8]]));
+    v = hmacSha256(k, v);
+  }
+}
+
+export u8[] concat(u8[][] parts) {
+  i32 n = 0;
+  for (i32 i = 0; i < parts.len(); i++) { n += parts[i].len(); }
+  u8[] out = u8[].filled(n, 0);
+  i32 at = 0;
+  for (i32 i = 0; i < parts.len(); i++) {
+    for (i32 k = 0; k < parts[i].len(); k++) { out[at + k] = parts[i][k]; }
+    at += parts[i].len();
+  }
+  return out;
+}
+
+/**
+ * The 65-byte signature of `hash` by `priv`: r ‖ s ‖ v, with s in the lower half of the order (EIP-2) and
+ * v the recovery id, 0 or 1 — whether R's y is odd, flipped when s was.
+ */
+export u8[] sign(u8[] hash, u8[] priv) {
+  Curve c = curve();
+  Field fq = Field.create(secpN());
+  U256 n = secpN();
+  U256 k = rfc6979(priv, hash);
+  U256[] rxy = c.toAffine(c.mul(generator(c), k));
+  U256 r = rxy[0].mod(n);
+  u64[] kInv = fq.inv(fq.fromU256(k));
+  u64[] e = fq.fromU256(U256.fromBytes(hash, 0, 32).mod(n));
+  U256 s = fq.toU256(fq.mul(kInv, fq.add(e, fq.mul(fq.fromU256(r), fq.fromU256(U256.fromBytes(priv, 0, 32))))));
+  i32 recid = (rxy[1].low() & 1) as! i32;
+  if (s.gt(n.shr(1))) {
+    s = n.sub(s);
+    recid = recid ^ 1;
+  }
+  u8[] out = u8[].filled(65, 0);
+  r.writeBytes(out, 0);
+  s.writeBytes(out, 32);
+  out[64] = recid as@ u8;
+  return out;
+}
+
+/** The public key that signed `hash` with the 65-byte `sig`, or null if none does. */
+export u8[]? recover(u8[] hash, u8[] sig) {
+  if (sig.len() != 65 || sig[64] > 1) { return null; }
+  U256 n = secpN();
+  U256 r = U256.fromBytes(sig, 0, 32);
+  U256 s = U256.fromBytes(sig, 32, 32);
+  if (r.isZero() || !r.lt(n) || s.isZero() || !s.lt(n)) { return null; }
+  Curve c = curve();
+  Field fp = c.f;
+  u64[] x = fp.fromU256(r);
+  u64[]? y = fp.sqrt(fp.add(fp.mul(fp.square(x), x), c.b));
+  if (y is null) { return null; }
+  bool odd = (fp.toU256(y!).low() & 1) == 1;
+  u64[] yy = odd == (sig[64] == 1) ? y! : fp.neg(y!);
+  Field fq = Field.create(n);
+  u64[] rInv = fq.inv(fq.fromU256(r));
+  U256 u1 = fq.toU256(fq.mul(fq.neg(fq.fromU256(U256.fromBytes(hash, 0, 32).mod(n))), rInv));
+  U256 u2 = fq.toU256(fq.mul(fq.fromU256(s), rInv));
+  Jac q = c.add(c.mul(generator(c), u1), c.mul(Jac(x, yy, fp.one()), u2));
+  if (c.isInfinity(q)) { return null; }
+  return pointBytes(c, q);
+}

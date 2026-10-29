@@ -1,0 +1,280 @@
+// RLPx, devp2p's encrypted transport: the ECIES that seals the handshake, the handshake itself (auth from
+// the side that dialled, ack from the side that answered), the secrets both sides derive from it, and the
+// frames everything after it travels in.
+//
+// The handshake is EIP-8's: each packet is a two-byte size, then the ECIES ciphertext of an RLP list and
+// some random padding, and the size is the ECIES's "shared MAC data", so it cannot be changed in flight.
+// A node must also read the older fixed-size form, which a few implementations still send; it sends only
+// the new one.
+//
+// Everything random — ephemeral keys, nonces, ECIES's ephemeral keys and IVs, padding — is the caller's
+// to supply, so that the handshake is a function of its inputs and can be checked against EIP-8's vectors.
+
+import { crypto.sha256, crypto.hmacSha256, crypto.aesCtr, crypto.aesExpandKey, crypto.aesEncryptBlock, crypto.aesRounds,
+         crypto.CtrStream, crypto.keccak256 } from "wac";
+import { rlp.Item, rlp.encode, rlp.decode, rlp.Decoded, rlp.bytesOf, rlp.itemsOf, rlp.isList } from "wac";
+import { publicKey, ecdh, sign, recover, concat } from "./secp.wac";
+import { Keccak256 } from "./keccak.wac";
+
+u8[] slice(u8[] b, i32 from, i32 to) {
+  u8[] out = u8[].filled(to - from, 0);
+  for (i32 i = from; i < to; i++) { out[i - from] = b[i]; }
+  return out;
+}
+
+u8[] xor(u8[] a, u8[] b) {
+  u8[] out = u8[].filled(a.len(), 0);
+  for (i32 i = 0; i < a.len(); i++) { out[i] = a[i] ^ b[i]; }
+  return out;
+}
+
+// ── ECIES ────────────────────────────────────────────────────────────────────────────────────────────
+
+/** NIST SP 800-56's concatenation KDF with SHA-256, for 32 bytes: one round, counter 1, no other info. */
+u8[] kdf(u8[] z) { return sha256(concat([[0 as u8, 0 as u8, 0 as u8, 1 as u8], z])); }
+
+/**
+ * `msg` sealed for the holder of `pub`: 0x04 ‖ R ‖ iv ‖ AES-128-CTR(kE, iv, msg) ‖ HMAC-SHA256(kM, iv ‖ c ‖ macData),
+ * where R is the public key of `ephemeral` and kE ‖ kM come from the KDF of ECDH(ephemeral, pub).
+ */
+export u8[] eciesEncrypt(u8[] pub, u8[] msg, u8[] macData, u8[] ephemeral, u8[] iv) {
+  u8[] key = kdf(ecdh(ephemeral, pub)!);
+  u8[] ke = slice(key, 0, 16);
+  u8[] km = sha256(slice(key, 16, 32));
+  u8[] c = aesCtr(ke, iv, msg);
+  u8[] tag = hmacSha256(km, concat([iv, c, macData]));
+  return concat([[4 as u8], publicKey(ephemeral), iv, c, tag]);
+}
+
+/** What `eciesEncrypt` sealed, opened with the recipient's `priv`, or null if it does not authenticate. */
+export u8[]? eciesDecrypt(u8[] priv, u8[] sealed, u8[] macData) {
+  if (sealed.len() < 65 + 16 + 32 || sealed[0] != 4) { return null; }
+  u8[]? z = ecdh(priv, slice(sealed, 1, 65));
+  if (z is null) { return null; }
+  u8[] key = kdf(z!);
+  u8[] km = sha256(slice(key, 16, 32));
+  u8[] iv = slice(sealed, 65, 81);
+  u8[] c = slice(sealed, 81, sealed.len() - 32);
+  u8[] tag = hmacSha256(km, concat([iv, c, macData]));
+  u8[] got = slice(sealed, sealed.len() - 32, sealed.len());
+  i32 diff = 0;
+  for (i32 i = 0; i < 32; i++) { diff = diff | ((tag[i] ^ got[i]) as i32); }
+  if (diff != 0) { return null; }
+  return aesCtr(slice(key, 0, 16), iv, c);
+}
+
+// ── The handshake ────────────────────────────────────────────────────────────────────────────────────
+
+/** What one side learned from the other's handshake packet. */
+export struct Hello {
+  /** The sender's node key: from auth only, since the dialler already knew the answerer's. */
+  u8[] staticKey;
+  u8[] ephemeralKey;
+  u8[] nonce;
+  string error;
+}
+
+Hello bad(string why) { return Hello(u8[].filled(0, 0), u8[].filled(0, 0), u8[].filled(0, 0), why); }
+
+/** EIP-8's packet: the two-byte size, then the sealed body. */
+u8[] sealPacket(u8[] remote, u8[] body, u8[] eciesKey, u8[] iv) {
+  i32 size = body.len() + 113;
+  u8[] prefix = [((size >> 8) & 0xFF) as! u8, (size & 0xFF) as! u8];
+  return concat([prefix, eciesEncrypt(remote, body, prefix, eciesKey, iv)]);
+}
+
+/** The body inside a handshake packet, in either form: EIP-8's (with its size) or the old fixed one. */
+u8[]? openPacket(u8[] priv, u8[] packet, i32 oldSize) {
+  if (packet.len() == oldSize) {
+    u8[]? old = eciesDecrypt(priv, packet, u8[].filled(0, 0));
+    if (old is not null) { return old; }
+  }
+  if (packet.len() < 2) { return null; }
+  i32 size = ((packet[0] as i32) << 8) | (packet[1] as i32);
+  if (packet.len() != size + 2) { return null; }
+  return eciesDecrypt(priv, slice(packet, 2, packet.len()), slice(packet, 0, 2));
+}
+
+/** How many bytes the handshake packet beginning with `head` has in all, once two bytes are in. */
+export i32 packetLength(u8[] head) {
+  if (head[0] == 4) { return -1; }
+  return (((head[0] as i32) << 8) | (head[1] as i32)) + 2;
+}
+
+/**
+ * The dialler's auth: its signature over ECDH(static, remote) ⊕ nonce by its ephemeral key, its node key,
+ * its nonce, and version 4, RLP, then padding.
+ */
+export u8[] makeAuth(u8[] staticKey, u8[] remote, u8[] ephemeral, u8[] nonce, u8[] padding, u8[] eciesKey, u8[] iv) {
+  u8[] sig = sign(xor(ecdh(staticKey, remote)!, nonce), ephemeral);
+  Item body = Item.List([Item.Bytes(sig), Item.Bytes(publicKey(staticKey)), Item.Bytes(nonce), Item.Bytes([4 as u8])]);
+  return sealPacket(remote, concat([encode(body), padding]), eciesKey, iv);
+}
+
+export Hello readAuth(u8[] staticKey, u8[] packet) {
+  u8[]? body = openPacket(staticKey, packet, 307);
+  if (body is null) { return bad("auth does not decrypt"); }
+  u8[] sig = u8[].filled(0, 0);
+  u8[] initiator = sig;
+  u8[] nonce = sig;
+  if (packet.len() == 307 && body!.len() == 194) {
+    // The old form: sig ‖ keccak256(ephemeral) ‖ static key ‖ nonce ‖ 0.
+    sig = slice(body!, 0, 65);
+    initiator = slice(body!, 97, 161);
+    nonce = slice(body!, 161, 193);
+  } else {
+    Decoded d = decodePrefix(body!);
+    if (!d.ok || !isList(d.item) || itemsOf(d.item).len() < 3) { return bad("auth is not an RLP list"); }
+    Item[] f = itemsOf(d.item);
+    sig = bytesOf(f[0]);
+    initiator = bytesOf(f[1]);
+    nonce = bytesOf(f[2]);
+  }
+  if (sig.len() != 65 || initiator.len() != 64 || nonce.len() != 32) { return bad("auth fields are the wrong sizes"); }
+  u8[]? shared = ecdh(staticKey, initiator);
+  if (shared is null) { return bad("auth's node key is not on the curve"); }
+  u8[]? eph = recover(xor(shared!, nonce), sig);
+  if (eph is null) { return bad("auth's signature recovers no key"); }
+  return Hello(initiator, eph!, nonce, "");
+}
+
+/** The answerer's ack: its ephemeral key, its nonce, and version 4, RLP, then padding. */
+export u8[] makeAck(u8[] remote, u8[] ephemeral, u8[] nonce, u8[] padding, u8[] eciesKey, u8[] iv) {
+  Item body = Item.List([Item.Bytes(publicKey(ephemeral)), Item.Bytes(nonce), Item.Bytes([4 as u8])]);
+  return sealPacket(remote, concat([encode(body), padding]), eciesKey, iv);
+}
+
+export Hello readAck(u8[] staticKey, u8[] packet) {
+  u8[]? body = openPacket(staticKey, packet, 210);
+  if (body is null) { return bad("ack does not decrypt"); }
+  if (packet.len() == 210 && body!.len() == 97) {
+    return Hello(u8[].filled(0, 0), slice(body!, 0, 64), slice(body!, 64, 96), "");
+  }
+  Decoded d = decodePrefix(body!);
+  if (!d.ok || !isList(d.item) || itemsOf(d.item).len() < 2) { return bad("ack is not an RLP list"); }
+  Item[] f = itemsOf(d.item);
+  u8[] eph = bytesOf(f[0]);
+  u8[] nonce = bytesOf(f[1]);
+  if (eph.len() != 64 || nonce.len() != 32) { return bad("ack fields are the wrong sizes"); }
+  return Hello(u8[].filled(0, 0), eph, nonce, "");
+}
+
+/** The RLP list at the front of `b`, ignoring the padding after it. */
+Decoded decodePrefix(u8[] b) {
+  if (b.len() == 0) { return decode(b); }
+  i32 p = b[0] as i32;
+  i32 n = 0;
+  if (p >= 0xf8) {
+    i32 ll = p - 0xf7;
+    if (b.len() < 1 + ll) { return decode(u8[].filled(0, 0)); }
+    for (i32 i = 0; i < ll; i++) { n = n * 256 + (b[1 + i] as i32); }
+    n = n + 1 + ll;
+  } else if (p >= 0xc0) {
+    n = 1 + p - 0xc0;
+  } else {
+    return decode(u8[].filled(0, 0));
+  }
+  if (n > b.len()) { return decode(u8[].filled(0, 0)); }
+  return decode(slice(b, 0, n));
+}
+
+// ── Secrets and frames ───────────────────────────────────────────────────────────────────────────────
+
+/**
+ * An RLPx session's state after the handshake: the stream ciphers each way (AES-256-CTR from a zero IV,
+ * running across frames), the MAC key, and the two running MACs.
+ */
+export struct Session {
+  CtrStream egressCipher;
+  CtrStream ingressCipher;
+  u8[] macKey;
+  Keccak256 egressMac;
+  Keccak256 ingressMac;
+  /** The remote node's key. */
+  u8[] remote;
+  /** Whether the frames' payloads are snappy-compressed: both sides said p2p version 5 or later in Hello. */
+  bool snappy;
+}
+
+/**
+ * The secrets both sides derive. `initiator` says which side this is; `auth` and `ack` are the packets as
+ * they went over the wire, size prefix and all.
+ */
+export Session session(bool initiator, u8[] ephemeral, u8[] remoteEphemeral, u8[] initNonce, u8[] respNonce, u8[] auth,
+                       u8[] ack, u8[] remote) {
+  u8[] ek = ecdh(ephemeral, remoteEphemeral)!;
+  u8[] shared = keccak256(concat([ek, keccak256(concat([respNonce, initNonce]))]));
+  u8[] aesSecret = keccak256(concat([ek, shared]));
+  u8[] macSecret = keccak256(concat([ek, aesSecret]));
+  Keccak256 mac1 = Keccak256.create();
+  mac1.update(concat([xor(macSecret, respNonce), auth]));
+  Keccak256 mac2 = Keccak256.create();
+  mac2.update(concat([xor(macSecret, initNonce), ack]));
+  u8[] zero = u8[].filled(16, 0);
+  return Session(CtrStream.create(aesSecret, zero), CtrStream.create(aesSecret, zero), macSecret,
+                 initiator ? mac1 : mac2, initiator ? mac2 : mac1, remote, false);
+}
+
+/** The keys behind a session, for checking against EIP-8's vectors. */
+export u8[][] secrets(u8[] ephemeral, u8[] remoteEphemeral, u8[] initNonce, u8[] respNonce) {
+  u8[] ek = ecdh(ephemeral, remoteEphemeral)!;
+  u8[] shared = keccak256(concat([ek, keccak256(concat([respNonce, initNonce]))]));
+  u8[] aesSecret = keccak256(concat([ek, shared]));
+  return [aesSecret, keccak256(concat([ek, aesSecret]))];
+}
+
+/** AES-256 of one block with the MAC key: the "aes(mac-secret, …)" of the frame MACs. */
+u8[] macBlock(u8[] key, u8[] block) { return aesEncryptBlock(aesExpandKey(key), block, aesRounds(32)); }
+
+/** Mix `seed` into a running MAC and take the first 16 bytes of its digest, as both frame MACs do. */
+u8[] macUpdate(Keccak256 mac, u8[] key, u8[] seed) {
+  u8[] digest = slice(mac.peek(), 0, 16);
+  mac.update(xor(macBlock(key, digest), seed));
+  return slice(mac.peek(), 0, 16);
+}
+
+/** One frame: header (size, then rlp([0, 0]), padded), its MAC, the padded payload, and its MAC. */
+export u8[] writeFrame(Session s, u8[] payload) {
+  u8[] header = u8[].filled(16, 0);
+  header[0] = ((payload.len() >> 16) & 0xFF) as! u8;
+  header[1] = ((payload.len() >> 8) & 0xFF) as! u8;
+  header[2] = (payload.len() & 0xFF) as! u8;
+  header[3] = 0xc2;
+  header[4] = 0x80;
+  header[5] = 0x80;
+  u8[] headerCipher = s.egressCipher.apply(header);
+  u8[] headerMac = macUpdate(s.egressMac, s.macKey, headerCipher);
+  i32 padded = ((payload.len() + 15) / 16) * 16;
+  u8[] body = u8[].filled(padded, 0);
+  for (i32 i = 0; i < payload.len(); i++) { body[i] = payload[i]; }
+  u8[] bodyCipher = s.egressCipher.apply(body);
+  s.egressMac.update(bodyCipher);
+  u8[] bodyMac = macUpdate(s.egressMac, s.macKey, slice(s.egressMac.peek(), 0, 16));
+  return concat([headerCipher, headerMac, bodyCipher, bodyMac]);
+}
+
+/** The payload size a frame's 32-byte header says, or −1 when its MAC is wrong. */
+export i32 readFrameHeader(Session s, u8[] head) {
+  u8[] headerCipher = slice(head, 0, 16);
+  u8[] want = macUpdate(s.ingressMac, s.macKey, headerCipher);
+  for (i32 i = 0; i < 16; i++) {
+    if (want[i] != head[16 + i]) { return -1; }
+  }
+  u8[] header = s.ingressCipher.apply(headerCipher);
+  return ((header[0] as i32) << 16) | ((header[1] as i32) << 8) | (header[2] as i32);
+}
+
+/** How many bytes follow a header for a payload of `size`: the padded body and its MAC. */
+export i32 frameBodyLength(i32 size) { return ((size + 15) / 16) * 16 + 16; }
+
+/** A frame's payload from what follows its header, or null when the MAC is wrong. */
+export u8[]? readFrameBody(Session s, u8[] rest, i32 size) {
+  i32 padded = rest.len() - 16;
+  u8[] bodyCipher = slice(rest, 0, padded);
+  s.ingressMac.update(bodyCipher);
+  u8[] want = macUpdate(s.ingressMac, s.macKey, slice(s.ingressMac.peek(), 0, 16));
+  for (i32 i = 0; i < 16; i++) {
+    if (want[i] != rest[padded + i]) { return null; }
+  }
+  return slice(s.ingressCipher.apply(bodyCipher), 0, size);
+}
